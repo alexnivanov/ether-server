@@ -153,7 +153,7 @@ func (t *TelegramAuth) confirm(token string, id int64, username, firstName strin
 		sessionToken = ""
 	}
 
-	p.client.setAuthed(nick)
+	p.client.setAuthed(id, nick)
 	// доставка через хаб: он сериализует отправку с close(send) при unregister
 	t.hub.direct <- directEnvelope{
 		client: p.client,

@@ -10,12 +10,14 @@ import (
 	_ "modernc.org/sqlite" // чистый Go, без cgo
 )
 
-// Store — персистентность в SQLite (файл `db` из конфига, свой на окружение).
-// Сейчас здесь пользователи и сессии; хранение сообщений ляжет сюда же.
+// Store — персистентность в SQLite (файл `db` из конфига, свой на окружение):
+// пользователи, сессии и сообщения каналов.
 //
 // Пользователь создаётся/обновляется при каждом входе через Telegram (ключ —
 // tg id). Сессия — случайный токен, который клиент получает в `authed` и
 // предъявляет в `resume` после реконнекта, чтобы не ходить к боту заново.
+// Сообщение хранится под ключом-строкой ID канала; история отдаётся кадром
+// `history` страницами вверх (before_id).
 type Store struct {
 	db *sql.DB
 }
@@ -43,6 +45,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 	seen_at    INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS sessions_tg_id ON sessions(tg_id);
+CREATE TABLE IF NOT EXISTS messages (
+	id      INTEGER PRIMARY KEY AUTOINCREMENT, -- монотонный, курсор пагинации
+	channel TEXT NOT NULL,                     -- ID канала (контракт ether-meta)
+	tg_id   INTEGER NOT NULL,                  -- автор (для модерации/удаления аккаунта)
+	sender  TEXT NOT NULL,                     -- ник на момент отправки
+	text    TEXT NOT NULL,
+	ts      INTEGER NOT NULL                   -- unix-миллисекунды (как в протоколе)
+);
+CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -101,6 +112,53 @@ func (s *Store) NewSession(tgID int64) (string, error) {
 		return "", err
 	}
 	return token, nil
+}
+
+// SaveMessage пишет сообщение в историю канала и возвращает его id.
+func (s *Store) SaveMessage(channel string, tgID int64, sender, text string, ts int64) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO messages (channel, tg_id, sender, text, ts) VALUES (?, ?, ?, ?, ?)`,
+		channel, tgID, sender, text, ts)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// History возвращает до limit последних сообщений канала в хронологическом
+// порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
+// старше него.
+func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
+	q := `SELECT id, channel, sender, text, ts FROM messages WHERE channel = ?`
+	args := []any{channel}
+	if beforeID > 0 {
+		q += ` AND id < ?`
+		args = append(args, beforeID)
+	}
+	q += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	msgs := make([]MessageData, 0, limit)
+	for rows.Next() {
+		var m MessageData
+		if err := rows.Scan(&m.ID, &m.Channel, &m.Sender, &m.Text, &m.TS); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// выборка шла новые→старые, отдаём хронологически
+	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
+		msgs[i], msgs[j] = msgs[j], msgs[i]
+	}
+	return msgs, nil
 }
 
 // UserBySession возвращает пользователя по токену сессии (nil — сессии нет)

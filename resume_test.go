@@ -107,7 +107,18 @@ func TestResumeOverWebSocket(t *testing.T) {
 		t.Fatalf("got %s %s, want message", msg.Type, msg.Data)
 	}
 	mustUnmarshal(t, msg.Data, &m)
-	if m.Sender != "alex" || m.Text != "привет" {
+	if m.Sender != "alex" || m.Text != "привет" || m.ID == 0 {
 		t.Fatalf("message: %+v", m)
+	}
+
+	// сообщение легло в историю и возвращается кадром history
+	env = roundtrip(envelope(TypeHistory, HistoryRequestData{Channel: "RU"}))
+	if env.Type != TypeHistory {
+		t.Fatalf("got %s %s, want history", env.Type, env.Data)
+	}
+	var h HistoryData
+	mustUnmarshal(t, env.Data, &h)
+	if len(h.Messages) != 1 || h.Messages[0].ID != m.ID || h.Messages[0].Text != "привет" {
+		t.Fatalf("history: %+v", h)
 	}
 }

@@ -9,6 +9,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	maxMessageLen   = 4096 // байт текста в publish
+	maxHistoryLimit = 200  // сообщений в одном ответе history
+)
+
 // Client — одно WebSocket-соединение. readPump читает кадры из сокета и дёргает
 // хаб; writePump — единственный писатель в сокет (конкурентная запись в gorilla
 // запрещена), он сериализует всё исходящее из канала send.
@@ -20,8 +25,9 @@ type Client struct {
 	tg    *TelegramAuth
 	store *Store
 
-	// ник читает readPump (publish), а пишет ещё и горутина Telegram-бота
+	// кто вошёл: читает readPump (publish), а пишет ещё и горутина Telegram-бота
 	mu     sync.Mutex
+	userID int64 // Telegram user id
 	nick   string
 	authed bool
 }
@@ -32,15 +38,17 @@ func (c *Client) Nick() string {
 	return c.nick
 }
 
-func (c *Client) isAuthed() bool {
+// authedUser отдаёт автора для publish: tg id, ник и флаг «вход выполнен».
+func (c *Client) authedUser() (int64, string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.authed
+	return c.userID, c.nick, c.authed
 }
 
-func (c *Client) setAuthed(nick string) {
+func (c *Client) setAuthed(userID int64, nick string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.userID = userID
 	c.nick = nick
 	c.authed = true
 }
@@ -83,7 +91,7 @@ func (c *Client) readPump() {
 				c.sendError("bad_session", "сессия не найдена — войди через Telegram заново")
 				continue
 			}
-			c.setAuthed(u.Nick)
+			c.setAuthed(u.TgID, u.Nick)
 			c.out(envelope(TypeAuthed, AuthedData{
 				User:  AuthedUser{ID: u.TgID, Nick: u.Nick, Username: u.Username},
 				Token: d.Token,
@@ -108,21 +116,53 @@ func (c *Client) readPump() {
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
 		case TypePublish:
-			if !c.isAuthed() {
+			userID, nick, authed := c.authedUser()
+			if !authed {
 				c.sendError("not_authed", "отправка доступна после входа через Telegram")
 				continue
 			}
 			var d PublishData
-			if err := json.Unmarshal(env.Data, &d); err != nil {
+			if err := json.Unmarshal(env.Data, &d); err != nil || d.Channel == "" {
 				c.sendError("bad_data", "invalid publish payload")
 				continue
 			}
-			c.hub.broadcast <- MessageData{
+			if d.Text == "" || len(d.Text) > maxMessageLen {
+				c.sendError("bad_data", "text must be 1..4096 bytes")
+				continue
+			}
+			m := MessageData{
 				Channel: d.Channel,
-				Sender:  c.Nick(),
+				Sender:  nick,
 				Text:    d.Text,
 				TS:      time.Now().UnixMilli(),
 			}
+			if id, err := c.store.SaveMessage(m.Channel, userID, m.Sender, m.Text, m.TS); err != nil {
+				log.Printf("save message: %v", err) // живая рассылка важнее истории
+			} else {
+				m.ID = id
+			}
+			c.hub.broadcast <- m
+
+		case TypeHistory:
+			var d HistoryRequestData
+			if err := json.Unmarshal(env.Data, &d); err != nil || d.Channel == "" {
+				c.sendError("bad_data", "invalid history payload")
+				continue
+			}
+			limit := d.Limit
+			if limit <= 0 {
+				limit = 50
+			}
+			if limit > maxHistoryLimit {
+				limit = maxHistoryLimit
+			}
+			msgs, err := c.store.History(d.Channel, d.BeforeID, limit)
+			if err != nil {
+				log.Printf("history %q: %v", d.Channel, err)
+				c.sendError("internal", "history lookup failed")
+				continue
+			}
+			c.out(envelope(TypeHistory, HistoryData{Channel: d.Channel, Messages: msgs}))
 
 		default:
 			c.sendError("unknown_type", "unknown message type: "+env.Type)

@@ -11,9 +11,13 @@ const (
 	TypeLoginTelegram = "login_telegram" // {} — запросить ссылку входа
 	TypeResume        = "resume"         // {token} — восстановить сессию после реконнекта
 
+	// history: запрос client → server {channel, before_id?, limit?},
+	// ответ server → client {channel, messages: [...]}
+	TypeHistory = "history"
+
 	// server → client
 	TypeLocated   = "located"    // {channels: [...]}
-	TypeMessage   = "message"    // {channel, sender, text, ts}
+	TypeMessage   = "message"    // {id, channel, sender, text, ts}
 	TypeError     = "error"      // {code, message}
 	TypeLoginLink = "login_link" // {url} — deep-link t.me/<бот>?start=<токен>
 	TypeAuthed    = "authed"     // {user: {id, nick, username}}
@@ -37,16 +41,26 @@ type PublishData struct {
 type ResumeData struct {
 	Token string `json:"token"`
 }
+type HistoryRequestData struct {
+	Channel  string `json:"channel"`
+	BeforeID int64  `json:"before_id,omitempty"` // 0 — с конца; иначе сообщения старше этого id
+	Limit    int    `json:"limit,omitempty"`     // 0 → 50, максимум 200
+}
 
 // server → client
 type LocatedData struct {
 	Channels []Channel `json:"channels"`
 }
 type MessageData struct {
+	ID      int64  `json:"id,omitempty"` // курсор для history/before_id; 0 — не сохранилось
 	Channel string `json:"channel"`
 	Sender  string `json:"sender"`
 	Text    string `json:"text"`
 	TS      int64  `json:"ts"`
+}
+type HistoryData struct {
+	Channel  string        `json:"channel"`
+	Messages []MessageData `json:"messages"` // хронологически, по возрастанию id
 }
 type ErrorData struct {
 	Code    string `json:"code"`

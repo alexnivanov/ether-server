@@ -39,7 +39,7 @@ go run . -config /etc/ether/custom.json  # явный путь вместо -env
 |---|---|
 | `main.go` | точка входа: флаги `-env`/`-config`, WebSocket-эндпоинт `/ws`, поднятие хаба |
 | `config.go` | `Config` — конфиг окружения (`config.<env>.json`) |
-| `store.go` | `Store` — персистентность в SQLite: пользователи (tg id) и сессии |
+| `store.go` | `Store` — персистентность в SQLite: пользователи (tg id), сессии, сообщения каналов |
 | `hub.go` | `Hub` — владеет подписками `channelID → клиенты`, рассылает сообщения; всё состояние меняется из одной горутины (без блокировок) |
 | `client.go` | `Client` — одно соединение; `readPump` читает кадры, `writePump` — единственный писатель в сокет |
 | `geocode.go` | интерфейс `Geocoder` (координаты → каналы), тип `Channel`, `StubGeocoder` для офлайн-прогонов |
@@ -62,8 +62,10 @@ go run . -config /etc/ether/custom.json  # явный путь вместо -env
 | `resume` | client → server | `{token}` — восстановить сессию после реконнекта |
 | `locate` | client → server | `{lat, lng}` |
 | `publish` | client → server | `{channel, text}` — только после `authed` |
+| `history` | client → server | `{channel, before_id?, limit?}` — догрузить историю канала |
 | `located` | server → client | `{channels: [...]}` |
-| `message` | server → client | `{channel, sender, text, ts}` |
+| `message` | server → client | `{id, channel, sender, text, ts}` |
+| `history` | server → client | `{channel, messages: [...]}` — хронологически, по возрастанию `id` |
 | `login_link` | server → client | `{url}` — deep-link `t.me/<бот>?start=<токен>` |
 | `authed` | server → client | `{user: {id, nick, username}, token}` — `token` сохранить для `resume` |
 | `error` | server → client | `{code, message}` |
@@ -98,11 +100,10 @@ websocat ws://localhost:8080/ws            # в другом
 ## Статус
 
 Каркас рабочий: геокодинг (`NominatimGeocoder`), вход через Telegram,
-персистентные пользователи и сессии (SQLite, `resume` после реконнекта),
-подписка и рассылка сквозь хаб. Не реализовано:
+персистентные пользователи, сессии и сообщения (SQLite: `resume` после
+реконнекта, история канала кадром `history`), подписка и рассылка сквозь хаб.
+Не реализовано:
 
-- **Хранение сообщений** — пока нет; хаб только рассылает онлайн-подписчикам,
-  истории канала нет (БД под это уже есть — SQLite в `store.go`).
 - **Переподписка при движении** — `locate` сейчас только *добавляет* подписки;
   диффа со снятием со старых уровней нет.
 - **Логаут / TTL сессий** — `resume`-токены живут бессрочно, отзыва нет.

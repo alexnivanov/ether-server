@@ -55,3 +55,53 @@ func TestStoreUsersAndSessions(t *testing.T) {
 		t.Fatalf("resume after re-save: got %+v, want nick alex_new", got)
 	}
 }
+
+func TestStoreMessages(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	var ids []int64
+	for i, text := range []string{"один", "два", "три", "четыре", "пять"} {
+		id, err := s.SaveMessage("RU", 42, "alex", text, int64(1000+i))
+		if err != nil {
+			t.Fatalf("save %q: %v", text, err)
+		}
+		ids = append(ids, id)
+	}
+	if _, err := s.SaveMessage("DE", 42, "alex", "hallo", 2000); err != nil {
+		t.Fatalf("save DE: %v", err)
+	}
+
+	// последняя страница: 3 новейших, хронологически
+	msgs, err := s.History("RU", 0, 3)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != 3 || msgs[0].Text != "три" || msgs[2].Text != "пять" {
+		t.Fatalf("history page 1: %+v", msgs)
+	}
+	if msgs[0].ID != ids[2] || msgs[0].Channel != "RU" || msgs[0].TS != 1002 {
+		t.Fatalf("history fields: %+v", msgs[0])
+	}
+
+	// страница вверх от начала предыдущей
+	msgs, err = s.History("RU", msgs[0].ID, 10)
+	if err != nil {
+		t.Fatalf("history before: %v", err)
+	}
+	if len(msgs) != 2 || msgs[0].Text != "один" || msgs[1].Text != "два" {
+		t.Fatalf("history page 2: %+v", msgs)
+	}
+
+	// чужой канал не подмешивается, пустой — пустой список
+	msgs, err = s.History("FR", 0, 10)
+	if err != nil {
+		t.Fatalf("history empty: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("history empty: %+v", msgs)
+	}
+}
