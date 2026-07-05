@@ -15,8 +15,8 @@
 Конфиг — на окружение: `config.<env>.json` (в git не идёт, образец —
 [`config.example.json`](./config.example.json)). Внутри: `addr` (по умолчанию
 `:8080`), `telegram_bot_token` (обязателен — без него сервер не стартует; на
-каждое окружение свой бот) и опциональный `nominatim_url` (пусто → публичный
-сервер OSM).
+каждое окружение свой бот), опциональные `nominatim_url` (пусто → публичный
+сервер OSM) и `db` — путь к SQLite-файлу (пусто → `ether.<env>.db`).
 
 ```sh
 cp config.example.json config.dev.json   # вписать токен бота
@@ -39,6 +39,7 @@ go run . -config /etc/ether/custom.json  # явный путь вместо -env
 |---|---|
 | `main.go` | точка входа: флаги `-env`/`-config`, WebSocket-эндпоинт `/ws`, поднятие хаба |
 | `config.go` | `Config` — конфиг окружения (`config.<env>.json`) |
+| `store.go` | `Store` — персистентность в SQLite: пользователи (tg id) и сессии |
 | `hub.go` | `Hub` — владеет подписками `channelID → клиенты`, рассылает сообщения; всё состояние меняется из одной горутины (без блокировок) |
 | `client.go` | `Client` — одно соединение; `readPump` читает кадры, `writePump` — единственный писатель в сокет |
 | `geocode.go` | интерфейс `Geocoder` (координаты → каналы), тип `Channel`, `StubGeocoder` для офлайн-прогонов |
@@ -58,12 +59,13 @@ go run . -config /etc/ether/custom.json  # явный путь вместо -env
 | Тип | Направление | Payload |
 |---|---|---|
 | `login_telegram` | client → server | `{}` — запросить ссылку входа |
+| `resume` | client → server | `{token}` — восстановить сессию после реконнекта |
 | `locate` | client → server | `{lat, lng}` |
 | `publish` | client → server | `{channel, text}` — только после `authed` |
 | `located` | server → client | `{channels: [...]}` |
 | `message` | server → client | `{channel, sender, text, ts}` |
 | `login_link` | server → client | `{url}` — deep-link `t.me/<бот>?start=<токен>` |
-| `authed` | server → client | `{user: {id, nick, username}}` |
+| `authed` | server → client | `{user: {id, nick, username}, token}` — `token` сохранить для `resume` |
 | `error` | server → client | `{code, message}` |
 
 `Channel` — `{id, level, label, name}`, где `id` — стабильный ключ
@@ -95,15 +97,15 @@ websocat ws://localhost:8080/ws            # в другом
 
 ## Статус
 
-Каркас рабочий: геокодинг (`NominatimGeocoder`), вход через Telegram, подписка и
-рассылка сквозь хаб. Не реализовано:
+Каркас рабочий: геокодинг (`NominatimGeocoder`), вход через Telegram,
+персистентные пользователи и сессии (SQLite, `resume` после реконнекта),
+подписка и рассылка сквозь хаб. Не реализовано:
 
 - **Хранение сообщений** — пока нет; хаб только рассылает онлайн-подписчикам,
-  истории канала нет.
+  истории канала нет (БД под это уже есть — SQLite в `store.go`).
 - **Переподписка при движении** — `locate` сейчас только *добавляет* подписки;
   диффа со снятием со старых уровней нет.
-- **Персистентные сессии** — вход живёт в рамках одного соединения; при
-  переподключении нужно логиниться заново.
+- **Логаут / TTL сессий** — `resume`-токены живут бессрочно, отзыва нет.
 - **Свой Nominatim** — публичный сервер ограничен 1 req/s (запросы
   сериализуются), для production нужен свой инстанс (`nominatim_url` в конфиге).
 

@@ -30,13 +30,22 @@ func main() {
 	hub := NewHub()
 	go hub.Run()
 
+	dbPath := cfg.DB
+	if dbPath == "" {
+		dbPath = "ether." + *env + ".db"
+	}
+	store, err := OpenStore(dbPath)
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+
 	nominatim := NewNominatimGeocoder()
 	if cfg.NominatimURL != "" {
 		nominatim.BaseURL = cfg.NominatimURL
 	}
 	var geo Geocoder = nominatim
 
-	tg, err := NewTelegramAuth(cfg.TelegramBotToken, hub)
+	tg, err := NewTelegramAuth(cfg.TelegramBotToken, hub, store)
 	if err != nil {
 		log.Fatalf("telegram: %v", err)
 	}
@@ -48,11 +57,12 @@ func main() {
 			return
 		}
 		c := &Client{
-			hub:  hub,
-			conn: conn,
-			send: make(chan Envelope, 16),
-			geo:  geo,
-			tg:   tg,
+			hub:   hub,
+			conn:  conn,
+			send:  make(chan Envelope, 16),
+			geo:   geo,
+			tg:    tg,
+			store: store,
 		}
 		hub.register <- c
 		go c.writePump()

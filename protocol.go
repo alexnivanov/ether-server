@@ -9,6 +9,7 @@ const (
 	TypeLocate        = "locate"         // {lat, lng}
 	TypePublish       = "publish"        // {channel, text} — только после authed
 	TypeLoginTelegram = "login_telegram" // {} — запросить ссылку входа
+	TypeResume        = "resume"         // {token} — восстановить сессию после реконнекта
 
 	// server → client
 	TypeLocated   = "located"    // {channels: [...]}
@@ -32,6 +33,9 @@ type LocateData struct {
 type PublishData struct {
 	Channel string `json:"channel"`
 	Text    string `json:"text"`
+}
+type ResumeData struct {
+	Token string `json:"token"`
 }
 
 // server → client
@@ -58,6 +62,9 @@ type AuthedUser struct {
 }
 type AuthedData struct {
 	User AuthedUser `json:"user"`
+	// сессионный токен: клиент сохраняет его и предъявляет в resume после
+	// реконнекта; пустой, если сессию не удалось сохранить
+	Token string `json:"token,omitempty"`
 }
 
 // mustJSON сериализует payload в RawMessage для вложения в Envelope.

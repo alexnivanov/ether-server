@@ -7,3 +7,8 @@
 # Конфиги окружений с секретами (образец — config.example.json)
 /config*.json
 !/config.example.json
+
+# SQLite-база (пользователи, сессии) и её WAL-файлы
+/*.db
+/*.db-wal
+/*.db-shm

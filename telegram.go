@@ -26,6 +26,7 @@ type TelegramAuth struct {
 	token   string
 	botName string
 	hub     *Hub
+	store   *Store
 
 	mu      sync.Mutex
 	pending map[string]pendingLogin // login-токен → кто его ждёт
@@ -38,8 +39,8 @@ type pendingLogin struct {
 
 const loginTTL = 5 * time.Minute
 
-func NewTelegramAuth(botToken string, hub *Hub) (*TelegramAuth, error) {
-	t := &TelegramAuth{token: botToken, hub: hub, pending: map[string]pendingLogin{}}
+func NewTelegramAuth(botToken string, hub *Hub, store *Store) (*TelegramAuth, error) {
+	t := &TelegramAuth{token: botToken, hub: hub, store: store, pending: map[string]pendingLogin{}}
 	name, err := t.getMe()
 	if err != nil {
 		return nil, err // api() уже включает имя метода в текст ошибки
@@ -141,12 +142,24 @@ func (t *TelegramAuth) confirm(token string, id int64, username, firstName strin
 	if nick == "" {
 		nick = "anon"
 	}
+
+	// персистентность: пользователь и токен сессии переживают реконнект
+	// (кадр resume). Ошибка хранилища не валит вход — просто без resume.
+	sessionToken := ""
+	if err := t.store.SaveUser(User{TgID: id, Username: username, FirstName: firstName, Nick: nick}); err != nil {
+		log.Printf("telegram: save user %d: %v", id, err)
+	} else if sessionToken, err = t.store.NewSession(id); err != nil {
+		log.Printf("telegram: new session for %d: %v", id, err)
+		sessionToken = ""
+	}
+
 	p.client.setAuthed(nick)
 	// доставка через хаб: он сериализует отправку с close(send) при unregister
 	t.hub.direct <- directEnvelope{
 		client: p.client,
 		env: envelope(TypeAuthed, AuthedData{
-			User: AuthedUser{ID: id, Nick: nick, Username: username},
+			User:  AuthedUser{ID: id, Nick: nick, Username: username},
+			Token: sessionToken,
 		}),
 	}
 	t.reply(chatID, "Готово, "+nick+"! Возвращайся в Эфир 🎉")

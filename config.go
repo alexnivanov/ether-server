@@ -19,6 +19,8 @@ type Config struct {
 	// Базовый URL Nominatim; пусто → публичный nominatim.openstreetmap.org
 	// (лимит 1 req/s, не для production — в prod сюда пойдёт свой инстанс).
 	NominatimURL string `json:"nominatim_url"`
+	// Путь к файлу SQLite (пользователи, сессии); пусто → "ether.<env>.db".
+	DB string `json:"db"`
 }
 
 func LoadConfig(path string) (*Config, error) {

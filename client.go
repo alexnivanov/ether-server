@@ -13,11 +13,12 @@ import (
 // хаб; writePump — единственный писатель в сокет (конкурентная запись в gorilla
 // запрещена), он сериализует всё исходящее из канала send.
 type Client struct {
-	hub  *Hub
-	conn *websocket.Conn
-	send chan Envelope
-	geo  Geocoder
-	tg   *TelegramAuth
+	hub   *Hub
+	conn  *websocket.Conn
+	send  chan Envelope
+	geo   Geocoder
+	tg    *TelegramAuth
+	store *Store
 
 	// ник читает readPump (publish), а пишет ещё и горутина Telegram-бота
 	mu     sync.Mutex
@@ -65,6 +66,28 @@ func (c *Client) readPump() {
 		switch env.Type {
 		case TypeLoginTelegram:
 			c.out(envelope(TypeLoginLink, LoginLinkData{URL: c.tg.NewLoginToken(c)}))
+
+		case TypeResume:
+			var d ResumeData
+			if err := json.Unmarshal(env.Data, &d); err != nil || d.Token == "" {
+				c.sendError("bad_data", "invalid resume payload")
+				continue
+			}
+			u, err := c.store.UserBySession(d.Token)
+			if err != nil {
+				log.Printf("resume: %v", err)
+				c.sendError("internal", "session lookup failed")
+				continue
+			}
+			if u == nil {
+				c.sendError("bad_session", "сессия не найдена — войди через Telegram заново")
+				continue
+			}
+			c.setAuthed(u.Nick)
+			c.out(envelope(TypeAuthed, AuthedData{
+				User:  AuthedUser{ID: u.TgID, Nick: u.Nick, Username: u.Username},
+				Token: d.Token,
+			}))
 
 		case TypeLocate:
 			var d LocateData

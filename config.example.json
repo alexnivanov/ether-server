@@ -1,5 +1,6 @@
 {
   "addr": ":8080",
   "telegram_bot_token": "<токен бота от @BotFather, вида 123456789:AA...>",
-  "nominatim_url": ""
+  "nominatim_url": "",
+  "db": ""
 }
