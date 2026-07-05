@@ -6,14 +6,16 @@ import "encoding/json"
 // Envelope: тег типа + сырой payload, который доразбирается по типу.
 const (
 	// client → server
-	TypeHello   = "hello"   // {nick}
-	TypeLocate  = "locate"  // {lat, lng}
-	TypePublish = "publish" // {channel, text}
+	TypeLocate        = "locate"         // {lat, lng}
+	TypePublish       = "publish"        // {channel, text} — только после authed
+	TypeLoginTelegram = "login_telegram" // {} — запросить ссылку входа
 
 	// server → client
-	TypeLocated = "located" // {channels: [...]}
-	TypeMessage = "message" // {channel, sender, text, ts}
-	TypeError   = "error"   // {code, message}
+	TypeLocated   = "located"    // {channels: [...]}
+	TypeMessage   = "message"    // {channel, sender, text, ts}
+	TypeError     = "error"      // {code, message}
+	TypeLoginLink = "login_link" // {url} — deep-link t.me/<бот>?start=<токен>
+	TypeAuthed    = "authed"     // {user: {id, nick, username}}
 )
 
 // Envelope — внешняя оболочка любого сообщения.
@@ -23,9 +25,6 @@ type Envelope struct {
 }
 
 // client → server
-type HelloData struct {
-	Nick string `json:"nick"`
-}
 type LocateData struct {
 	Lat float64 `json:"lat"`
 	Lng float64 `json:"lng"`
@@ -48,6 +47,17 @@ type MessageData struct {
 type ErrorData struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+type LoginLinkData struct {
+	URL string `json:"url"`
+}
+type AuthedUser struct {
+	ID       int64  `json:"id"` // Telegram user id
+	Nick     string `json:"nick"`
+	Username string `json:"username,omitempty"`
+}
+type AuthedData struct {
+	User AuthedUser `json:"user"`
 }
 
 // mustJSON сериализует payload в RawMessage для вложения в Envelope.

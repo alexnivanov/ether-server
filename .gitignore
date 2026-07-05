@@ -3,3 +3,7 @@
 
 # Скомпилированный бинарник (go build)
 /ether-server
+
+# Конфиги окружений с секретами (образец — config.example.json)
+/config*.json
+!/config.example.json

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -16,11 +17,36 @@ type Client struct {
 	conn *websocket.Conn
 	send chan Envelope
 	geo  Geocoder
-	nick string
+	tg   *TelegramAuth
+
+	// ник читает readPump (publish), а пишет ещё и горутина Telegram-бота
+	mu     sync.Mutex
+	nick   string
+	authed bool
+}
+
+func (c *Client) Nick() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.nick
+}
+
+func (c *Client) isAuthed() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authed
+}
+
+func (c *Client) setAuthed(nick string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.nick = nick
+	c.authed = true
 }
 
 func (c *Client) readPump() {
 	defer func() {
+		c.tg.Cancel(c) // до unregister: confirm не должен писать в закрытый send
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
@@ -37,11 +63,8 @@ func (c *Client) readPump() {
 		}
 
 		switch env.Type {
-		case TypeHello:
-			var d HelloData
-			if json.Unmarshal(env.Data, &d) == nil && d.Nick != "" {
-				c.nick = d.Nick
-			}
+		case TypeLoginTelegram:
+			c.out(envelope(TypeLoginLink, LoginLinkData{URL: c.tg.NewLoginToken(c)}))
 
 		case TypeLocate:
 			var d LocateData
@@ -62,6 +85,10 @@ func (c *Client) readPump() {
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
 		case TypePublish:
+			if !c.isAuthed() {
+				c.sendError("not_authed", "отправка доступна после входа через Telegram")
+				continue
+			}
 			var d PublishData
 			if err := json.Unmarshal(env.Data, &d); err != nil {
 				c.sendError("bad_data", "invalid publish payload")
@@ -69,7 +96,7 @@ func (c *Client) readPump() {
 			}
 			c.hub.broadcast <- MessageData{
 				Channel: d.Channel,
-				Sender:  c.nick,
+				Sender:  c.Nick(),
 				Text:    d.Text,
 				TS:      time.Now().UnixMilli(),
 			}
@@ -93,7 +120,7 @@ func (c *Client) out(env Envelope) {
 	select {
 	case c.send <- env:
 	default:
-		log.Printf("send buffer full for %q, dropping %s", c.nick, env.Type)
+		log.Printf("send buffer full for %q, dropping %s", c.Nick(), env.Type)
 	}
 }
 

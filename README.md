@@ -12,12 +12,20 @@
 
 ## Запуск
 
+Конфиг — на окружение: `config.<env>.json` (в git не идёт, образец —
+[`config.example.json`](./config.example.json)). Внутри: `addr` (по умолчанию
+`:8080`), `telegram_bot_token` (обязателен — без него сервер не стартует; на
+каждое окружение свой бот) и опциональный `nominatim_url` (пусто → публичный
+сервер OSM).
+
 ```sh
-go run .
+cp config.example.json config.dev.json   # вписать токен бота
+go run .                                 # -env dev по умолчанию
+go run . -env prod                       # возьмёт config.prod.json
+go run . -config /etc/ether/custom.json  # явный путь вместо -env
 ```
 
-Сервер слушает `:8080` и принимает WebSocket-соединения на `/ws`
-(`ws://localhost:8080/ws`).
+Сервер принимает WebSocket-соединения на `/ws` (`ws://localhost:8080/ws`).
 
 ## Как это работает
 
@@ -29,10 +37,13 @@ go run .
 
 | Файл | Роль |
 |---|---|
-| `main.go` | точка входа: WebSocket-эндпоинт `/ws`, поднятие хаба |
+| `main.go` | точка входа: флаги `-env`/`-config`, WebSocket-эндпоинт `/ws`, поднятие хаба |
+| `config.go` | `Config` — конфиг окружения (`config.<env>.json`) |
 | `hub.go` | `Hub` — владеет подписками `channelID → клиенты`, рассылает сообщения; всё состояние меняется из одной горутины (без блокировок) |
 | `client.go` | `Client` — одно соединение; `readPump` читает кадры, `writePump` — единственный писатель в сокет |
-| `geocode.go` | интерфейс `Geocoder` (координаты → каналы) и тип `Channel` |
+| `geocode.go` | интерфейс `Geocoder` (координаты → каналы), тип `Channel`, `StubGeocoder` для офлайн-прогонов |
+| `nominatim.go` | `NominatimGeocoder` — реальный геокодинг через Nominatim (reverse + details, слоты по `rank_address`) |
+| `telegram.go` | вход через Telegram: deep-link боту, long-poll `getUpdates` |
 | `protocol.go` | wire-протокол: `Envelope` и типы сообщений |
 
 ## Wire-протокол
@@ -46,11 +57,13 @@ go run .
 
 | Тип | Направление | Payload |
 |---|---|---|
-| `hello` | client → server | `{nick}` |
+| `login_telegram` | client → server | `{}` — запросить ссылку входа |
 | `locate` | client → server | `{lat, lng}` |
-| `publish` | client → server | `{channel, text}` |
+| `publish` | client → server | `{channel, text}` — только после `authed` |
 | `located` | server → client | `{channels: [...]}` |
 | `message` | server → client | `{channel, sender, text, ts}` |
+| `login_link` | server → client | `{url}` — deep-link `t.me/<бот>?start=<токен>` |
+| `authed` | server → client | `{user: {id, nick, username}}` |
 | `error` | server → client | `{code, message}` |
 
 `Channel` — `{id, level, label, name}`, где `id` — стабильный ключ
@@ -69,26 +82,29 @@ websocat ws://localhost:8080/ws            # в другом
 Затем в сессии `websocat` по строке:
 
 ```json
-{"type":"hello","data":{"nick":"alex"}}
+{"type":"login_telegram","data":{}}
 {"type":"locate","data":{"lat":55.76,"lng":37.61}}
 {"type":"publish","data":{"channel":"relation/2555133","text":"привет"}}
 ```
 
-После `locate` сервер ответит `located` с набором каналов, а `publish` разошлёт
-`message` всем подписчикам указанного канала (включая отправителя).
+На `login_telegram` сервер вернёт `login_link` — открыть ссылку и нажать Start у
+бота, придёт `authed`. После `locate` сервер ответит `located` с набором каналов
+(геокодинг через публичный Nominatim занимает ~2–3 с), а `publish` (доступен
+только после входа) разошлёт `message` всем подписчикам указанного канала
+(включая отправителя).
 
 ## Статус
 
-Каркас рабочий — подписка и рассылка сквозь хаб работают. Не реализовано:
+Каркас рабочий: геокодинг (`NominatimGeocoder`), вход через Telegram, подписка и
+рассылка сквозь хаб. Не реализовано:
 
-- **Геокодинг** — сейчас `StubGeocoder` возвращает фиксированный набор каналов
-  (Москва) независимо от координат. Реальный `NominatimGeocoder` (порт логики из
-  `ether-research`: `reverse` + `/details`, выбор единиц по `rank_address`,
-  ISO-коды) подключается за тем же интерфейсом — хаб менять не придётся.
 - **Хранение сообщений** — пока нет; хаб только рассылает онлайн-подписчикам,
   истории канала нет.
 - **Переподписка при движении** — `locate` сейчас только *добавляет* подписки;
   диффа со снятием со старых уровней нет.
-- **Авторизация** — `nick` принимается на доверии (`hello`), без идентификации.
+- **Персистентные сессии** — вход живёт в рамках одного соединения; при
+  переподключении нужно логиниться заново.
+- **Свой Nominatim** — публичный сервер ограничен 1 req/s (запросы
+  сериализуются), для production нужен свой инстанс (`nominatim_url` в конфиге).
 
 Зависимости: [`gorilla/websocket`](https://github.com/gorilla/websocket). Go 1.26.
