@@ -1,3 +1,5 @@
+//go:build live
+
 package main
 
 import "testing"
@@ -9,6 +11,10 @@ import "testing"
 // больше проверить негде. Один общий *NominatimGeocoder на все кейсы: его
 // внутренний мьютекс сам держит паузу 1.1с между запросами (лимит публичного
 // сервера), как ручной sleep между test() в JS-версии.
+//
+// За build-тегом live: usage policy публичного Nominatim запрещает
+// автоматизированную нагрузку, а CI гоняет тесты на каждый push — незачем
+// дёргать чужой сервер на каждый коммит. Запуск вручную: go test -tags live .
 func TestChannelsKnownLocations(t *testing.T) {
 	g := NewNominatimGeocoder()
 
