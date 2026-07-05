@@ -50,7 +50,36 @@ func main() {
 		log.Fatalf("telegram: %v", err)
 	}
 
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux := http.NewServeMux()
+	registerREST(mux, store)
+	mux.HandleFunc("/ws", wsHandler(hub, geo, tg, store))
+
+	log.Printf("ether-server (%s) listening on %s (ws-эндпоинт /ws, REST /session/resume /rules/accept /history)", path, cfg.Addr)
+	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+}
+
+// wsHandler — апгрейд до WebSocket. ?token= опционален (можно смотреть каналы
+// и читать без входа), но если прислан — должен быть валиден: клиент получает
+// его либо из login_telegram/подтверждения у бота, либо только что проверил
+// его через REST /session/resume, так что протухший токен здесь — сигнал
+// рассинхронизации, а не штатный путь, поэтому отвечаем 401 до апгрейда.
+func wsHandler(hub *Hub, geo Geocoder, tg *TelegramAuth, store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var authedUser *User
+		if token := r.URL.Query().Get("token"); token != "" {
+			u, err := store.UserBySession(token)
+			if err != nil {
+				log.Printf("ws auth: %v", err)
+				http.Error(w, "session lookup failed", http.StatusInternalServerError)
+				return
+			}
+			if u == nil {
+				http.Error(w, "bad session", http.StatusUnauthorized)
+				return
+			}
+			authedUser = u
+		}
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Println("upgrade:", err)
@@ -64,11 +93,11 @@ func main() {
 			tg:    tg,
 			store: store,
 		}
+		if authedUser != nil {
+			c.setAuthed(authedUser.TgID, authedUser.Nick)
+		}
 		hub.register <- c
 		go c.writePump()
 		go c.readPump()
-	})
-
-	log.Printf("ether-server (%s) listening on %s (ws-эндпоинт /ws)", path, cfg.Addr)
-	log.Fatal(http.ListenAndServe(cfg.Addr, nil))
+	}
 }

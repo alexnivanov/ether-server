@@ -75,29 +75,6 @@ func (c *Client) readPump() {
 		case TypeLoginTelegram:
 			c.out(envelope(TypeLoginLink, LoginLinkData{URL: c.tg.NewLoginToken(c)}))
 
-		case TypeResume:
-			var d ResumeData
-			if err := json.Unmarshal(env.Data, &d); err != nil || d.Token == "" {
-				c.sendError("bad_data", "invalid resume payload")
-				continue
-			}
-			u, err := c.store.UserBySession(d.Token)
-			if err != nil {
-				log.Printf("resume: %v", err)
-				c.sendError("internal", "session lookup failed")
-				continue
-			}
-			if u == nil {
-				c.sendError("bad_session", "сессия не найдена — войди через Telegram заново")
-				continue
-			}
-			c.setAuthed(u.TgID, u.Nick)
-			c.out(envelope(TypeAuthed, AuthedData{
-				User:          AuthedUser{ID: u.TgID, Nick: u.Nick, Username: u.Username},
-				Token:         d.Token,
-				RulesAccepted: u.RulesAccepted,
-			}))
-
 		case TypeLocate:
 			var d LocateData
 			if err := json.Unmarshal(env.Data, &d); err != nil {
@@ -143,46 +120,6 @@ func (c *Client) readPump() {
 				m.ID = id
 			}
 			c.hub.broadcast <- m
-
-		case TypeAcceptRules:
-			userID, nick, authed := c.authedUser()
-			if !authed {
-				c.sendError("not_authed", "войди через Telegram перед принятием правил")
-				continue
-			}
-			if err := c.store.AcceptRules(userID); err != nil {
-				log.Printf("accept rules %d: %v", userID, err)
-				c.sendError("internal", "failed to save rules acceptance")
-				continue
-			}
-			// подтверждение: без него клиент не знает, что запись закоммичена
-			// (пригодится, если когда-нибудь понадобится ждать перед входом
-			// в чат); токен не повторяем — клиент уже его хранит
-			c.out(envelope(TypeAuthed, AuthedData{
-				User:          AuthedUser{ID: userID, Nick: nick},
-				RulesAccepted: true,
-			}))
-
-		case TypeHistory:
-			var d HistoryRequestData
-			if err := json.Unmarshal(env.Data, &d); err != nil || d.Channel == "" {
-				c.sendError("bad_data", "invalid history payload")
-				continue
-			}
-			limit := d.Limit
-			if limit <= 0 {
-				limit = 50
-			}
-			if limit > maxHistoryLimit {
-				limit = maxHistoryLimit
-			}
-			msgs, err := c.store.History(d.Channel, d.BeforeID, limit)
-			if err != nil {
-				log.Printf("history %q: %v", d.Channel, err)
-				c.sendError("internal", "history lookup failed")
-				continue
-			}
-			c.out(envelope(TypeHistory, HistoryData{Channel: d.Channel, Messages: msgs}))
 
 		default:
 			c.sendError("unknown_type", "unknown message type: "+env.Type)

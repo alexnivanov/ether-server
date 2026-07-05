@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -19,31 +21,52 @@ func mustUnmarshal(t *testing.T, data json.RawMessage, v any) {
 	}
 }
 
-// Сквозная проверка resume по настоящему WebSocket: publish до входа
-// отбивается, мусорный токен — bad_session, посеянный — authed.
-// Telegram не участвует: resume ходит только в Store.
-func TestResumeOverWebSocket(t *testing.T) {
+// newTestServer поднимает REST + /ws на одном сервере, как main.go, поверх
+// свежего Store и StubGeocoder — без настоящего Telegram (боту тут делать
+// нечего: resume/accept_rules/history проверяются через REST, а логин у бота
+// покрыт другими тестами TelegramAuth).
+func newTestServer(t *testing.T) (*httptest.Server, *Store) {
+	t.Helper()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "e2e.db"))
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
-	defer store.Close()
+	t.Cleanup(func() { store.Close() })
 
 	hub := NewHub()
 	go hub.Run()
 	tg := &TelegramAuth{hub: hub, store: store, pending: map[string]pendingLogin{}}
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := upgrader.Upgrade(w, r, nil)
-		if err != nil {
-			return
-		}
-		c := &Client{hub: hub, conn: conn, send: make(chan Envelope, 16), geo: StubGeocoder{}, tg: tg, store: store}
-		hub.register <- c
-		go c.writePump()
-		go c.readPump()
-	}))
-	defer srv.Close()
+	mux := http.NewServeMux()
+	registerREST(mux, store)
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, tg, store))
+
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, store
+}
+
+func restPost(t *testing.T, url string, body any) (*http.Response, map[string]any) {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		t.Fatalf("decode response from %s: %v", url, err)
+	}
+	return resp, m
+}
+
+// Сквозная проверка REST-эндпоинтов, вынесенных из WS (resume/accept_rules/
+// history): мусорный токен — 401 bad_session, настоящий — данные аккаунта,
+// принятие правил персистентно и видно в следующем resume, история отдаёт
+// то, что было опубликовано по WS.
+func TestRESTSessionFlow(t *testing.T) {
+	srv, store := newTestServer(t)
 
 	if _, err := store.SaveUser(User{TgID: 7, Username: "alex", FirstName: "Alex", Nick: "alex"}); err != nil {
 		t.Fatalf("seed user: %v", err)
@@ -53,105 +76,161 @@ func TestResumeOverWebSocket(t *testing.T) {
 		t.Fatalf("seed session: %v", err)
 	}
 
-	ws, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	// мусорный токен не пускает
+	resp, body := restPost(t, srv.URL+"/session/resume", ResumeData{Token: "garbage"})
+	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
+		t.Fatalf("resume(garbage) = %d %v, want 401 bad_session", resp.StatusCode, body)
+	}
+
+	// настоящий токен отдаёт личность аккаунта
+	resp, body = restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("resume(token) = %d %v, want 200", resp.StatusCode, body)
+	}
+	var authed AuthedData
+	raw, _ := json.Marshal(body)
+	mustUnmarshal(t, raw, &authed)
+	if authed.User.ID != 7 || authed.User.Nick != "alex" || authed.Token != "" {
+		t.Fatalf("resume: %+v, want token пустой (клиент его и так знает)", authed)
+	}
+	if authed.RulesAccepted {
+		t.Fatalf("resume: rules_accepted = true до accept_rules")
+	}
+
+	// без токена accept_rules недоступен
+	resp, body = restPost(t, srv.URL+"/rules/accept", AcceptRulesData{})
+	if resp.StatusCode != http.StatusBadRequest || body["code"] != "not_authed" {
+		t.Fatalf("accept_rules() = %d %v, want 400 not_authed", resp.StatusCode, body)
+	}
+
+	// принятие правил персистентно и видно в следующем resume (аккаунт, не устройство)
+	resp, body = restPost(t, srv.URL+"/rules/accept", AcceptRulesData{Token: token})
+	if resp.StatusCode != http.StatusOK || body["rules_accepted"] != true {
+		t.Fatalf("accept_rules(token) = %d %v, want 200 rules_accepted=true", resp.StatusCode, body)
+	}
+	_, body = restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
+	if body["rules_accepted"] != true {
+		t.Fatalf("resume после accept_rules: %v, want rules_accepted=true", body)
+	}
+
+	// история пуста, пока никто не публиковал
+	histResp, err := http.Get(srv.URL + "/history?channel=RU")
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf("GET history: %v", err)
+	}
+	defer histResp.Body.Close()
+	var h HistoryData
+	if err := json.NewDecoder(histResp.Body).Decode(&h); err != nil {
+		t.Fatalf("decode history: %v", err)
+	}
+	if len(h.Messages) != 0 {
+		t.Fatalf("history пустого канала: %+v", h)
+	}
+
+	// публикуем через WS (с тем же токеном — см. TestWebSocketTokenAuth) и
+	// проверяем, что REST history видит результат
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + token
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial ws: %v", err)
 	}
 	defer ws.Close()
 	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	roundtrip := func(out Envelope) Envelope {
-		if err := ws.WriteJSON(out); err != nil {
-			t.Fatalf("write %s: %v", out.Type, err)
-		}
-		var in Envelope
-		if err := ws.ReadJSON(&in); err != nil {
-			t.Fatalf("read after %s: %v", out.Type, err)
-		}
-		return in
+	if err := ws.WriteJSON(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})); err != nil {
+		t.Fatalf("write locate: %v", err)
 	}
-	wantError := func(env Envelope, code string) {
-		t.Helper()
-		if env.Type != TypeError {
-			t.Fatalf("got %s %s, want error %s", env.Type, env.Data, code)
-		}
-		var e ErrorData
-		mustUnmarshal(t, env.Data, &e)
-		if e.Code != code {
-			t.Fatalf("got error %q, want %q", e.Code, code)
-		}
+	var located Envelope
+	if err := ws.ReadJSON(&located); err != nil {
+		t.Fatalf("read located: %v", err)
+	}
+	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "привет"})); err != nil {
+		t.Fatalf("write publish: %v", err)
+	}
+	var msgEnv Envelope
+	if err := ws.ReadJSON(&msgEnv); err != nil {
+		t.Fatalf("read message: %v", err)
 	}
 
-	// без входа публиковать нельзя
-	wantError(roundtrip(envelope(TypePublish, PublishData{Channel: "RU", Text: "hi"})), "not_authed")
-
-	// мусорный токен не пускает
-	wantError(roundtrip(envelope(TypeResume, ResumeData{Token: "garbage"})), "bad_session")
-
-	// настоящий токен восстанавливает вход
-	env := roundtrip(envelope(TypeResume, ResumeData{Token: token}))
-	var authed AuthedData
-	if env.Type != TypeAuthed {
-		t.Fatalf("got %s %s, want authed", env.Type, env.Data)
-	}
-	mustUnmarshal(t, env.Data, &authed)
-	if authed.User.ID != 7 || authed.User.Nick != "alex" || authed.Token != token {
-		t.Fatalf("authed: %+v", authed)
-	}
-	if authed.RulesAccepted {
-		t.Fatalf("authed: rules_accepted = true до accept_rules")
-	}
-
-	// после resume publish проходит: сообщение возвращается подписчику
-	roundtrip(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})) // located, подписка через StubGeocoder
-	msg := roundtrip(envelope(TypePublish, PublishData{Channel: "RU", Text: "привет"}))
-	var m MessageData
-	if msg.Type != TypeMessage {
-		t.Fatalf("got %s %s, want message", msg.Type, msg.Data)
-	}
-	mustUnmarshal(t, msg.Data, &m)
-	if m.Sender != "alex" || m.Text != "привет" || m.ID == 0 {
-		t.Fatalf("message: %+v", m)
-	}
-
-	// сообщение легло в историю и возвращается кадром history
-	env = roundtrip(envelope(TypeHistory, HistoryRequestData{Channel: "RU"}))
-	if env.Type != TypeHistory {
-		t.Fatalf("got %s %s, want history", env.Type, env.Data)
-	}
-	var h HistoryData
-	mustUnmarshal(t, env.Data, &h)
-	if len(h.Messages) != 1 || h.Messages[0].ID != m.ID || h.Messages[0].Text != "привет" {
-		t.Fatalf("history: %+v", h)
-	}
-
-	// принятие правил персистентно и переживает реконнект (новое соединение,
-	// тот же токен) — экран правил больше показывать не нужно
-	env = roundtrip(envelope(TypeAcceptRules, struct{}{}))
-	if env.Type != TypeAuthed {
-		t.Fatalf("got %s %s, want authed (accept_rules ack)", env.Type, env.Data)
-	}
-	mustUnmarshal(t, env.Data, &authed)
-	if !authed.RulesAccepted {
-		t.Fatalf("accept_rules ack: rules_accepted = false, want true")
-	}
-
-	ws2, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	histResp2, err := http.Get(srv.URL + "/history?channel=RU")
 	if err != nil {
-		t.Fatalf("dial 2: %v", err)
+		t.Fatalf("GET history 2: %v", err)
 	}
-	defer ws2.Close()
-	ws2.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if err := ws2.WriteJSON(envelope(TypeResume, ResumeData{Token: token})); err != nil {
-		t.Fatalf("write resume 2: %v", err)
+	defer histResp2.Body.Close()
+	var h2 HistoryData
+	if err := json.NewDecoder(histResp2.Body).Decode(&h2); err != nil {
+		t.Fatalf("decode history 2: %v", err)
 	}
-	var env2 Envelope
-	if err := ws2.ReadJSON(&env2); err != nil {
-		t.Fatalf("read resume 2: %v", err)
+	if len(h2.Messages) != 1 || h2.Messages[0].Text != "привет" || h2.Messages[0].Sender != "alex" {
+		t.Fatalf("history после publish: %+v", h2)
 	}
-	var authed2 AuthedData
-	mustUnmarshal(t, env2.Data, &authed2)
-	if !authed2.RulesAccepted {
-		t.Fatalf("authed после accept_rules: rules_accepted = false, want true")
+}
+
+// Проверяет аутентификацию WS в момент апгрейда через ?token=: мусорный токен
+// отбивается ещё до открытия сокета (401, апгрейд не происходит), настоящий —
+// сокет сразу authed без единого кадра, анонимное подключение (без токена)
+// может locate, но не publish.
+func TestWebSocketTokenAuth(t *testing.T) {
+	srv, store := newTestServer(t)
+
+	if _, err := store.SaveUser(User{TgID: 9, Username: "bob", FirstName: "Bob", Nick: "bob"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	token, err := store.NewSession(9)
+	if err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+	wsBase := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	// мусорный токен — апгрейд не проходит вовсе
+	_, resp, err := websocket.DefaultDialer.Dial(wsBase+"/ws?token=garbage", nil)
+	if err == nil {
+		t.Fatalf("dial(garbage token): ожидалась ошибка апгрейда")
+	}
+	if resp == nil || resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("dial(garbage token): status = %v, want 401", resp)
+	}
+
+	// настоящий токен — сокет уже authed, publish проходит без единого кадра входа
+	ws, _, err := websocket.DefaultDialer.Dial(wsBase+fmt.Sprintf("/ws?token=%s", token), nil)
+	if err != nil {
+		t.Fatalf("dial(valid token): %v", err)
+	}
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// подписка на канал — иначе broadcast некому доставить, включая отправителя
+	if err := ws.WriteJSON(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})); err != nil {
+		t.Fatalf("write locate: %v", err)
+	}
+	var env Envelope
+	if err := ws.ReadJSON(&env); err != nil {
+		t.Fatalf("read located: %v", err)
+	}
+	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "hi"})); err != nil {
+		t.Fatalf("write publish: %v", err)
+	}
+	if err := ws.ReadJSON(&env); err != nil {
+		t.Fatalf("read after publish: %v", err)
+	}
+	if env.Type != TypeMessage {
+		t.Fatalf("got %s %s, want message (сокет должен быть authed сразу по токену)", env.Type, env.Data)
+	}
+
+	// анонимное подключение: locate работает, publish — нет
+	anon, _, err := websocket.DefaultDialer.Dial(wsBase+"/ws", nil)
+	if err != nil {
+		t.Fatalf("dial(anon): %v", err)
+	}
+	defer anon.Close()
+	anon.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := anon.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "hi"})); err != nil {
+		t.Fatalf("write publish anon: %v", err)
+	}
+	if err := anon.ReadJSON(&env); err != nil {
+		t.Fatalf("read after publish anon: %v", err)
+	}
+	var e ErrorData
+	mustUnmarshal(t, env.Data, &e)
+	if env.Type != TypeError || e.Code != "not_authed" {
+		t.Fatalf("anon publish: got %s %+v, want error not_authed", env.Type, e)
 	}
 }
