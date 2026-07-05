@@ -13,8 +13,10 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	defer s.Close()
 
 	u := User{TgID: 42, Username: "alex", FirstName: "Alex", Nick: "alex"}
-	if err := s.SaveUser(u); err != nil {
+	if accepted, err := s.SaveUser(u); err != nil {
 		t.Fatalf("save: %v", err)
+	} else if accepted {
+		t.Fatal("save: rules_accepted = true для нового пользователя")
 	}
 
 	token, err := s.NewSession(u.TgID)
@@ -44,7 +46,7 @@ func TestStoreUsersAndSessions(t *testing.T) {
 
 	// повторный вход обновляет ник, старая сессия видит новый
 	u.Nick = "alex_new"
-	if err := s.SaveUser(u); err != nil {
+	if _, err := s.SaveUser(u); err != nil {
 		t.Fatalf("re-save: %v", err)
 	}
 	got, err = s.UserBySession(token)
@@ -53,6 +55,23 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	}
 	if got == nil || got.Nick != "alex_new" {
 		t.Fatalf("resume after re-save: got %+v, want nick alex_new", got)
+	}
+
+	// правила принимаются один раз и переживают повторные SaveUser (логин)
+	if err := s.AcceptRules(u.TgID); err != nil {
+		t.Fatalf("accept rules: %v", err)
+	}
+	if accepted, err := s.SaveUser(u); err != nil {
+		t.Fatalf("re-save after accept: %v", err)
+	} else if !accepted {
+		t.Fatal("re-save after accept: rules_accepted = false, want true")
+	}
+	got, err = s.UserBySession(token)
+	if err != nil {
+		t.Fatalf("resume after accept: %v", err)
+	}
+	if got == nil || !got.RulesAccepted {
+		t.Fatalf("resume after accept: got %+v, want RulesAccepted=true", got)
 	}
 }
 

@@ -146,11 +146,15 @@ func (t *TelegramAuth) confirm(token string, id int64, username, firstName strin
 	// персистентность: пользователь и токен сессии переживают реконнект
 	// (кадр resume). Ошибка хранилища не валит вход — просто без resume.
 	sessionToken := ""
-	if err := t.store.SaveUser(User{TgID: id, Username: username, FirstName: firstName, Nick: nick}); err != nil {
+	rulesAccepted := false
+	if accepted, err := t.store.SaveUser(User{TgID: id, Username: username, FirstName: firstName, Nick: nick}); err != nil {
 		log.Printf("telegram: save user %d: %v", id, err)
-	} else if sessionToken, err = t.store.NewSession(id); err != nil {
-		log.Printf("telegram: new session for %d: %v", id, err)
-		sessionToken = ""
+	} else {
+		rulesAccepted = accepted
+		if sessionToken, err = t.store.NewSession(id); err != nil {
+			log.Printf("telegram: new session for %d: %v", id, err)
+			sessionToken = ""
+		}
 	}
 
 	p.client.setAuthed(id, nick)
@@ -158,8 +162,9 @@ func (t *TelegramAuth) confirm(token string, id int64, username, firstName strin
 	t.hub.direct <- directEnvelope{
 		client: p.client,
 		env: envelope(TypeAuthed, AuthedData{
-			User:  AuthedUser{ID: id, Nick: nick, Username: username},
-			Token: sessionToken,
+			User:          AuthedUser{ID: id, Nick: nick, Username: username},
+			Token:         sessionToken,
+			RulesAccepted: rulesAccepted,
 		}),
 	}
 	t.reply(chatID, "Готово, "+nick+"! Возвращайся в Эфир 🎉")

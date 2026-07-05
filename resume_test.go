@@ -45,7 +45,7 @@ func TestResumeOverWebSocket(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := store.SaveUser(User{TgID: 7, Username: "alex", FirstName: "Alex", Nick: "alex"}); err != nil {
+	if _, err := store.SaveUser(User{TgID: 7, Username: "alex", FirstName: "Alex", Nick: "alex"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
 	token, err := store.NewSession(7)
@@ -98,6 +98,9 @@ func TestResumeOverWebSocket(t *testing.T) {
 	if authed.User.ID != 7 || authed.User.Nick != "alex" || authed.Token != token {
 		t.Fatalf("authed: %+v", authed)
 	}
+	if authed.RulesAccepted {
+		t.Fatalf("authed: rules_accepted = true до accept_rules")
+	}
 
 	// после resume publish проходит: сообщение возвращается подписчику
 	roundtrip(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})) // located, подписка через StubGeocoder
@@ -120,5 +123,35 @@ func TestResumeOverWebSocket(t *testing.T) {
 	mustUnmarshal(t, env.Data, &h)
 	if len(h.Messages) != 1 || h.Messages[0].ID != m.ID || h.Messages[0].Text != "привет" {
 		t.Fatalf("history: %+v", h)
+	}
+
+	// принятие правил персистентно и переживает реконнект (новое соединение,
+	// тот же токен) — экран правил больше показывать не нужно
+	env = roundtrip(envelope(TypeAcceptRules, struct{}{}))
+	if env.Type != TypeAuthed {
+		t.Fatalf("got %s %s, want authed (accept_rules ack)", env.Type, env.Data)
+	}
+	mustUnmarshal(t, env.Data, &authed)
+	if !authed.RulesAccepted {
+		t.Fatalf("accept_rules ack: rules_accepted = false, want true")
+	}
+
+	ws2, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer ws2.Close()
+	ws2.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := ws2.WriteJSON(envelope(TypeResume, ResumeData{Token: token})); err != nil {
+		t.Fatalf("write resume 2: %v", err)
+	}
+	var env2 Envelope
+	if err := ws2.ReadJSON(&env2); err != nil {
+		t.Fatalf("read resume 2: %v", err)
+	}
+	var authed2 AuthedData
+	mustUnmarshal(t, env2.Data, &authed2)
+	if !authed2.RulesAccepted {
+		t.Fatalf("authed после accept_rules: rules_accepted = false, want true")
 	}
 }

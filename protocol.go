@@ -10,6 +10,7 @@ const (
 	TypePublish       = "publish"        // {channel, text} — только после authed
 	TypeLoginTelegram = "login_telegram" // {} — запросить ссылку входа
 	TypeResume        = "resume"         // {token} — восстановить сессию после реконнекта
+	TypeAcceptRules   = "accept_rules"   // {} — принять правила эфира, только после authed
 
 	// history: запрос client → server {channel, before_id?, limit?},
 	// ответ server → client {channel, messages: [...]}
@@ -79,6 +80,9 @@ type AuthedData struct {
 	// сессионный токен: клиент сохраняет его и предъявляет в resume после
 	// реконнекта; пустой, если сессию не удалось сохранить
 	Token string `json:"token,omitempty"`
+	// принимал ли этот аккаунт правила эфира раньше (accept_rules) — привязано
+	// к пользователю, не к устройству/сессии; true — клиент минует экран правил
+	RulesAccepted bool `json:"rules_accepted"`
 }
 
 // mustJSON сериализует payload в RawMessage для вложения в Envelope.
