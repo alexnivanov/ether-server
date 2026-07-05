@@ -106,13 +106,28 @@ func (e *nomAddressEntry) ref() string {
 	return fmt.Sprintf("%s/%d", t, e.OSMID)
 }
 
+var numericName = regexp.MustCompile(`^\d+$`)
+
 // isUnit — реальная территориальная единица, а не адресный скаляр (индекс,
 // номер дома, код страны). Только такие записи годятся в кандидаты слотов.
+//
+// Отдельно отсекаем place/quarter с чисто числовым именем ("4", "14", ...) —
+// это узлы внутренней адресной сетки OSM (наблюдалось в Москве: несколько таких
+// узлов на одном ранге рядом с настоящим районом), а не именованная единица.
+// Без этого фильтра сетка выигрывала у административного района как более
+// специфичная по рангу и подменяла собой слот «Район» (порт фикса из
+// ether-research/nominatim_hierarchy.js).
 func (e *nomAddressEntry) isUnit() bool {
 	if e.IsAddress != nil && !*e.IsAddress {
 		return false
 	}
-	return e.Type != "postcode" && e.Type != "house_number"
+	if e.Type == "postcode" || e.Type == "house_number" {
+		return false
+	}
+	if e.Class == "place" && e.Type == "quarter" && numericName.MatchString(e.LocalName) {
+		return false
+	}
+	return true
 }
 
 // ─── HTTP ─────────────────────────────────────────────────────────────────────
