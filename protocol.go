@@ -39,6 +39,7 @@ type PublishData struct {
 	Channel string `json:"channel"`
 	Text    string `json:"text"`
 }
+
 // ResumeData / AcceptRulesData — тела REST-запросов (см. rest.go), не WS.
 type ResumeData struct {
 	Token string `json:"token"`
@@ -76,6 +77,7 @@ type AuthedUser struct {
 	Nick     string `json:"nick"`
 	Username string `json:"username,omitempty"`
 }
+
 // AuthedData — push server → client по WS после подтверждения входа у бота
 // (см. telegram.go, TypeAuthed); тот же шейп переиспользует REST-ответ
 // POST /session/resume (см. rest.go) — там Token всегда пуст, клиент и так
