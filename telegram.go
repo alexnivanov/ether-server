@@ -1,237 +1,100 @@
 package main
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
-	"log"
-	"net/http"
-	"net/url"
-	"strings"
+	"strconv"
 	"sync"
-	"time"
+
+	"github.com/MicahParks/keyfunc/v3"
+	"github.com/golang-jwt/jwt/v5"
 )
 
-// TelegramAuth — вход через Telegram по deep-link боту (см. PROTOCOL.md):
-// клиент запрашивает login_link, получает t.me/<бот>?start=<токен>, пользователь
-// жмёт Start, бот видит `/start <токен>`, и сервер аутентифицирует то соединение,
-// которое запросило токен. Виджет Login Widget не используем: ему нужен домен
-// (/setdomain), deep-link работает и с localhost, и в мобильных клиентах.
+// TelegramAuth — проверка входа через нативный Telegram Login SDK (см.
+// ether-meta/PROTOCOL.md). SDK на устройстве открывает приложение Telegram и
+// отдаёт клиенту OIDC ID-token (JWT), подписанный Telegram. Сервер проверяет
+// его подпись по ПУБЛИЧНЫМ ключам Telegram (JWKS) и клеймы (iss/aud/exp) —
+// секретный токен бота для этого не нужен вовсе.
 //
-// Токен бота приходит из конфига (config.json, см. config.example.json).
-// Вход через Telegram обязателен: без валидного токена сервер не стартует.
+// Пришло на смену и long-poll-боту, и HMAC-виджету: нативный SDK логинит через
+// приложение (один тап, без номера) и корректно переживает повторный вход.
+const (
+	tgIssuer  = "https://oauth.telegram.org"
+	tgJWKSURL = "https://oauth.telegram.org/.well-known/jwks.json"
+)
+
 type TelegramAuth struct {
-	token   string
-	botName string
-	hub     *Hub
-	store   *Store
+	clientID string // aud — числовой client id приложения из @BotFather
+	jwksURL  string
 
-	mu      sync.Mutex
-	pending map[string]pendingLogin // login-токен → кто его ждёт
+	mu sync.Mutex
+	kf keyfunc.Keyfunc // ленивая инициализация — см. keys()
 }
 
-type pendingLogin struct {
-	client  *Client
-	expires time.Time
+func NewTelegramAuth(clientID, jwksURL string) *TelegramAuth {
+	return &TelegramAuth{clientID: clientID, jwksURL: jwksURL}
 }
 
-const loginTTL = 5 * time.Minute
-
-func NewTelegramAuth(botToken string, hub *Hub, store *Store) (*TelegramAuth, error) {
-	t := &TelegramAuth{token: botToken, hub: hub, store: store, pending: map[string]pendingLogin{}}
-	name, err := t.getMe()
-	if err != nil {
-		return nil, err // api() уже включает имя метода в текст ошибки
-	}
-	t.botName = name
-	go t.poll()
-	go t.expireLoop()
-	log.Printf("telegram: вход включён через @%s", name)
-	return t, nil
-}
-
-// NewLoginToken регистрирует одноразовый токен для соединения и возвращает
-// deep-link, который клиент откроет у пользователя.
-func (t *TelegramAuth) NewLoginToken(c *Client) string {
-	b := make([]byte, 16)
-	rand.Read(b)
-	token := hex.EncodeToString(b)
+// keys лениво поднимает keyfunc: первый вызов тянет JWKS и запускает фоновое
+// обновление ключей. Успех кэшируем, ошибку — нет, поэтому недоступность
+// Telegram на старте не валит сервер (падает только конкретный вход, а
+// следующий попробует снова).
+func (t *TelegramAuth) keys() (keyfunc.Keyfunc, error) {
 	t.mu.Lock()
-	t.pending[token] = pendingLogin{client: c, expires: time.Now().Add(loginTTL)}
-	t.mu.Unlock()
-	return "https://t.me/" + t.botName + "?start=" + token
-}
-
-// Cancel снимает все ожидающие токены соединения. Вызывается до unregister в
-// хабе — после этого confirm уже не найдёт клиента и не тронет закрытый send.
-func (t *TelegramAuth) Cancel(c *Client) {
-	t.mu.Lock()
-	for token, p := range t.pending {
-		if p.client == c {
-			delete(t.pending, token)
-		}
+	defer t.mu.Unlock()
+	if t.kf != nil {
+		return t.kf, nil
 	}
-	t.mu.Unlock()
-}
-
-// ── обработка апдейтов бота ──
-
-type tgUpdate struct {
-	UpdateID int64 `json:"update_id"`
-	Message  *struct {
-		Text string `json:"text"`
-		From *struct {
-			ID        int64  `json:"id"`
-			FirstName string `json:"first_name"`
-			Username  string `json:"username"`
-		} `json:"from"`
-		Chat struct {
-			ID int64 `json:"id"`
-		} `json:"chat"`
-	} `json:"message"`
-}
-
-func (t *TelegramAuth) poll() {
-	offset := int64(0)
-	for {
-		var updates []tgUpdate
-		err := t.api("getUpdates", url.Values{
-			"timeout":         {"50"},
-			"offset":          {fmt.Sprint(offset)},
-			"allowed_updates": {`["message"]`},
-		}, &updates)
-		if err != nil {
-			log.Printf("telegram: getUpdates: %v", err)
-			time.Sleep(3 * time.Second)
-			continue
-		}
-		for _, u := range updates {
-			offset = u.UpdateID + 1
-			m := u.Message
-			if m == nil || m.From == nil {
-				continue
-			}
-			token, ok := strings.CutPrefix(m.Text, "/start ")
-			if !ok {
-				t.reply(m.Chat.ID, "Это бот входа в Эфир — нажми «Продолжить с Telegram» в приложении.")
-				continue
-			}
-			t.confirm(strings.TrimSpace(token), m.From.ID, m.From.Username, m.From.FirstName, m.Chat.ID)
-		}
-	}
-}
-
-func (t *TelegramAuth) confirm(token string, id int64, username, firstName string, chatID int64) {
-	t.mu.Lock()
-	p, ok := t.pending[token]
-	if ok {
-		delete(t.pending, token)
-	}
-	t.mu.Unlock()
-	if !ok || time.Now().After(p.expires) {
-		t.reply(chatID, "Ссылка устарела — запроси вход в приложении ещё раз.")
-		return
-	}
-
-	nick := username
-	if nick == "" {
-		nick = firstName
-	}
-	if nick == "" {
-		nick = "anon"
-	}
-
-	// персистентность: пользователь и токен сессии переживают реконнект
-	// (кадр resume). Ошибка хранилища не валит вход — просто без resume.
-	sessionToken := ""
-	rulesAccepted := false
-	if accepted, err := t.store.SaveUser(User{TgID: id, Username: username, FirstName: firstName, Nick: nick}); err != nil {
-		log.Printf("telegram: save user %d: %v", id, err)
-	} else {
-		rulesAccepted = accepted
-		if sessionToken, err = t.store.NewSession(id); err != nil {
-			log.Printf("telegram: new session for %d: %v", id, err)
-			sessionToken = ""
-		}
-	}
-
-	p.client.setAuthed(id, nick)
-	// доставка через хаб: он сериализует отправку с close(send) при unregister
-	t.hub.direct <- directEnvelope{
-		client: p.client,
-		env: envelope(TypeAuthed, AuthedData{
-			User:          AuthedUser{ID: id, Nick: nick, Username: username},
-			Token:         sessionToken,
-			RulesAccepted: rulesAccepted,
-		}),
-	}
-	t.reply(chatID, "Готово, "+nick+"! Возвращайся в Эфир 🎉")
-	log.Printf("telegram: authed %q (tg id %d)", nick, id)
-}
-
-func (t *TelegramAuth) expireLoop() {
-	for range time.Tick(time.Minute) {
-		now := time.Now()
-		t.mu.Lock()
-		for token, p := range t.pending {
-			if now.After(p.expires) {
-				delete(t.pending, token)
-			}
-		}
-		t.mu.Unlock()
-	}
-}
-
-// ── Bot API ──
-
-// клиент с запасом по таймауту под long polling (timeout=50)
-var tgHTTP = &http.Client{Timeout: 60 * time.Second}
-
-func (t *TelegramAuth) api(method string, params url.Values, out any) error {
-	resp, err := tgHTTP.PostForm("https://api.telegram.org/bot"+t.token+"/"+method, params)
+	kf, err := keyfunc.NewDefault([]string{t.jwksURL})
 	if err != nil {
-		return err
+		return nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	var env struct {
-		OK          bool            `json:"ok"`
-		Result      json.RawMessage `json:"result"`
-		Description string          `json:"description"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		return fmt.Errorf("%s: %w", method, err)
-	}
-	if !env.OK {
-		return fmt.Errorf("%s: %s", method, env.Description)
-	}
-	if out != nil {
-		return json.Unmarshal(env.Result, out)
-	}
-	return nil
+	t.kf = kf
+	return kf, nil
 }
 
-func (t *TelegramAuth) getMe() (string, error) {
-	var me struct {
-		Username string `json:"username"`
-	}
-	if err := t.api("getMe", url.Values{}, &me); err != nil {
-		return "", err
-	}
-	return me.Username, nil
+// TelegramUser — данные из проверенного ID-token.
+type TelegramUser struct {
+	ID       int64
+	Username string
+	Name     string
 }
 
-func (t *TelegramAuth) reply(chatID int64, text string) {
-	err := t.api("sendMessage", url.Values{
-		"chat_id": {fmt.Sprint(chatID)},
-		"text":    {text},
-	}, nil)
-	if err != nil {
-		log.Printf("telegram: sendMessage: %v", err)
+// Nick — отображаемое имя: username, иначе имя, иначе "anon".
+func (u TelegramUser) Nick() string {
+	if u.Username != "" {
+		return u.Username
 	}
+	if u.Name != "" {
+		return u.Name
+	}
+	return "anon"
+}
+
+type tgClaims struct {
+	jwt.RegisteredClaims
+	PreferredUsername string `json:"preferred_username"`
+	GivenName         string `json:"given_name"`
+}
+
+// Verify проверяет ID-token (подпись по JWKS + iss/aud/exp/алгоритм) и
+// возвращает пользователя; sub — числовой Telegram user id.
+func (t *TelegramAuth) Verify(idToken string) (*TelegramUser, error) {
+	kf, err := t.keys()
+	if err != nil {
+		return nil, fmt.Errorf("jwks: %w", err)
+	}
+	var claims tgClaims
+	if _, err := jwt.ParseWithClaims(idToken, &claims, kf.Keyfunc,
+		jwt.WithValidMethods([]string{"RS256"}),
+		jwt.WithIssuer(tgIssuer),
+		jwt.WithAudience(t.clientID),
+		jwt.WithExpirationRequired(),
+	); err != nil {
+		return nil, err
+	}
+	id, err := strconv.ParseInt(claims.Subject, 10, 64)
+	if err != nil || id == 0 {
+		return nil, fmt.Errorf("bad subject %q", claims.Subject)
+	}
+	return &TelegramUser{ID: id, Username: claims.PreferredUsername, Name: claims.GivenName}, nil
 }

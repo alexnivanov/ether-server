@@ -8,18 +8,63 @@ import (
 )
 
 // REST — синхронный запрос-ответ без побочных эффектов на живом WS-соединении:
-// resume, accept_rules, history. Всё, что требует пуша или сокета как объекта
-// (login_telegram, locate, publish/message), осталось на WebSocket — см.
-// client.go и ether-meta/PROTOCOL.md.
+// вход через Telegram Login SDK (auth), resume, logout, accept_rules, history.
+// На WebSocket остались только locate и publish/message — см. client.go и
+// ether-meta/PROTOCOL.md.
 //
 // Идентификация здесь полностью стейтлесс: "аутентифицирован" значит "прислал
 // валидный токен сессии в этом запросе", без привязки к какому-либо Client —
 // в отличие от WS, где authed живёт на структуре соединения.
 
-func registerREST(mux *http.ServeMux, store *Store) {
+func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth) {
+	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg))
 	mux.HandleFunc("/session/resume", handleResume(store))
+	mux.HandleFunc("/session/logout", handleLogout(store))
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
 	mux.HandleFunc("/history", handleHistory(store))
+}
+
+// handleAuthTelegram — POST /auth/telegram {id_token} → 200 authed (user +
+// свежий token сессии + rules_accepted) | 401 bad_auth (JWT не прошёл) | 400
+// bad_data. id_token — OIDC-токен от нативного Telegram Login SDK; сервер
+// проверяет его подпись по публичным ключам Telegram (см. telegram.go), сети к
+// api.telegram.org не нужно.
+func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d TelegramAuthRequest
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.IDToken == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "missing id_token")
+			return
+		}
+		u, err := tg.Verify(d.IDToken)
+		if err != nil {
+			log.Printf("auth: verify id_token: %v", err)
+			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "проверка входа Telegram не прошла")
+			return
+		}
+		nick := u.Nick()
+		accepted, err := store.SaveUser(User{TgID: u.ID, Username: u.Username, FirstName: u.Name, Nick: nick})
+		if err != nil {
+			log.Printf("auth: save user %d: %v", u.ID, err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
+			return
+		}
+		token, err := store.NewSession(u.ID)
+		if err != nil {
+			log.Printf("auth: new session for %d: %v", u.ID, err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось создать сессию")
+			return
+		}
+		writeJSON(w, http.StatusOK, AuthedData{
+			User:          AuthedUser{ID: u.ID, Nick: nick, Username: u.Username},
+			Token:         token,
+			RulesAccepted: accepted,
+		})
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -59,6 +104,29 @@ func handleResume(store *Store) http.HandlerFunc {
 			User:          AuthedUser{ID: u.TgID, Nick: u.Nick, Username: u.Username},
 			RulesAccepted: u.RulesAccepted,
 		})
+	}
+}
+
+// handleLogout — POST /session/logout {token} → 200 {} всегда (идемпотентно:
+// отзыв несуществующего токена — тоже успех, клиенту важно лишь «сессии больше
+// нет»). Отзывает только этот токен, другие устройства пользователя не трогает.
+func handleLogout(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d LogoutData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "invalid logout payload")
+			return
+		}
+		if err := store.DeleteSession(d.Token); err != nil {
+			log.Printf("logout: %v", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "logout failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
 	}
 }
 

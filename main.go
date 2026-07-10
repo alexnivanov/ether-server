@@ -45,25 +45,26 @@ func main() {
 	}
 	var geo Geocoder = nominatim
 
-	tg, err := NewTelegramAuth(cfg.TelegramBotToken, hub, store)
-	if err != nil {
-		log.Fatalf("telegram: %v", err)
-	}
+	// вход через нативный Telegram Login SDK: сервер проверяет OIDC ID-token по
+	// публичным ключам Telegram (JWKS тянется лениво при первом входе), поэтому
+	// старт не зависит от доступности Telegram
+	tg := NewTelegramAuth(cfg.TelegramClientID, tgJWKSURL)
 
 	mux := http.NewServeMux()
-	registerREST(mux, store)
-	mux.HandleFunc("/ws", wsHandler(hub, geo, tg, store))
+	registerREST(mux, store, tg)
+	mux.HandleFunc("/ws", wsHandler(hub, geo, store))
 
-	log.Printf("ether-server (%s) listening on %s (ws-эндпоинт /ws, REST /session/resume /rules/accept /history)", path, cfg.Addr)
+	log.Printf("ether-server (%s) listening on %s (ws /ws; REST /auth/telegram /session/resume /session/logout /rules/accept /history)", path, cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
 }
 
 // wsHandler — апгрейд до WebSocket. ?token= опционален (можно смотреть каналы
 // и читать без входа), но если прислан — должен быть валиден: клиент получает
-// его либо из login_telegram/подтверждения у бота, либо только что проверил
-// его через REST /session/resume, так что протухший токен здесь — сигнал
-// рассинхронизации, а не штатный путь, поэтому отвечаем 401 до апгрейда.
-func wsHandler(hub *Hub, geo Geocoder, tg *TelegramAuth, store *Store) http.HandlerFunc {
+// его из REST /auth/telegram (вход через Login Widget) или /session/resume, так
+// что протухший токен здесь — сигнал рассинхронизации, а не штатный путь,
+// поэтому отвечаем 401 до апгрейда. ?token= — единственный способ авторизовать
+// сокет: логин-кадров на WS больше нет.
+func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var authedUser *User
 		if token := r.URL.Query().Get("token"); token != "" {
@@ -90,13 +91,11 @@ func wsHandler(hub *Hub, geo Geocoder, tg *TelegramAuth, store *Store) http.Hand
 			conn:  conn,
 			send:  make(chan Envelope, 16),
 			geo:   geo,
-			tg:    tg,
 			store: store,
 		}
 		if authedUser != nil {
 			c.setAuthed(authedUser.TgID, authedUser.Nick)
 		}
-		hub.register <- c
 		go c.writePump()
 		go c.readPump()
 	}

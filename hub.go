@@ -8,15 +8,10 @@ import "log"
 type Hub struct {
 	// channelID → множество подписанных клиентов
 	channels map[string]map[*Client]bool
-	// все живые соединения — чтобы направленная доставка (direct) была
-	// сериализована с close(send) в unregister
-	clients map[*Client]bool
 
-	register   chan *Client
 	unregister chan *Client
 	subscribe  chan subscription
 	broadcast  chan MessageData
-	direct     chan directEnvelope
 }
 
 type subscription struct {
@@ -24,33 +19,19 @@ type subscription struct {
 	channels []string
 }
 
-// directEnvelope — кадр одному конкретному соединению (например authed из
-// горутины Telegram-бота).
-type directEnvelope struct {
-	client *Client
-	env    Envelope
-}
-
 func NewHub() *Hub {
 	return &Hub{
 		channels:   make(map[string]map[*Client]bool),
-		clients:    make(map[*Client]bool),
-		register:   make(chan *Client),
 		unregister: make(chan *Client),
 		subscribe:  make(chan subscription),
 		broadcast:  make(chan MessageData),
-		direct:     make(chan directEnvelope),
 	}
 }
 
 func (h *Hub) Run() {
 	for {
 		select {
-		case c := <-h.register:
-			h.clients[c] = true
-
 		case c := <-h.unregister:
-			delete(h.clients, c)
 			for id, subs := range h.channels {
 				if subs[c] {
 					delete(subs, c)
@@ -60,15 +41,6 @@ func (h *Hub) Run() {
 				}
 			}
 			close(c.send)
-
-		case d := <-h.direct:
-			if h.clients[d.client] {
-				select {
-				case d.client.send <- d.env:
-				default:
-					log.Printf("send buffer full, dropping %s", d.env.Type)
-				}
-			}
 
 		case s := <-h.subscribe:
 			for _, id := range s.channels {

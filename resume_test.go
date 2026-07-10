@@ -22,9 +22,9 @@ func mustUnmarshal(t *testing.T, data json.RawMessage, v any) {
 }
 
 // newTestServer поднимает REST + /ws на одном сервере, как main.go, поверх
-// свежего Store и StubGeocoder — без настоящего Telegram (боту тут делать
-// нечего: resume/accept_rules/history проверяются через REST, а логин у бота
-// покрыт другими тестами TelegramAuth).
+// свежего Store и StubGeocoder. Эти тесты не ходят в /auth/telegram (сессии
+// заводятся напрямую через Store), поэтому TelegramAuth получает фиктивный JWKS
+// URL — он лениво тянется только при первом входе (см. TestAuthTelegram).
 func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 	t.Helper()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "e2e.db"))
@@ -35,11 +35,11 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 
 	hub := NewHub()
 	go hub.Run()
-	tg := &TelegramAuth{hub: hub, store: store, pending: map[string]pendingLogin{}}
+	tg := NewTelegramAuth("test-client", "http://127.0.0.1:0/jwks")
 
 	mux := http.NewServeMux()
-	registerREST(mux, store)
-	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, tg, store))
+	registerREST(mux, store, tg)
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -162,6 +162,21 @@ func TestRESTSessionFlow(t *testing.T) {
 	}
 	if len(h2.Messages) != 1 || h2.Messages[0].Text != "привет" || h2.Messages[0].Sender != "alex" {
 		t.Fatalf("history после publish: %+v", h2)
+	}
+
+	// logout отзывает сессию: тот же токен после него в resume — bad_session
+	resp, body = restPost(t, srv.URL+"/session/logout", LogoutData{Token: token})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("logout(token) = %d %v, want 200", resp.StatusCode, body)
+	}
+	resp, body = restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
+	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
+		t.Fatalf("resume после logout = %d %v, want 401 bad_session", resp.StatusCode, body)
+	}
+	// повторный logout того же токена — тоже 200 (идемпотентность)
+	resp, _ = restPost(t, srv.URL+"/session/logout", LogoutData{Token: token})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("повторный logout = %d, want 200 (идемпотентно)", resp.StatusCode)
 	}
 }
 

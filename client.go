@@ -22,10 +22,10 @@ type Client struct {
 	conn  *websocket.Conn
 	send  chan Envelope
 	geo   Geocoder
-	tg    *TelegramAuth
 	store *Store
 
-	// кто вошёл: читает readPump (publish), а пишет ещё и горутина Telegram-бота
+	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
+	// дальше только читается (publish)
 	mu     sync.Mutex
 	userID int64 // Telegram user id
 	nick   string
@@ -55,7 +55,6 @@ func (c *Client) setAuthed(userID int64, nick string) {
 
 func (c *Client) readPump() {
 	defer func() {
-		c.tg.Cancel(c) // до unregister: confirm не должен писать в закрытый send
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
@@ -72,9 +71,6 @@ func (c *Client) readPump() {
 		}
 
 		switch env.Type {
-		case TypeLoginTelegram:
-			c.out(envelope(TypeLoginLink, LoginLinkData{URL: c.tg.NewLoginToken(c)}))
-
 		case TypeLocate:
 			var d LocateData
 			if err := json.Unmarshal(env.Data, &d); err != nil {

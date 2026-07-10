@@ -132,6 +132,13 @@ func (s *Store) NewSession(tgID int64) (string, error) {
 	return token, nil
 }
 
+// DeleteSession отзывает один токен сессии (логаут). Идемпотентна: отсутствие
+// токена — не ошибка. Другие устройства того же пользователя не трогает.
+func (s *Store) DeleteSession(token string) error {
+	_, err := s.db.Exec(`DELETE FROM sessions WHERE token = ?`, token)
+	return err
+}
+
 // SaveMessage пишет сообщение в историю канала и возвращает его id.
 func (s *Store) SaveMessage(channel string, tgID int64, sender, text string, ts int64) (int64, error) {
 	res, err := s.db.Exec(`INSERT INTO messages (channel, tg_id, sender, text, ts) VALUES (?, ?, ?, ?, ?)`,
