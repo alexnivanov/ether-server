@@ -98,7 +98,12 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 			store: store,
 		}
 		if authedUser != nil {
-			c.setAuthed(authedUser.TgID, authedUser.Nick, authedUser.AvatarURL)
+			c.setAuthed(
+				authedUser.TgID,
+				authedUser.Nick,
+				authedUser.Username,
+				authedUser.AvatarURL,
+			)
 		}
 		go c.writePump()
 		go c.readPump()

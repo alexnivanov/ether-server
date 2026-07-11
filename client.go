@@ -29,6 +29,7 @@ type Client struct {
 	mu        sync.Mutex
 	userID    int64 // Telegram user id
 	nick      string
+	username  string // @username — кладётся в live-сообщения для ссылки на профиль
 	avatarURL string // фото профиля — кладётся в live-сообщения автора
 	authed    bool
 }
@@ -39,18 +40,20 @@ func (c *Client) Nick() string {
 	return c.nick
 }
 
-// author отдаёт данные автора для publish: tg id, ник, аватар и флаг «вход выполнен».
-func (c *Client) author() (id int64, nick, avatar string, authed bool) {
+// author отдаёт данные автора для publish: tg id, ник, @username, аватар и
+// флаг «вход выполнен».
+func (c *Client) author() (id int64, nick, username, avatar string, authed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.userID, c.nick, c.avatarURL, c.authed
+	return c.userID, c.nick, c.username, c.avatarURL, c.authed
 }
 
-func (c *Client) setAuthed(userID int64, nick, avatarURL string) {
+func (c *Client) setAuthed(userID int64, nick, username, avatarURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.userID = userID
 	c.nick = nick
+	c.username = username
 	c.avatarURL = avatarURL
 	c.authed = true
 }
@@ -92,7 +95,7 @@ func (c *Client) readPump() {
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
 		case TypePublish:
-			userID, nick, avatar, authed := c.author()
+			userID, nick, username, avatar, authed := c.author()
 			if !authed {
 				c.sendError("not_authed", "отправка доступна после входа через Telegram")
 				continue
@@ -110,7 +113,9 @@ func (c *Client) readPump() {
 			// для истории — JOIN из users (см. store.History)
 			m := MessageData{
 				Channel:   d.Channel,
+				SenderID:  userID,
 				Sender:    nick,
+				Username:  username,
 				AvatarURL: avatar,
 				Text:      d.Text,
 				TS:        time.Now().UnixMilli(),

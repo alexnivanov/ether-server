@@ -157,9 +157,9 @@ func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (
 // порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
 // старше него.
 func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
-	// ник и аватар автора — JOIN из users по tg_id (в messages их нет);
-	// LEFT JOIN на случай, если аккаунт автора удалён — тогда пустые.
-	q := `SELECT m.id, m.channel, COALESCE(u.nick, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
+	// ник, @username и аватар автора — JOIN из users по tg_id (в messages их
+	// нет); LEFT JOIN на случай, если аккаунт автора удалён — тогда пустые.
+	q := `SELECT m.id, m.channel, m.tg_id, COALESCE(u.nick, ''), COALESCE(u.username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
 		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
 		WHERE m.channel = ?`
 	args := []any{channel}
@@ -180,7 +180,8 @@ func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageDat
 	for rows.Next() {
 		var m MessageData
 		if err := rows.Scan(
-			&m.ID, &m.Channel, &m.Sender, &m.AvatarURL, &m.Text, &m.TS,
+			&m.ID, &m.Channel, &m.SenderID, &m.Sender, &m.Username,
+			&m.AvatarURL, &m.Text, &m.TS,
 		); err != nil {
 			return nil, err
 		}

@@ -18,7 +18,7 @@ const (
 
 	// server → client
 	TypeLocated = "located" // {channels: [...]}
-	TypeMessage = "message" // {id, channel, sender, avatar_url, text, ts}
+	TypeMessage = "message" // {id, channel, sender_id, sender, username, avatar_url, text, ts}
 	TypeError   = "error"   // {code, message}
 )
 
@@ -61,13 +61,17 @@ type LocatedData struct {
 	Channels []Channel `json:"channels"`
 }
 
-// MessageData — сообщение для клиента. Sender/AvatarURL не хранятся в таблице
-// messages: для истории собираются JOIN из users, для live — из авторского
-// соединения. AvatarURL пустой — у автора нет фото или профиль приватный.
+// MessageData — сообщение для клиента. Sender/Username/AvatarURL не хранятся в
+// таблице messages (там только tg_id автора): для истории собираются JOIN из
+// users, для live — из авторского соединения. SenderID/Username нужны клиенту,
+// чтобы по тапу на аватар открыть профиль автора в Telegram. AvatarURL/Username
+// пустые — у автора нет фото / нет @username.
 type MessageData struct {
 	ID        int64  `json:"id,omitempty"` // курсор для before_id; 0 — не сохранилось
 	Channel   string `json:"channel"`
+	SenderID  int64  `json:"sender_id,omitempty"` // Telegram user id автора
 	Sender    string `json:"sender"`
+	Username  string `json:"username,omitempty"`
 	AvatarURL string `json:"avatar_url,omitempty"`
 	Text      string `json:"text"`
 	TS        int64  `json:"ts"`

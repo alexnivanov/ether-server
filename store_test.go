@@ -82,9 +82,11 @@ func TestStoreMessages(t *testing.T) {
 	}
 	defer s.Close()
 
-	// автор: ник и аватар в messages не хранятся — History берёт их JOIN из users
+	// автор: ник/@username/аватар в messages не хранятся — History берёт их
+	// JOIN из users по tg_id
 	if _, err := s.SaveUser(User{
 		TgID:      42,
+		Username:  "alex_tg",
 		Nick:      "alex",
 		AvatarURL: "https://t.me/i/alex.jpg",
 	}); err != nil {
@@ -115,7 +117,10 @@ func TestStoreMessages(t *testing.T) {
 		t.Fatalf("history fields: %+v", msgs[0])
 	}
 	// ник и аватар подтянуты JOIN из users
-	if msgs[0].Sender != "alex" || msgs[0].AvatarURL != "https://t.me/i/alex.jpg" {
+	if msgs[0].Sender != "alex" ||
+		msgs[0].SenderID != 42 ||
+		msgs[0].Username != "alex_tg" ||
+		msgs[0].AvatarURL != "https://t.me/i/alex.jpg" {
 		t.Fatalf("history join users: %+v", msgs[0])
 	}
 
