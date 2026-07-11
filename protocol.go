@@ -78,9 +78,11 @@ type ErrorData struct {
 	Message string `json:"message"`
 }
 type AuthedUser struct {
-	ID       int64  `json:"id"` // Telegram user id
-	Nick     string `json:"nick"`
-	Username string `json:"username,omitempty"`
+	ID        int64  `json:"id"` // Telegram user id
+	Nick      string `json:"nick"`
+	Username  string `json:"username,omitempty"`
+	Name      string `json:"name,omitempty"`       // отображаемое имя из Telegram
+	AvatarURL string `json:"avatar_url,omitempty"` // URL фото профиля из Telegram
 }
 
 // AuthedData — общий шейп REST-ответов про личность: POST /auth/telegram (вход

@@ -27,6 +27,7 @@ type User struct {
 	Username  string
 	FirstName string
 	Nick      string
+	AvatarURL string // URL фото профиля из Telegram (claim `picture`); может быть пустым
 	// RulesAccepted — согласие с правилами эфира привязано к Telegram-аккаунту,
 	// а не к устройству/сессии: однажды принял — экран правил больше не увидит,
 	// даже переустановив клиент или потеряв shared_preferences.
@@ -39,6 +40,7 @@ CREATE TABLE IF NOT EXISTS users (
 	username          TEXT NOT NULL DEFAULT '',
 	first_name        TEXT NOT NULL DEFAULT '',
 	nick              TEXT NOT NULL,
+	avatar_url        TEXT NOT NULL DEFAULT '', -- URL фото профиля из Telegram
 	created_at        INTEGER NOT NULL,    -- unix-секунды
 	seen_at           INTEGER NOT NULL,
 	rules_accepted_at INTEGER NOT NULL DEFAULT 0 -- 0 — не принял
@@ -83,6 +85,10 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
+	// Миграция для БД, созданных до появления avatar_url: в свежих колонка уже
+	// есть из CREATE выше, здесь добавляем её к старым. Дубликат (колонка уже
+	// есть) — не ошибка для нас, поэтому результат игнорируем.
+	db.Exec(`ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
 }
 
@@ -95,14 +101,15 @@ func (s *Store) Close() error { return s.db.Close() }
 func (s *Store) SaveUser(u User) (rulesAccepted bool, err error) {
 	now := time.Now().Unix()
 	if _, err := s.db.Exec(`
-		INSERT INTO users (tg_id, username, first_name, nick, created_at, seen_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO users (tg_id, username, first_name, nick, avatar_url, created_at, seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(tg_id) DO UPDATE SET
 			username = excluded.username,
 			first_name = excluded.first_name,
 			nick = excluded.nick,
+			avatar_url = excluded.avatar_url,
 			seen_at = excluded.seen_at`,
-		u.TgID, u.Username, u.FirstName, u.Nick, now, now); err != nil {
+		u.TgID, u.Username, u.FirstName, u.Nick, u.AvatarURL, now, now); err != nil {
 		return false, err
 	}
 	var acceptedAt int64
@@ -192,10 +199,10 @@ func (s *Store) UserBySession(token string) (*User, error) {
 	var u User
 	var acceptedAt int64
 	err := s.db.QueryRow(`
-		SELECT u.tg_id, u.username, u.first_name, u.nick, u.rules_accepted_at
+		SELECT u.tg_id, u.username, u.first_name, u.nick, u.avatar_url, u.rules_accepted_at
 		FROM sessions s JOIN users u ON u.tg_id = s.tg_id
 		WHERE s.token = ?`, token).
-		Scan(&u.TgID, &u.Username, &u.FirstName, &u.Nick, &acceptedAt)
+		Scan(&u.TgID, &u.Username, &u.FirstName, &u.Nick, &u.AvatarURL, &acceptedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

@@ -60,7 +60,13 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
-			User:          AuthedUser{ID: u.ID, Nick: nick, Username: u.Username},
+			User: AuthedUser{
+				ID:        u.ID,
+				Nick:      nick,
+				Username:  u.Username,
+				Name:      u.Name,
+				AvatarURL: u.AvatarURL,
+			},
 			Token:         token,
 			RulesAccepted: accepted,
 		})
@@ -101,7 +107,13 @@ func handleResume(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
-			User:          AuthedUser{ID: u.TgID, Nick: u.Nick, Username: u.Username},
+			User: AuthedUser{
+				ID:        u.TgID,
+				Nick:      u.Nick,
+				Username:  u.Username,
+				Name:      u.FirstName,
+				AvatarURL: u.AvatarURL,
+			},
 			RulesAccepted: u.RulesAccepted,
 		})
 	}
@@ -159,7 +171,13 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
-			User:          AuthedUser{ID: u.TgID, Nick: u.Nick, Username: u.Username},
+			User: AuthedUser{
+				ID:        u.TgID,
+				Nick:      u.Nick,
+				Username:  u.Username,
+				Name:      u.FirstName,
+				AvatarURL: u.AvatarURL,
+			},
 			RulesAccepted: true,
 		})
 	}
