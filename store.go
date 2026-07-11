@@ -55,8 +55,7 @@ CREATE INDEX IF NOT EXISTS sessions_tg_id ON sessions(tg_id);
 CREATE TABLE IF NOT EXISTS messages (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT, -- монотонный, курсор пагинации
 	channel TEXT NOT NULL,                     -- ID канала (контракт ether-meta)
-	tg_id   INTEGER NOT NULL,                  -- автор (для модерации/удаления аккаунта)
-	sender  TEXT NOT NULL,                     -- ник на момент отправки
+	tg_id   INTEGER NOT NULL,                  -- автор; ник и аватар берутся JOIN из users
 	text    TEXT NOT NULL,
 	ts      INTEGER NOT NULL                   -- unix-миллисекунды (как в протоколе)
 );
@@ -85,10 +84,8 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	// Миграция для БД, созданных до появления avatar_url: в свежих колонка уже
-	// есть из CREATE выше, здесь добавляем её к старым. Дубликат (колонка уже
-	// есть) — не ошибка для нас, поэтому результат игнорируем.
-	db.Exec(`ALTER TABLE users ADD COLUMN avatar_url TEXT NOT NULL DEFAULT ''`)
+	// Миграций нет: до closed-beta MVP схему меняем свободно, а БД пересоздаём
+	// с нуля (единственный источник схемы — storeSchema выше).
 	return &Store{db: db}, nil
 }
 
@@ -147,9 +144,9 @@ func (s *Store) DeleteSession(token string) error {
 }
 
 // SaveMessage пишет сообщение в историю канала и возвращает его id.
-func (s *Store) SaveMessage(channel string, tgID int64, sender, text string, ts int64) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO messages (channel, tg_id, sender, text, ts) VALUES (?, ?, ?, ?, ?)`,
-		channel, tgID, sender, text, ts)
+func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO messages (channel, tg_id, text, ts) VALUES (?, ?, ?, ?)`,
+		channel, tgID, text, ts)
 	if err != nil {
 		return 0, err
 	}
@@ -160,13 +157,17 @@ func (s *Store) SaveMessage(channel string, tgID int64, sender, text string, ts 
 // порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
 // старше него.
 func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
-	q := `SELECT id, channel, sender, text, ts FROM messages WHERE channel = ?`
+	// ник и аватар автора — JOIN из users по tg_id (в messages их нет);
+	// LEFT JOIN на случай, если аккаунт автора удалён — тогда пустые.
+	q := `SELECT m.id, m.channel, COALESCE(u.nick, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
+		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
+		WHERE m.channel = ?`
 	args := []any{channel}
 	if beforeID > 0 {
-		q += ` AND id < ?`
+		q += ` AND m.id < ?`
 		args = append(args, beforeID)
 	}
-	q += ` ORDER BY id DESC LIMIT ?`
+	q += ` ORDER BY m.id DESC LIMIT ?`
 	args = append(args, limit)
 
 	rows, err := s.db.Query(q, args...)
@@ -178,7 +179,9 @@ func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageDat
 	msgs := make([]MessageData, 0, limit)
 	for rows.Next() {
 		var m MessageData
-		if err := rows.Scan(&m.ID, &m.Channel, &m.Sender, &m.Text, &m.TS); err != nil {
+		if err := rows.Scan(
+			&m.ID, &m.Channel, &m.Sender, &m.AvatarURL, &m.Text, &m.TS,
+		); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)

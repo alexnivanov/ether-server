@@ -18,7 +18,7 @@ const (
 
 	// server → client
 	TypeLocated = "located" // {channels: [...]}
-	TypeMessage = "message" // {id, channel, sender, text, ts}
+	TypeMessage = "message" // {id, channel, sender, avatar_url, text, ts}
 	TypeError   = "error"   // {code, message}
 )
 
@@ -60,12 +60,17 @@ type TelegramAuthRequest struct {
 type LocatedData struct {
 	Channels []Channel `json:"channels"`
 }
+
+// MessageData — сообщение для клиента. Sender/AvatarURL не хранятся в таблице
+// messages: для истории собираются JOIN из users, для live — из авторского
+// соединения. AvatarURL пустой — у автора нет фото или профиль приватный.
 type MessageData struct {
-	ID      int64  `json:"id,omitempty"` // курсор для before_id; 0 — не сохранилось
-	Channel string `json:"channel"`
-	Sender  string `json:"sender"`
-	Text    string `json:"text"`
-	TS      int64  `json:"ts"`
+	ID        int64  `json:"id,omitempty"` // курсор для before_id; 0 — не сохранилось
+	Channel   string `json:"channel"`
+	Sender    string `json:"sender"`
+	AvatarURL string `json:"avatar_url,omitempty"`
+	Text      string `json:"text"`
+	TS        int64  `json:"ts"`
 }
 
 // HistoryData — тело ответа REST GET /history (см. rest.go).

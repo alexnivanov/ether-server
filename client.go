@@ -26,10 +26,11 @@ type Client struct {
 
 	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
 	// дальше только читается (publish)
-	mu     sync.Mutex
-	userID int64 // Telegram user id
-	nick   string
-	authed bool
+	mu        sync.Mutex
+	userID    int64 // Telegram user id
+	nick      string
+	avatarURL string // фото профиля — кладётся в live-сообщения автора
+	authed    bool
 }
 
 func (c *Client) Nick() string {
@@ -38,18 +39,19 @@ func (c *Client) Nick() string {
 	return c.nick
 }
 
-// authedUser отдаёт автора для publish: tg id, ник и флаг «вход выполнен».
-func (c *Client) authedUser() (int64, string, bool) {
+// author отдаёт данные автора для publish: tg id, ник, аватар и флаг «вход выполнен».
+func (c *Client) author() (id int64, nick, avatar string, authed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.userID, c.nick, c.authed
+	return c.userID, c.nick, c.avatarURL, c.authed
 }
 
-func (c *Client) setAuthed(userID int64, nick string) {
+func (c *Client) setAuthed(userID int64, nick, avatarURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.userID = userID
 	c.nick = nick
+	c.avatarURL = avatarURL
 	c.authed = true
 }
 
@@ -90,7 +92,7 @@ func (c *Client) readPump() {
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
 		case TypePublish:
-			userID, nick, authed := c.authedUser()
+			userID, nick, avatar, authed := c.author()
 			if !authed {
 				c.sendError("not_authed", "отправка доступна после входа через Telegram")
 				continue
@@ -104,13 +106,16 @@ func (c *Client) readPump() {
 				c.sendError("bad_data", "text must be 1..4096 bytes")
 				continue
 			}
+			// в БД пишем только tg_id; ник/аватар для live берём из соединения,
+			// для истории — JOIN из users (см. store.History)
 			m := MessageData{
-				Channel: d.Channel,
-				Sender:  nick,
-				Text:    d.Text,
-				TS:      time.Now().UnixMilli(),
+				Channel:   d.Channel,
+				Sender:    nick,
+				AvatarURL: avatar,
+				Text:      d.Text,
+				TS:        time.Now().UnixMilli(),
 			}
-			if id, err := c.store.SaveMessage(m.Channel, userID, m.Sender, m.Text, m.TS); err != nil {
+			if id, err := c.store.SaveMessage(m.Channel, userID, m.Text, m.TS); err != nil {
 				log.Printf("save message: %v", err) // живая рассылка важнее истории
 			} else {
 				m.ID = id

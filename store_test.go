@@ -82,15 +82,24 @@ func TestStoreMessages(t *testing.T) {
 	}
 	defer s.Close()
 
+	// автор: ник и аватар в messages не хранятся — History берёт их JOIN из users
+	if _, err := s.SaveUser(User{
+		TgID:      42,
+		Nick:      "alex",
+		AvatarURL: "https://t.me/i/alex.jpg",
+	}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
 	var ids []int64
 	for i, text := range []string{"один", "два", "три", "четыре", "пять"} {
-		id, err := s.SaveMessage("RU", 42, "alex", text, int64(1000+i))
+		id, err := s.SaveMessage("RU", 42, text, int64(1000+i))
 		if err != nil {
 			t.Fatalf("save %q: %v", text, err)
 		}
 		ids = append(ids, id)
 	}
-	if _, err := s.SaveMessage("DE", 42, "alex", "hallo", 2000); err != nil {
+	if _, err := s.SaveMessage("DE", 42, "hallo", 2000); err != nil {
 		t.Fatalf("save DE: %v", err)
 	}
 
@@ -104,6 +113,10 @@ func TestStoreMessages(t *testing.T) {
 	}
 	if msgs[0].ID != ids[2] || msgs[0].Channel != "RU" || msgs[0].TS != 1002 {
 		t.Fatalf("history fields: %+v", msgs[0])
+	}
+	// ник и аватар подтянуты JOIN из users
+	if msgs[0].Sender != "alex" || msgs[0].AvatarURL != "https://t.me/i/alex.jpg" {
+		t.Fatalf("history join users: %+v", msgs[0])
 	}
 
 	// страница вверх от начала предыдущей

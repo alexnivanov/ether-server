@@ -13,6 +13,10 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// version проставляется при сборке (-ldflags "-X main.version=..."), см.
+// scripts/deploy.sh; при обычном go build/run остаётся "dev".
+var version = "dev"
+
 func main() {
 	env := flag.String("env", "dev", "окружение: берётся конфиг config.<env>.json")
 	configPath := flag.String("config", "", "явный путь к конфигу (перекрывает -env)")
@@ -54,7 +58,7 @@ func main() {
 	registerREST(mux, store, tg)
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store))
 
-	log.Printf("ether-server (%s) listening on %s (ws /ws; REST /auth/telegram /session/resume /session/logout /rules/accept /history)", path, cfg.Addr)
+	log.Printf("ether-server %s (%s) listening on %s (ws /ws; REST /auth/telegram /session/resume /session/logout /rules/accept /history)", version, path, cfg.Addr)
 	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
 }
 
@@ -94,7 +98,7 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 			store: store,
 		}
 		if authedUser != nil {
-			c.setAuthed(authedUser.TgID, authedUser.Nick)
+			c.setAuthed(authedUser.TgID, authedUser.Nick, authedUser.AvatarURL)
 		}
 		go c.writePump()
 		go c.readPump()

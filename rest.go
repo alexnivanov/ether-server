@@ -47,7 +47,7 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 			return
 		}
 		nick := u.Nick()
-		accepted, err := store.SaveUser(User{TgID: u.ID, Username: u.Username, FirstName: u.Name, Nick: nick})
+		accepted, err := store.SaveUser(User{TgID: u.ID, Username: u.Username, FirstName: u.Name, Nick: nick, AvatarURL: u.AvatarURL})
 		if err != nil {
 			log.Printf("auth: save user %d: %v", u.ID, err)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
