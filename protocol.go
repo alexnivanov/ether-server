@@ -84,7 +84,7 @@ type AuthedUser struct {
 }
 
 // AuthedData — общий шейп REST-ответов про личность: POST /auth/telegram (вход
-// через Login Widget), POST /session/resume и POST /rules/accept (см. rest.go).
+// через Telegram Login SDK), POST /session/resume и POST /rules/accept (см. rest.go).
 // В resume/accept_rules поле Token пустое — клиент и так прислал его в запросе;
 // заполнено оно только в ответе /auth/telegram (новая сессия).
 type AuthedData struct {
