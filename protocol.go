@@ -6,8 +6,8 @@ import "encoding/json"
 // пуш или живой сокет как побочный эффект: locate — подписывает соединение;
 // publish/message — рассылка. Сокет авторизуется единственным способом —
 // токеном сессии в query ?token= при апгрейде (см. wsHandler). Аутентификация
-// (вход через Telegram Login Widget), resume, accept_rules, history — в REST
-// (см. rest.go).
+// (вход через нативный Telegram Login SDK), resume, accept_rules, history — в
+// REST (см. rest.go).
 //
 // Каждый кадр WebSocket — это Envelope: тег типа + сырой payload, который
 // доразбирается по типу.
@@ -18,8 +18,8 @@ const (
 
 	// server → client
 	TypeLocated = "located" // {channels: [...]}
-	TypeMessage = "message"  // {id, channel, sender, text, ts}
-	TypeError   = "error"    // {code, message}
+	TypeMessage = "message" // {id, channel, sender, text, ts}
+	TypeError   = "error"   // {code, message}
 )
 
 // Envelope — внешняя оболочка любого сообщения.
