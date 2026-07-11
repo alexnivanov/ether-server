@@ -27,32 +27,32 @@ type Client struct {
 	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
 	// дальше только читается (publish)
 	mu        sync.Mutex
-	userID    int64 // Telegram user id
-	nick      string
-	username  string // @username — кладётся в live-сообщения для ссылки на профиль
-	avatarURL string // фото профиля — кладётся в live-сообщения автора
+	userID    int64  // Telegram user id
+	fullName  string // отображаемое имя автора — в live-сообщения
+	username  string // @username — в live-сообщения для ссылки на профиль
+	avatarURL string // фото профиля — в live-сообщения автора
 	authed    bool
 }
 
-func (c *Client) Nick() string {
+func (c *Client) DisplayName() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.nick
+	return c.fullName
 }
 
-// author отдаёт данные автора для publish: tg id, ник, @username, аватар и
+// author отдаёт данные автора для publish: tg id, имя, @username, аватар и
 // флаг «вход выполнен».
-func (c *Client) author() (id int64, nick, username, avatar string, authed bool) {
+func (c *Client) author() (id int64, name, username, avatar string, authed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.userID, c.nick, c.username, c.avatarURL, c.authed
+	return c.userID, c.fullName, c.username, c.avatarURL, c.authed
 }
 
-func (c *Client) setAuthed(userID int64, nick, username, avatarURL string) {
+func (c *Client) setAuthed(userID int64, fullName, username, avatarURL string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.userID = userID
-	c.nick = nick
+	c.fullName = fullName
 	c.username = username
 	c.avatarURL = avatarURL
 	c.authed = true
@@ -95,7 +95,7 @@ func (c *Client) readPump() {
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
 		case TypePublish:
-			userID, nick, username, avatar, authed := c.author()
+			userID, name, username, avatar, authed := c.author()
 			if !authed {
 				c.sendError("not_authed", "отправка доступна после входа через Telegram")
 				continue
@@ -109,12 +109,12 @@ func (c *Client) readPump() {
 				c.sendError("bad_data", "text must be 1..4096 bytes")
 				continue
 			}
-			// в БД пишем только tg_id; ник/аватар для live берём из соединения,
+			// в БД пишем только tg_id; имя/аватар для live берём из соединения,
 			// для истории — JOIN из users (см. store.History)
 			m := MessageData{
 				Channel:   d.Channel,
 				SenderID:  userID,
-				Sender:    nick,
+				Sender:    name,
 				Username:  username,
 				AvatarURL: avatar,
 				Text:      d.Text,
@@ -146,7 +146,7 @@ func (c *Client) out(env Envelope) {
 	select {
 	case c.send <- env:
 	default:
-		log.Printf("send buffer full for %q, dropping %s", c.Nick(), env.Type)
+		log.Printf("send buffer full for %q, dropping %s", c.DisplayName(), env.Type)
 	}
 }
 

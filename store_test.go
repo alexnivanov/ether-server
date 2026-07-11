@@ -12,7 +12,7 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	}
 	defer s.Close()
 
-	u := User{TgID: 42, Username: "alex", FirstName: "Alex", Nick: "alex"}
+	u := User{TgID: 42, TgUsername: "alex", FullName: "Alex"}
 	if accepted, err := s.SaveUser(u); err != nil {
 		t.Fatalf("save: %v", err)
 	} else if accepted {
@@ -45,7 +45,7 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	}
 
 	// повторный вход обновляет ник, старая сессия видит новый
-	u.Nick = "alex_new"
+	u.FullName = "alex_new"
 	if _, err := s.SaveUser(u); err != nil {
 		t.Fatalf("re-save: %v", err)
 	}
@@ -53,8 +53,8 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resume after re-save: %v", err)
 	}
-	if got == nil || got.Nick != "alex_new" {
-		t.Fatalf("resume after re-save: got %+v, want nick alex_new", got)
+	if got == nil || got.FullName != "alex_new" {
+		t.Fatalf("resume after re-save: got %+v, want full_name alex_new", got)
 	}
 
 	// правила принимаются один раз и переживают повторные SaveUser (логин)
@@ -85,10 +85,10 @@ func TestStoreMessages(t *testing.T) {
 	// автор: ник/@username/аватар в messages не хранятся — History берёт их
 	// JOIN из users по tg_id
 	if _, err := s.SaveUser(User{
-		TgID:      42,
-		Username:  "alex_tg",
-		Nick:      "alex",
-		AvatarURL: "https://t.me/i/alex.jpg",
+		TgID:       42,
+		TgUsername: "alex_tg",
+		FullName:   "alex",
+		AvatarURL:  "https://t.me/i/alex.jpg",
 	}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}

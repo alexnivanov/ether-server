@@ -23,11 +23,10 @@ type Store struct {
 }
 
 type User struct {
-	TgID      int64
-	Username  string
-	FirstName string
-	Nick      string
-	AvatarURL string // URL фото профиля из Telegram (claim `picture`); может быть пустым
+	TgID       int64
+	TgUsername string // @username — для ссылки на профиль в Telegram (не для имени)
+	FullName   string // отображаемое имя (Telegram `name`); единственное для UI
+	AvatarURL  string // URL фото профиля из Telegram (claim `picture`); может быть пустым
 	// RulesAccepted — согласие с правилами эфира привязано к Telegram-аккаунту,
 	// а не к устройству/сессии: однажды принял — экран правил больше не увидит,
 	// даже переустановив клиент или потеряв shared_preferences.
@@ -37,9 +36,8 @@ type User struct {
 const storeSchema = `
 CREATE TABLE IF NOT EXISTS users (
 	tg_id             INTEGER PRIMARY KEY, -- Telegram user id
-	username          TEXT NOT NULL DEFAULT '',
-	first_name        TEXT NOT NULL DEFAULT '',
-	nick              TEXT NOT NULL,
+	tg_username       TEXT NOT NULL DEFAULT '', -- @username (ссылка на профиль)
+	full_name         TEXT NOT NULL DEFAULT '', -- отображаемое имя (для UI)
 	avatar_url        TEXT NOT NULL DEFAULT '', -- URL фото профиля из Telegram
 	created_at        INTEGER NOT NULL,    -- unix-секунды
 	seen_at           INTEGER NOT NULL,
@@ -55,7 +53,7 @@ CREATE INDEX IF NOT EXISTS sessions_tg_id ON sessions(tg_id);
 CREATE TABLE IF NOT EXISTS messages (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT, -- монотонный, курсор пагинации
 	channel TEXT NOT NULL,                     -- ID канала (контракт ether-meta)
-	tg_id   INTEGER NOT NULL,                  -- автор; ник и аватар берутся JOIN из users
+	tg_id   INTEGER NOT NULL,                  -- автор; имя и аватар берутся JOIN из users
 	text    TEXT NOT NULL,
 	ts      INTEGER NOT NULL                   -- unix-миллисекунды (как в протоколе)
 );
@@ -91,22 +89,21 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// SaveUser создаёт или обновляет пользователя (ключ — tg id): username и ник
+// SaveUser создаёт или обновляет пользователя (ключ — tg id): tg_username и имя
 // подхватываются заново при каждом входе; rules_accepted_at не трогает — его
 // меняет только AcceptRules. Возвращает, принимал ли пользователь правила
 // раньше (для повторного входа тем же Telegram-аккаунтом).
 func (s *Store) SaveUser(u User) (rulesAccepted bool, err error) {
 	now := time.Now().Unix()
 	if _, err := s.db.Exec(`
-		INSERT INTO users (tg_id, username, first_name, nick, avatar_url, created_at, seen_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO users (tg_id, tg_username, full_name, avatar_url, created_at, seen_at)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(tg_id) DO UPDATE SET
-			username = excluded.username,
-			first_name = excluded.first_name,
-			nick = excluded.nick,
+			tg_username = excluded.tg_username,
+			full_name = excluded.full_name,
 			avatar_url = excluded.avatar_url,
 			seen_at = excluded.seen_at`,
-		u.TgID, u.Username, u.FirstName, u.Nick, u.AvatarURL, now, now); err != nil {
+		u.TgID, u.TgUsername, u.FullName, u.AvatarURL, now, now); err != nil {
 		return false, err
 	}
 	var acceptedAt int64
@@ -157,9 +154,9 @@ func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (
 // порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
 // старше него.
 func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
-	// ник, @username и аватар автора — JOIN из users по tg_id (в messages их
+	// имя, @username и аватар автора — JOIN из users по tg_id (в messages их
 	// нет); LEFT JOIN на случай, если аккаунт автора удалён — тогда пустые.
-	q := `SELECT m.id, m.channel, m.tg_id, COALESCE(u.nick, ''), COALESCE(u.username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
+	q := `SELECT m.id, m.channel, m.tg_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
 		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
 		WHERE m.channel = ?`
 	args := []any{channel}
@@ -203,10 +200,10 @@ func (s *Store) UserBySession(token string) (*User, error) {
 	var u User
 	var acceptedAt int64
 	err := s.db.QueryRow(`
-		SELECT u.tg_id, u.username, u.first_name, u.nick, u.avatar_url, u.rules_accepted_at
+		SELECT u.tg_id, u.tg_username, u.full_name, u.avatar_url, u.rules_accepted_at
 		FROM sessions s JOIN users u ON u.tg_id = s.tg_id
 		WHERE s.token = ?`, token).
-		Scan(&u.TgID, &u.Username, &u.FirstName, &u.Nick, &u.AvatarURL, &acceptedAt)
+		Scan(&u.TgID, &u.TgUsername, &u.FullName, &u.AvatarURL, &acceptedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}

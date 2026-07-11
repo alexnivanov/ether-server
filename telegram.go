@@ -55,20 +55,9 @@ func (t *TelegramAuth) keys() (keyfunc.Keyfunc, error) {
 // TelegramUser — данные из проверенного ID-token.
 type TelegramUser struct {
 	ID        int64
-	Username  string
+	Username  string // @username (для ссылки на профиль)
 	Name      string // отображаемое имя (полное `name`, иначе given_name)
 	AvatarURL string // URL фото профиля (claim `picture`), может быть пустым
-}
-
-// Nick — отображаемое имя: username, иначе имя, иначе "anon".
-func (u TelegramUser) Nick() string {
-	if u.Username != "" {
-		return u.Username
-	}
-	if u.Name != "" {
-		return u.Name
-	}
-	return "anon"
 }
 
 type tgClaims struct {
@@ -99,9 +88,14 @@ func (t *TelegramAuth) Verify(idToken string) (*TelegramUser, error) {
 	if err != nil || id == 0 {
 		return nil, fmt.Errorf("bad subject %q", claims.Subject)
 	}
+	// отображаемое имя: полное `name`, иначе `given_name`, иначе @username —
+	// чтобы поле не осталось пустым, если Telegram не прислал имя
 	name := claims.Name
 	if name == "" {
 		name = claims.GivenName
+	}
+	if name == "" {
+		name = claims.PreferredUsername
 	}
 	return &TelegramUser{
 		ID:        id,

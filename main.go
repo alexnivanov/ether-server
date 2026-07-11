@@ -100,8 +100,8 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 		if authedUser != nil {
 			c.setAuthed(
 				authedUser.TgID,
-				authedUser.Nick,
-				authedUser.Username,
+				authedUser.FullName,
+				authedUser.TgUsername,
 				authedUser.AvatarURL,
 			)
 		}

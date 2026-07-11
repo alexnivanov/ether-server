@@ -68,7 +68,7 @@ func restPost(t *testing.T, url string, body any) (*http.Response, map[string]an
 func TestRESTSessionFlow(t *testing.T) {
 	srv, store := newTestServer(t)
 
-	if _, err := store.SaveUser(User{TgID: 7, Username: "alex", FirstName: "Alex", Nick: "alex"}); err != nil {
+	if _, err := store.SaveUser(User{TgID: 7, TgUsername: "alex", FullName: "alex"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
 	token, err := store.NewSession(7)
@@ -90,7 +90,7 @@ func TestRESTSessionFlow(t *testing.T) {
 	var authed AuthedData
 	raw, _ := json.Marshal(body)
 	mustUnmarshal(t, raw, &authed)
-	if authed.User.ID != 7 || authed.User.Nick != "alex" || authed.Token != "" {
+	if authed.User.ID != 7 || authed.User.Name != "alex" || authed.Token != "" {
 		t.Fatalf("resume: %+v, want token пустой (клиент его и так знает)", authed)
 	}
 	if authed.RulesAccepted {
@@ -187,7 +187,7 @@ func TestRESTSessionFlow(t *testing.T) {
 func TestWebSocketTokenAuth(t *testing.T) {
 	srv, store := newTestServer(t)
 
-	if _, err := store.SaveUser(User{TgID: 9, Username: "bob", FirstName: "Bob", Nick: "bob"}); err != nil {
+	if _, err := store.SaveUser(User{TgID: 9, TgUsername: "bob", FullName: "bob"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
 	token, err := store.NewSession(9)

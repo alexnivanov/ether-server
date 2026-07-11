@@ -81,8 +81,8 @@ func TestAuthTelegram(t *testing.T) {
 	if token == "" {
 		t.Fatalf("auth(valid): пустой token, %v", m)
 	}
-	if u, _ := m["user"].(map[string]any); u == nil || u["nick"] != "alex" {
-		t.Fatalf("auth(valid): user = %v, want nick=alex", m["user"])
+	if u, _ := m["user"].(map[string]any); u == nil || u["name"] != "alex" {
+		t.Fatalf("auth(valid): user = %v, want name=alex", m["user"])
 	}
 	if u, err := store.UserBySession(token); err != nil || u == nil || u.TgID != 777 {
 		t.Fatalf("сессия из auth не резолвится: u=%v err=%v", u, err)

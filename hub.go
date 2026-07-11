@@ -57,7 +57,7 @@ func (h *Hub) Run() {
 				case c.send <- env:
 				default:
 					// медленный клиент: не блокируем хаб, роняем сообщение
-					log.Printf("send buffer full for %q, dropping message in %s", c.Nick(), m.Channel)
+					log.Printf("send buffer full for %q, dropping message in %s", c.DisplayName(), m.Channel)
 				}
 			}
 		}

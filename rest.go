@@ -46,8 +46,7 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "проверка входа Telegram не прошла")
 			return
 		}
-		nick := u.Nick()
-		accepted, err := store.SaveUser(User{TgID: u.ID, Username: u.Username, FirstName: u.Name, Nick: nick, AvatarURL: u.AvatarURL})
+		accepted, err := store.SaveUser(User{TgID: u.ID, TgUsername: u.Username, FullName: u.Name, AvatarURL: u.AvatarURL})
 		if err != nil {
 			log.Printf("auth: save user %d: %v", u.ID, err)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
@@ -62,7 +61,6 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, AuthedData{
 			User: AuthedUser{
 				ID:        u.ID,
-				Nick:      nick,
 				Username:  u.Username,
 				Name:      u.Name,
 				AvatarURL: u.AvatarURL,
@@ -83,7 +81,7 @@ func writeRESTError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, ErrorData{Code: code, Message: message})
 }
 
-// handleResume — POST /session/resume {token} → 200 authed (nick/username/
+// handleResume — POST /session/resume {token} → 200 authed (name/username/
 // rules_accepted, без token — клиент его и так прислал) | 401 bad_session.
 func handleResume(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -109,9 +107,8 @@ func handleResume(store *Store) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, AuthedData{
 			User: AuthedUser{
 				ID:        u.TgID,
-				Nick:      u.Nick,
-				Username:  u.Username,
-				Name:      u.FirstName,
+				Username:  u.TgUsername,
+				Name:      u.FullName,
 				AvatarURL: u.AvatarURL,
 			},
 			RulesAccepted: u.RulesAccepted,
@@ -173,9 +170,8 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, AuthedData{
 			User: AuthedUser{
 				ID:        u.TgID,
-				Nick:      u.Nick,
-				Username:  u.Username,
-				Name:      u.FirstName,
+				Username:  u.TgUsername,
+				Name:      u.FullName,
 				AvatarURL: u.AvatarURL,
 			},
 			RulesAccepted: true,
