@@ -27,6 +27,37 @@ go run . -config /etc/ether/custom.json  # явный путь вместо -env
 
 Сервер принимает WebSocket-соединения на `/ws` (`ws://localhost:8080/ws`).
 
+## Деплой (прод)
+
+Прод — один хост (`etherapp.ru`, SSH-алиас `ether`): статический Go-бинарник под
+systemd, наружу его публикует Caddy с авто-TLS. Раскладка раздельная — бинарник
+и конфиг read-only, запись только в каталог с базой (`ProtectSystem=strict` +
+`ReadWritePaths=/var/lib/ether`):
+
+| Путь | Что это |
+|---|---|
+| `/opt/ether/ether-server` | бинарник, read-only для сервиса (владелец `ether:ether`, `0755`) |
+| `/etc/ether/config.prod.json` | конфиг с секретами (не в git; образец — `config.example.json`), передаётся флагом `-config` |
+| `/var/lib/ether/ether.prod.db` (+`-wal`/`-shm`) | база SQLite; `/var/lib/ether` — `WorkingDirectory` и единственный writable-путь сервиса |
+| `/etc/systemd/system/ether-server.service` | юнит; запускает бинарник под пользователем `ether`. Референс — [`deploy/ether-server.service`](./deploy/ether-server.service) |
+| `/etc/caddy/Caddyfile` | reverse-proxy + TLS на `localhost:8080`. Референс — [`deploy/Caddyfile`](./deploy/Caddyfile) |
+
+Файлы в [`deploy/`](./deploy) — референс ручной первичной настройки (сервер
+поднимали руками). systemd-юнит и Caddyfile меняются на сервере; после правок
+юнита — `sudo systemctl daemon-reload`.
+
+**Выкатка новой версии** — [`scripts/deploy.sh`](./scripts/deploy.sh): собирает
+статический бинарник под Linux, льёт в `/tmp`, ставит через `sudo install` и
+рестартит сервис (конфиг и базу не трогает):
+
+```sh
+SSH_HOST=ether scripts/deploy.sh
+```
+
+**Логи**: `sudo journalctl -u ether-server -f`.
+**Сброс базы**: команды в [`scripts/reset-db-prod.sh`](./scripts/reset-db-prod.sh)
+(запускать руками на сервере — стирает всех пользователей, сессии и сообщения).
+
 ## Как это работает
 
 Клиент шлёт серверу **координаты**, сервер через геокодинг вычисляет набор ID

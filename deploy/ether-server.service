@@ -1,32 +1,34 @@
-# Референс systemd-юнита для прода (etherapp.ru). Кладётся на сервере в
-# /etc/systemd/system/ether-server.service; scripts/deploy.sh только рестартит
-# уже установленный сервис. После правок: sudo systemctl daemon-reload.
+# Референс systemd-юнита для прода (etherapp.ru) — копия того, что стоит на
+# сервере в /etc/systemd/system/ether-server.service. scripts/deploy.sh только
+# рестартит уже установленный сервис. После правок: sudo systemctl daemon-reload.
 #
-# Модель: один статический бинарник, конфиг и SQLite-база — рядом, в
-# WorkingDirectory. Бинарник ищет config.prod.json и пишет ether.prod.db
-# относительно рабочего каталога, поэтому WorkingDirectory обязателен.
+# Раскладка раздельная: бинарник read-only в /opt/ether, конфиг в /etc/ether,
+# изменяемое состояние (SQLite-база) — в /var/lib/ether. ProtectSystem=strict
+# делает всю ФС read-only, а ReadWritePaths возвращает запись ТОЛЬКО в
+# /var/lib/ether — то есть база отделена от бинарника и конфига намеренно.
 [Unit]
-Description=ether-server (geo-chat backend)
+Description=Ether server (geographic IRC backend)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# отдельный непривилегированный пользователь; каталог принадлежит ему
 User=ether
 Group=ether
-WorkingDirectory=/opt/ether
-ExecStart=/opt/ether/ether-server -env prod
+WorkingDirectory=/var/lib/ether
+ExecStart=/opt/ether/ether-server -config /etc/ether/config.prod.json
 Restart=on-failure
-RestartSec=2
-
-# бинарник слушает :8080 (в конфиге addr), наружу его публикует Caddy (TLS).
-# ограничиваем доступ к ФС: сервису нужен на запись только свой каталог (база)
+RestartSec=3
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/opt/ether
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/ether
 
 [Install]
 WantedBy=multi-user.target

@@ -4,8 +4,8 @@
 # Схема пересоздаётся при старте.
 
 # Backup if needed
-cp /opt/ether-server/ether.prod.db ~/ether.prod.db.bak
+cp /var/lib/ether/ether.prod.db ~/ether.prod.db.bak
 
 sudo systemctl stop ether-server
-sudo rm -f /opt/ether-server/ether.prod.db /opt/ether-server/ether.prod.db-wal /opt/ether-server/ether.prod.db-shm
+sudo rm -f /var/lib/ether/ether.prod.db /var/lib/ether/ether.prod.db-wal /var/lib/ether/ether.prod.db-shm
 sudo systemctl start ether-server
