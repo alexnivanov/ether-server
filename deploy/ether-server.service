@@ -1,0 +1,32 @@
+# Референс systemd-юнита для прода (etherapp.ru). Кладётся на сервере в
+# /etc/systemd/system/ether-server.service; scripts/deploy.sh только рестартит
+# уже установленный сервис. После правок: sudo systemctl daemon-reload.
+#
+# Модель: один статический бинарник, конфиг и SQLite-база — рядом, в
+# WorkingDirectory. Бинарник ищет config.prod.json и пишет ether.prod.db
+# относительно рабочего каталога, поэтому WorkingDirectory обязателен.
+[Unit]
+Description=ether-server (geo-chat backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# отдельный непривилегированный пользователь; каталог принадлежит ему
+User=ether
+Group=ether
+WorkingDirectory=/opt/ether
+ExecStart=/opt/ether/ether-server -env prod
+Restart=on-failure
+RestartSec=2
+
+# бинарник слушает :8080 (в конфиге addr), наружу его публикует Caddy (TLS).
+# ограничиваем доступ к ФС: сервису нужен на запись только свой каталог (база)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/ether
+
+[Install]
+WantedBy=multi-user.target

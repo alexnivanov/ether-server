@@ -1,0 +1,8 @@
+# Референс конфига Caddy для прода. Кладётся на сервере в /etc/caddy/Caddyfile.
+# Caddy сам добывает и продлевает TLS-сертификат (Let's Encrypt) для домена и
+# терминирует HTTPS, проксируя всё на локальный ether-server (:8080). Один
+# reverse_proxy покрывает и REST, и WebSocket-апгрейд на /ws — Caddy пробрасывает
+# Upgrade/Connection автоматически, отдельный блок для ws не нужен.
+etherapp.ru {
+	reverse_proxy localhost:8080
+}
