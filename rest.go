@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"strconv"
 )
@@ -42,19 +42,19 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 		}
 		u, err := tg.Verify(d.IDToken)
 		if err != nil {
-			log.Printf("auth: verify id_token: %v", err)
+			slog.Warn("auth verify failed", "err", err)
 			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "проверка входа Telegram не прошла")
 			return
 		}
 		accepted, err := store.SaveUser(User{TgID: u.ID, TgUsername: u.Username, FullName: u.Name, AvatarURL: u.AvatarURL})
 		if err != nil {
-			log.Printf("auth: save user %d: %v", u.ID, err)
+			slog.Error("auth save user", "err", err, "tg_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
 			return
 		}
 		token, err := store.NewSession(u.ID)
 		if err != nil {
-			log.Printf("auth: new session for %d: %v", u.ID, err)
+			slog.Error("auth new session", "err", err, "tg_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось создать сессию")
 			return
 		}
@@ -96,7 +96,7 @@ func handleResume(store *Store) http.HandlerFunc {
 		}
 		u, err := store.UserBySession(d.Token)
 		if err != nil {
-			log.Printf("resume: %v", err)
+			slog.Error("resume", "err", err)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
 			return
 		}
@@ -131,7 +131,7 @@ func handleLogout(store *Store) http.HandlerFunc {
 			return
 		}
 		if err := store.DeleteSession(d.Token); err != nil {
-			log.Printf("logout: %v", err)
+			slog.Error("logout", "err", err)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "logout failed")
 			return
 		}
@@ -154,7 +154,7 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 		}
 		u, err := store.UserBySession(d.Token)
 		if err != nil {
-			log.Printf("accept_rules: session lookup: %v", err)
+			slog.Error("accept_rules session lookup", "err", err)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
 			return
 		}
@@ -163,7 +163,7 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 			return
 		}
 		if err := store.AcceptRules(u.TgID); err != nil {
-			log.Printf("accept_rules %d: %v", u.TgID, err)
+			slog.Error("accept_rules", "err", err, "tg_id", u.TgID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "failed to save rules acceptance")
 			return
 		}
@@ -215,7 +215,7 @@ func handleHistory(store *Store) http.HandlerFunc {
 		}
 		msgs, err := store.History(channel, beforeID, limit)
 		if err != nil {
-			log.Printf("history %q: %v", channel, err)
+			slog.Error("history", "err", err, "channel", channel)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "history lookup failed")
 			return
 		}

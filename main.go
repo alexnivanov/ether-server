@@ -2,11 +2,27 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 
 	"github.com/gorilla/websocket"
 )
+
+// setupLogging ставит slog глобальным логгером. Формат выбираем по тому, куда
+// пишем: терминал (локальный запуск) → человекочитаемый Text; не-терминал
+// (под systemd, в journald) → структурный JSON. Так работает и на проде, где
+// сервис стартует без -env. Уровень — Info (Debug-вызовов пока нет).
+func setupLogging() {
+	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
+	var h slog.Handler
+	if fi, _ := os.Stderr.Stat(); fi != nil && fi.Mode()&os.ModeCharDevice != 0 {
+		h = slog.NewTextHandler(os.Stderr, opts)
+	} else {
+		h = slog.NewJSONHandler(os.Stderr, opts)
+	}
+	slog.SetDefault(slog.New(h))
+}
 
 var upgrader = websocket.Upgrader{
 	// прототип: пускаем любой origin
@@ -18,6 +34,8 @@ var upgrader = websocket.Upgrader{
 var version = "dev"
 
 func main() {
+	setupLogging()
+
 	env := flag.String("env", "dev", "окружение: берётся конфиг config.<env>.json")
 	configPath := flag.String("config", "", "явный путь к конфигу (перекрывает -env)")
 	flag.Parse()
@@ -28,7 +46,8 @@ func main() {
 	}
 	cfg, err := LoadConfig(path)
 	if err != nil {
-		log.Fatalf("config: %v", err)
+		slog.Error("config", "err", err)
+		os.Exit(1)
 	}
 
 	hub := NewHub()
@@ -40,7 +59,8 @@ func main() {
 	}
 	store, err := OpenStore(dbPath)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		slog.Error("store", "err", err)
+		os.Exit(1)
 	}
 
 	nominatim := NewNominatimGeocoder()
@@ -58,8 +78,11 @@ func main() {
 	registerREST(mux, store, tg)
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store))
 
-	log.Printf("ether-server %s (%s) listening on %s (ws /ws; REST /auth/telegram /session/resume /session/logout /rules/accept /history)", version, path, cfg.Addr)
-	log.Fatal(http.ListenAndServe(cfg.Addr, mux))
+	slog.Info("listening", "version", version, "config", path, "addr", cfg.Addr)
+	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
+		slog.Error("listen", "err", err)
+		os.Exit(1)
+	}
 }
 
 // wsHandler — апгрейд до WebSocket. ?token= опционален (можно смотреть каналы
@@ -74,7 +97,7 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 		if token := r.URL.Query().Get("token"); token != "" {
 			u, err := store.UserBySession(token)
 			if err != nil {
-				log.Printf("ws auth: %v", err)
+				slog.Error("ws auth", "err", err)
 				http.Error(w, "session lookup failed", http.StatusInternalServerError)
 				return
 			}
@@ -87,7 +110,7 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("upgrade:", err)
+			slog.Warn("ws upgrade failed", "err", err)
 			return
 		}
 		c := &Client{

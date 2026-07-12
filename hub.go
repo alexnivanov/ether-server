@@ -1,6 +1,6 @@
 package main
 
-import "log"
+import "log/slog"
 
 // subscribers — множество подписчиков канала (set-as-map: значение-заглушка
 // не читается).
@@ -61,7 +61,7 @@ func (h *Hub) Run() {
 				case c.send <- env:
 				default:
 					// медленный клиент: не блокируем хаб, роняем сообщение
-					log.Printf("send buffer full for %q, dropping message in %s", c.DisplayName(), m.Channel)
+					slog.Warn("send buffer full, dropping message", "client", c.DisplayName(), "channel", m.Channel)
 				}
 			}
 		}

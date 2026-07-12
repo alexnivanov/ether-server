@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -121,7 +121,7 @@ func (c *Client) readPump() {
 				TS:        time.Now().UnixMilli(),
 			}
 			if id, err := c.store.SaveMessage(m.Channel, userID, m.Text, m.TS); err != nil {
-				log.Printf("save message: %v", err) // живая рассылка важнее истории
+				slog.Error("save message", "err", err, "channel", m.Channel) // живая рассылка важнее истории
 			} else {
 				m.ID = id
 			}
@@ -146,7 +146,7 @@ func (c *Client) out(env Envelope) {
 	select {
 	case c.send <- env:
 	default:
-		log.Printf("send buffer full for %q, dropping %s", c.DisplayName(), env.Type)
+		slog.Warn("send buffer full, dropping frame", "client", c.DisplayName(), "type", env.Type)
 	}
 }
 
