@@ -2,12 +2,16 @@ package main
 
 import "log"
 
+// subscribers — множество подписчиков канала (set-as-map: значение-заглушка
+// не читается).
+type subscribers map[*Client]bool
+
 // Hub владеет всеми подписками каналов и рассылает сообщения подписчикам.
 // Всё состояние меняется из одной горутины (Run) — клиенты общаются с ним через
 // каналы, поэтому блокировки не нужны.
 type Hub struct {
 	// channelID → множество подписанных клиентов
-	channels map[string]map[*Client]bool
+	channels map[string]subscribers
 
 	unregister chan *Client
 	subscribe  chan subscription
@@ -21,7 +25,7 @@ type subscription struct {
 
 func NewHub() *Hub {
 	return &Hub{
-		channels:   make(map[string]map[*Client]bool),
+		channels:   make(map[string]subscribers),
 		unregister: make(chan *Client),
 		subscribe:  make(chan subscription),
 		broadcast:  make(chan MessageData),
@@ -45,7 +49,7 @@ func (h *Hub) Run() {
 		case s := <-h.subscribe:
 			for _, id := range s.channels {
 				if h.channels[id] == nil {
-					h.channels[id] = make(map[*Client]bool)
+					h.channels[id] = make(subscribers)
 				}
 				h.channels[id][s.client] = true
 			}
