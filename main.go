@@ -9,19 +9,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// setupLogging ставит slog глобальным логгером. Формат выбираем по тому, куда
-// пишем: терминал (локальный запуск) → человекочитаемый Text; не-терминал
-// (под systemd, в journald) → структурный JSON. Так работает и на проде, где
-// сервис стартует без -env. Уровень — Info (Debug-вызовов пока нет).
+// setupLogging ставит slog глобальным логгером с компактным человекочитаемым
+// форматом (см. consoleHandler в logging.go): "LEVEL [component] message key=val",
+// без времени — под systemd его добавляет journald. Уровень — Info (Debug-вызовов
+// пока нет). Пишем в stderr, journald его подхватывает.
 func setupLogging() {
-	opts := &slog.HandlerOptions{Level: slog.LevelInfo}
-	var h slog.Handler
-	if fi, _ := os.Stderr.Stat(); fi != nil && fi.Mode()&os.ModeCharDevice != 0 {
-		h = slog.NewTextHandler(os.Stderr, opts)
-	} else {
-		h = slog.NewJSONHandler(os.Stderr, opts)
-	}
-	slog.SetDefault(slog.New(h))
+	slog.SetDefault(slog.New(newConsoleHandler(os.Stderr, slog.LevelInfo)))
 }
 
 var upgrader = websocket.Upgrader{
