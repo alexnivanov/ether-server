@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -14,9 +16,11 @@ import (
 //	LEVEL [component] message  key=value ...
 //
 // Без времени: под systemd метку времени ставит сам journald, дублировать её в
-// строке незачем (при локальном запуске время видно по промпту/`ts`). Секция
-// [component] опциональна — появляется, только если задан атрибут "component"
-// (`slog.With("component", "ws").Info(...)`); иначе опускается. Стандартный
+// строке незачем (при локальном запуске время видно по промпту/`ts`).
+//
+// [component] определяется автоматически по имени файла места вызова (весь
+// сервер — один пакет main, поэтому имя пакета бесполезно, а файлы разбиты по
+// подсистемам: client.go → [client], rest.go → [rest]). Стандартный
 // slog.TextHandler так не умеет: он всегда печатает `level=`/`msg=` через
 // key=value.
 type consoleHandler struct {
@@ -44,13 +48,8 @@ func (h *consoleHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
 func (h *consoleHandler) WithGroup(string) slog.Handler { return h }
 
 func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
-	var component string
 	var pairs []string
 	appendAttr := func(a slog.Attr) {
-		if a.Key == "component" { // вычленяем — уходит в [..], а не в key=value
-			component = a.Value.String()
-			return
-		}
 		v := a.Value.String()
 		if v == "" || strings.ContainsAny(v, " \t\"") {
 			v = fmt.Sprintf("%q", v)
@@ -61,6 +60,16 @@ func (h *consoleHandler) Handle(_ context.Context, r slog.Record) error {
 		appendAttr(a)
 	}
 	r.Attrs(func(a slog.Attr) bool { appendAttr(a); return true })
+
+	// component — имя файла места вызова (slog кладёт PC вызывающего в
+	// Record.PC): client.go → "client", rest.go → "rest".
+	var component string
+	if r.PC != 0 {
+		fs := runtime.CallersFrames([]uintptr{r.PC})
+		if f, _ := fs.Next(); f.File != "" {
+			component = strings.TrimSuffix(filepath.Base(f.File), ".go")
+		}
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "%-5s ", r.Level.String()) // INFO / WARN / ERROR, ширина под выравнивание

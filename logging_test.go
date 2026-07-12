@@ -11,15 +11,14 @@ func TestConsoleHandlerFormat(t *testing.T) {
 	var buf bytes.Buffer
 	l := slog.New(newConsoleHandler(&buf, slog.LevelInfo))
 
+	// component автоматически = имя файла вызова (здесь logging_test)
 	l.Info("listening", "addr", ":8080")
-	l.Warn("ws upgrade failed", "err", "bad handshake") // значение с пробелом → в кавычки
-	l.With("component", "ws").Error("save message", "channel", "RU")
+	l.Warn("bad", "err", "bad handshake") // значение с пробелом → в кавычки
 
 	got := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
 	want := []string{
-		"INFO  listening addr=:8080",
-		`WARN  ws upgrade failed err="bad handshake"`,
-		"ERROR [ws] save message channel=RU", // component уходит в [..], не в key=value
+		"INFO  [logging_test] listening addr=:8080",
+		`WARN  [logging_test] bad err="bad handshake"`,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("строк: got %d, want %d\n%s", len(got), len(want), buf.String())
