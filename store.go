@@ -39,15 +39,15 @@ CREATE TABLE IF NOT EXISTS users (
 	tg_username       TEXT NOT NULL DEFAULT '', -- @username (ссылка на профиль)
 	full_name         TEXT NOT NULL DEFAULT '', -- отображаемое имя (для UI)
 	avatar_url        TEXT NOT NULL DEFAULT '', -- URL фото профиля из Telegram
-	created_at        INTEGER NOT NULL,    -- unix-секунды
+	created_at        INTEGER NOT NULL,    -- unix-миллисекунды (как всюду в БД)
 	seen_at           INTEGER NOT NULL,
-	rules_accepted_at INTEGER NOT NULL DEFAULT 0 -- 0 — не принял
+	rules_accepted_at INTEGER NOT NULL DEFAULT 0 -- unix-мс; 0 — не принял
 );
 CREATE TABLE IF NOT EXISTS sessions (
 	token      TEXT PRIMARY KEY,
 	tg_id      INTEGER NOT NULL REFERENCES users(tg_id),
-	created_at INTEGER NOT NULL,
-	seen_at    INTEGER NOT NULL
+	created_at INTEGER NOT NULL, -- unix-миллисекунды
+	seen_at    INTEGER NOT NULL  -- unix-миллисекунды
 );
 CREATE INDEX IF NOT EXISTS sessions_tg_id ON sessions(tg_id);
 CREATE TABLE IF NOT EXISTS messages (
@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS messages (
 	channel TEXT NOT NULL,                     -- ID канала (контракт ether-meta)
 	tg_id   INTEGER NOT NULL,                  -- автор; имя и аватар берутся JOIN из users
 	text    TEXT NOT NULL,
-	ts      INTEGER NOT NULL                   -- unix-миллисекунды (как в протоколе)
+	ts      INTEGER NOT NULL                   -- unix-миллисекунды (контракт протокола)
 );
 CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
 `
@@ -94,7 +94,7 @@ func (s *Store) Close() error { return s.db.Close() }
 // меняет только AcceptRules. Возвращает, принимал ли пользователь правила
 // раньше (для повторного входа тем же Telegram-аккаунтом).
 func (s *Store) SaveUser(u User) (rulesAccepted bool, err error) {
-	now := time.Now().Unix()
+	now := time.Now().UnixMilli()
 	if _, err := s.db.Exec(`
 		INSERT INTO users (tg_id, tg_username, full_name, avatar_url, created_at, seen_at)
 		VALUES (?, ?, ?, ?, ?, ?)
@@ -114,7 +114,7 @@ func (s *Store) SaveUser(u User) (rulesAccepted bool, err error) {
 // AcceptRules отмечает, что пользователь принял правила эфира — привязано к
 // Telegram-аккаунту, переживает переустановку клиента и смену устройства.
 func (s *Store) AcceptRules(tgID int64) error {
-	_, err := s.db.Exec(`UPDATE users SET rules_accepted_at = ? WHERE tg_id = ?`, time.Now().Unix(), tgID)
+	_, err := s.db.Exec(`UPDATE users SET rules_accepted_at = ? WHERE tg_id = ?`, time.Now().UnixMilli(), tgID)
 	return err
 }
 
@@ -124,7 +124,7 @@ func (s *Store) NewSession(tgID int64) (string, error) {
 	b := make([]byte, 32)
 	rand.Read(b)
 	token := hex.EncodeToString(b)
-	now := time.Now().Unix()
+	now := time.Now().UnixMilli()
 	_, err := s.db.Exec(`INSERT INTO sessions (token, tg_id, created_at, seen_at) VALUES (?, ?, ?, ?)`,
 		token, tgID, now, now)
 	if err != nil {
@@ -211,7 +211,7 @@ func (s *Store) UserBySession(token string) (*User, error) {
 		return nil, err
 	}
 	u.RulesAccepted = acceptedAt > 0
-	now := time.Now().Unix()
+	now := time.Now().UnixMilli()
 	s.db.Exec(`UPDATE sessions SET seen_at = ? WHERE token = ?`, now, token)
 	s.db.Exec(`UPDATE users SET seen_at = ? WHERE tg_id = ?`, now, u.TgID)
 	return &u, nil
