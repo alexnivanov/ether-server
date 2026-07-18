@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -54,10 +55,11 @@ func TestAuthTelegram(t *testing.T) {
 		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, tgClaims{
 			RegisteredClaims: jwt.RegisteredClaims{
 				Issuer:    tgIssuer,
-				Subject:   "777",
+				Subject:   "opaque-sub-larger-than-int64",
 				Audience:  jwt.ClaimStrings{aud},
 				ExpiresAt: jwt.NewNumericDate(exp),
 			},
+			ID:                json.RawMessage("777"), // берём id, не sub
 			PreferredUsername: "alex",
 		})
 		tok.Header["kid"] = kid

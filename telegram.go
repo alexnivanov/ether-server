@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/MicahParks/keyfunc/v3"
@@ -62,10 +64,14 @@ type TelegramUser struct {
 
 type tgClaims struct {
 	jwt.RegisteredClaims
-	PreferredUsername string `json:"preferred_username"`
-	Name              string `json:"name"`       // полное отображаемое имя
-	GivenName         string `json:"given_name"` // имя (fallback, если нет name)
-	Picture           string `json:"picture"`    // URL фото профиля
+	// id — настоящий Telegram user id. Берём его, а НЕ sub: sub бывает
+	// opaque/pairwise и вылезает за int64 (было: overflow → "bad subject").
+	// Приходит числом или строкой-числом — ловим сырьём, кавычки снимаем.
+	ID                json.RawMessage `json:"id"`
+	PreferredUsername string          `json:"preferred_username"`
+	Name              string          `json:"name"`       // полное отображаемое имя
+	GivenName         string          `json:"given_name"` // имя (fallback, если нет name)
+	Picture           string          `json:"picture"`    // URL фото профиля
 }
 
 // Verify проверяет ID-token (подпись по JWKS + iss/aud/exp/алгоритм) и
@@ -84,9 +90,10 @@ func (t *TelegramAuth) Verify(idToken string) (*TelegramUser, error) {
 	); err != nil {
 		return nil, err
 	}
-	id, err := strconv.ParseInt(claims.Subject, 10, 64)
+	idStr := strings.Trim(string(claims.ID), `"`)
+	id, err := strconv.ParseInt(idStr, 10, 64)
 	if err != nil || id == 0 {
-		return nil, fmt.Errorf("bad subject %q", claims.Subject)
+		return nil, fmt.Errorf("bad id %q", idStr)
 	}
 	// отображаемое имя: полное `name`, иначе `given_name`, иначе @username —
 	// чтобы поле не осталось пустым, если Telegram не прислал имя

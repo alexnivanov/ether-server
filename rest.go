@@ -43,7 +43,7 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 		u, err := tg.Verify(d.IDToken)
 		if err != nil {
 			slog.Warn("auth verify failed", "err", err)
-			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "проверка входа Telegram не прошла")
+			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "Проверка входа Telegram не прошла")
 			return
 		}
 		accepted, err := store.SaveUser(User{TgID: u.ID, TgUsername: u.Username, FullName: u.Name, AvatarURL: u.AvatarURL})
