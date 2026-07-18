@@ -2,5 +2,7 @@
   "addr": ":8080",
   "telegram_client_id": "<числовой client id приложения из @BotFather>",
   "nominatim_url": "",
-  "db": ""
+  "db": "",
+  "fcm_project_id": "<id проекта Firebase, напр. ether-5f4b6; пусто → пуши выключены>",
+  "fcm_credentials_file": "<путь к service-account JSON, напр. /etc/ether/fcm.json>"
 }

@@ -67,9 +67,17 @@ func main() {
 	// старт не зависит от доступности Telegram
 	tg := NewTelegramAuth(cfg.TelegramClientID, tgJWKSURL)
 
+	// FCM-пуши опциональны: без creds в конфиге push == nil и publish работает
+	// как раньше. Ошибка чтения creds не валит старт — просто без пушей.
+	push, err := NewPusher(cfg.FCMProjectID, cfg.FCMCredentialsFile)
+	if err != nil {
+		slog.Warn("fcm disabled (creds error)", "err", err)
+	}
+	slog.Info("fcm", "enabled", push != nil)
+
 	mux := http.NewServeMux()
 	registerREST(mux, store, tg)
-	mux.HandleFunc("/ws", wsHandler(hub, geo, store))
+	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push))
 
 	slog.Info("listening", "version", version, "config", path, "addr", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
@@ -84,7 +92,7 @@ func main() {
 // что протухший токен здесь — сигнал рассинхронизации, а не штатный путь,
 // поэтому отвечаем 401 до апгрейда. ?token= — единственный способ авторизовать
 // сокет: логин-кадров на WS больше нет.
-func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
+func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var authedUser *User
 		if token := r.URL.Query().Get("token"); token != "" {
@@ -112,6 +120,7 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 			send:  make(chan Envelope, 16),
 			geo:   geo,
 			store: store,
+			push:  push,
 		}
 		if authedUser != nil {
 			c.setAuthed(

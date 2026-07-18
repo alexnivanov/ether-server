@@ -39,7 +39,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 
 	mux := http.NewServeMux()
 	registerREST(mux, store, tg)
-	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store))
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)

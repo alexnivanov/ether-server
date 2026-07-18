@@ -23,6 +23,11 @@ type Config struct {
 	NominatimURL string `json:"nominatim_url"`
 	// Путь к файлу SQLite (пользователи, сессии); пусто → "ether.<env>.db".
 	DB string `json:"db"`
+	// FCM-пуши о новых сообщениях (опционально). Оба пусты → пуши выключены,
+	// сервер работает как раньше. FCMProjectID — id проекта Firebase;
+	// FCMCredentialsFile — путь к service-account JSON (в git не идёт).
+	FCMProjectID       string `json:"fcm_project_id"`
+	FCMCredentialsFile string `json:"fcm_credentials_file"`
 }
 
 func LoadConfig(path string) (*Config, error) {

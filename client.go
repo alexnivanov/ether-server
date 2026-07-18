@@ -23,6 +23,7 @@ type Client struct {
 	send  chan Envelope
 	geo   Geocoder
 	store *Store
+	push  *Pusher // FCM-пуши о новых сообщениях; nil — пуши выключены
 
 	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
 	// дальше только читается (publish)
@@ -126,6 +127,12 @@ func (c *Client) readPump() {
 				m.ID = id
 			}
 			c.hub.broadcast <- m
+
+			// пуш подписчикам топика канала (Район/Квартал — клиент подписан
+			// только на них). Асинхронно: HTTP к FCM не должен тормозить сокет.
+			if c.push != nil {
+				go c.push.Notify(m.Channel, name, m.Text)
+			}
 
 		default:
 			c.sendError("unknown_type", "unknown message type: "+env.Type)
