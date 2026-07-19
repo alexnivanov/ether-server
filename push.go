@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -68,12 +68,13 @@ func fcmTopic(channelID string) string {
 func (p *Pusher) Notify(channelID, sender, text string) {
 	tok, err := p.ts.Token()
 	if err != nil {
-		log.Printf("fcm: token: %v", err)
+		slog.Error("fcm token", "err", err)
 		return
 	}
+	topic := fcmTopic(channelID)
 	payload, _ := json.Marshal(map[string]any{
 		"message": map[string]any{
-			"topic": fcmTopic(channelID),
+			"topic": topic,
 			"notification": map[string]any{
 				"title": sender,
 				"body":  text,
@@ -86,12 +87,15 @@ func (p *Pusher) Notify(channelID, sender, text string) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := p.http.Do(req)
 	if err != nil {
-		log.Printf("fcm: send: %v", err)
+		slog.Error("fcm send", "topic", topic, "err", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		log.Printf("fcm: send %s: %s", resp.Status, b)
+		slog.Warn("fcm send rejected", "topic", topic, "status", resp.Status, "body", string(b))
+		return
 	}
+	// лог и на успехе — чтобы было видно каждую отправку (топик + ok)
+	slog.Info("fcm send", "topic", topic, "status", "ok")
 }
