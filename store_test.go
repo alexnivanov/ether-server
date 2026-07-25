@@ -273,12 +273,19 @@ func TestStoreReportMessage(t *testing.T) {
 		t.Fatalf("save message: %v", err)
 	}
 
-	ok, err := s.ReportMessage(msgID, reporter.TgID, "abuse")
+	rep, err := s.ReportMessage(msgID, reporter.TgID, "abuse")
 	if err != nil {
 		t.Fatalf("report: %v", err)
 	}
-	if !ok {
-		t.Fatal("report: ok = false для существующего сообщения")
+	if rep == nil {
+		t.Fatal("report: nil для существующего сообщения")
+	}
+	if !rep.Fresh {
+		t.Fatal("report: Fresh = false для первой жалобы")
+	}
+	// данные для уведомления в канал модерации собраны из сообщения и автора
+	if rep.Text != "гадость" || rep.AuthorTgID != author.TgID || rep.AuthorName != "Author" {
+		t.Fatalf("report: %+v", rep)
 	}
 
 	// текст и автор скопированы — жалоба разбираема после удаления сообщения
@@ -293,9 +300,12 @@ func TestStoreReportMessage(t *testing.T) {
 		t.Fatalf("report: text=%q author=%d reason=%q", gotText, gotAuthor, gotReason)
 	}
 
-	// повторная жалоба того же пользователя — успех, но без дубля
-	if ok, err := s.ReportMessage(msgID, reporter.TgID, "spam"); err != nil || !ok {
-		t.Fatalf("report again: ok=%v err=%v", ok, err)
+	// повторная жалоба того же пользователя — успех, но без дубля; Fresh=false,
+	// чтобы не постить в канал модерации второй раз
+	if again, err := s.ReportMessage(msgID, reporter.TgID, "spam"); err != nil || again == nil {
+		t.Fatalf("report again: rep=%v err=%v", again, err)
+	} else if again.Fresh {
+		t.Fatal("report again: Fresh = true для повторной жалобы")
 	}
 	var count int
 	if err := s.db.QueryRow(`SELECT COUNT(*) FROM reports WHERE message_id = ?`, msgID).Scan(&count); err != nil {
@@ -305,9 +315,9 @@ func TestStoreReportMessage(t *testing.T) {
 		t.Fatalf("report дублируется: %d записей", count)
 	}
 
-	// жалоба на несуществующее сообщение — ok=false, не ошибка
-	if ok, err := s.ReportMessage(9999, reporter.TgID, "spam"); err != nil || ok {
-		t.Fatalf("report missing: ok=%v err=%v", ok, err)
+	// жалоба на несуществующее сообщение — nil, но не ошибка
+	if missing, err := s.ReportMessage(9999, reporter.TgID, "spam"); err != nil || missing != nil {
+		t.Fatalf("report missing: rep=%v err=%v", missing, err)
 	}
 
 	// жалоба переживает удаление самого сообщения (TTL-уборка)

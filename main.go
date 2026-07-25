@@ -76,8 +76,13 @@ func main() {
 	}
 	slog.Info("fcm", "enabled", push != nil)
 
+	// уведомления модерации в служебный Telegram-канал: без токена/chat_id в
+	// конфиге notify == nil, жалобы всё равно принимаются (БД + лог)
+	notify := NewNotifier(cfg.TelegramNotifyToken, cfg.TelegramNotifyChatID)
+	slog.Info("moderation notify", "enabled", notify != nil)
+
 	mux := http.NewServeMux()
-	registerREST(mux, store, tg)
+	registerREST(mux, store, tg, notify)
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push))
 
 	slog.Info("listening", "version", version, "config", path, "addr", cfg.Addr)

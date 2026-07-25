@@ -38,7 +38,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 	tg := NewTelegramAuth("test-client", "http://127.0.0.1:0/jwks")
 
 	mux := http.NewServeMux()
-	registerREST(mux, store, tg)
+	registerREST(mux, store, tg, nil) // nil — без уведомлений модерации
 	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil))
 
 	srv := httptest.NewServer(mux)

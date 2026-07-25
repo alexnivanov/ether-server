@@ -28,6 +28,13 @@ type Config struct {
 	// FCMCredentialsFile — путь к service-account JSON (в git не идёт).
 	FCMProjectID       string `json:"fcm_project_id"`
 	FCMCredentialsFile string `json:"fcm_credentials_file"`
+	// Служебный Telegram-канал для жалоб на сообщения (опционально): токен бота
+	// (@BotFather) и chat_id канала, где этот бот — админ. Оба пусты →
+	// уведомления выключены, жалобы всё равно пишутся в БД и лог. Токен —
+	// секрет, в git не идёт. Требует исходящего доступа к api.telegram.org с
+	// сервера (первый прод-хост в РФ его не имел — см. историю переезда).
+	TelegramNotifyToken  string `json:"telegram_notify_token"`
+	TelegramNotifyChatID string `json:"telegram_notify_chat_id"`
 }
 
 func LoadConfig(path string) (*Config, error) {

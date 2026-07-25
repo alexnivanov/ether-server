@@ -257,32 +257,56 @@ func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageDat
 	return msgs, nil
 }
 
+// ReportedMessage — что именно нажаловали: данные для разбора и для уведомления
+// в служебный Telegram-канал (см. notify.go).
+type ReportedMessage struct {
+	MessageID      int64
+	Channel        string
+	AuthorTgID     int64
+	AuthorName     string // имя автора на момент жалобы (JOIN из users)
+	AuthorUsername string // @username автора; пусто — нет username
+	Text           string
+	Reason         string
+	// Fresh — жалоба записана впервые. false: этот пользователь уже жаловался на
+	// это сообщение — в БД дубля нет, и уведомление повторно слать не надо
+	// (иначе повторные тапы засорят канал).
+	Fresh bool
+}
+
 // ReportMessage регистрирует жалобу на сообщение. Текст и автора копируем из
 // самого сообщения (клиент их не присылает — иначе на что жалуются, решал бы
 // он): сообщение живёт неделю, а жалоба должна остаться разбираемой после его
-// удаления. Возвращает false, если сообщения с таким id нет (уже удалено по TTL
+// удаления. Возвращает nil, если сообщения с таким id нет (уже удалено по TTL
 // или id выдуман). Повторная жалоба того же пользователя на то же сообщение —
 // не ошибка и не дубль (UNIQUE + INSERT OR IGNORE), для клиента это успех.
-func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (ok bool, err error) {
-	var channel, text string
-	var authorID int64
-	err = s.db.QueryRow(`SELECT channel, tg_id, text FROM messages WHERE id = ?`, messageID).
-		Scan(&channel, &authorID, &text)
+func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (*ReportedMessage, error) {
+	rep := &ReportedMessage{MessageID: messageID, Reason: reason}
+	// LEFT JOIN: имя автора — удобство для разбора, его отсутствие не должно
+	// мешать принять жалобу
+	err := s.db.QueryRow(`
+		SELECT m.channel, m.tg_id, m.text, COALESCE(u.full_name, ''), COALESCE(u.tg_username, '')
+		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
+		WHERE m.id = ?`, messageID).
+		Scan(&rep.Channel, &rep.AuthorTgID, &rep.Text, &rep.AuthorName, &rep.AuthorUsername)
 	if err == sql.ErrNoRows {
-		return false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	_, err = s.db.Exec(`
+	res, err := s.db.Exec(`
 		INSERT OR IGNORE INTO reports
 			(message_id, channel, author_tg_id, message_text, reporter_tg_id, reason, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		messageID, channel, authorID, text, reporterTgID, reason, time.Now().UnixMilli())
+		messageID, rep.Channel, rep.AuthorTgID, rep.Text, reporterTgID, reason, time.Now().UnixMilli())
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	return true, nil
+	// 0 изменённых строк — сработал IGNORE, т.е. жалоба уже была
+	if n, err := res.RowsAffected(); err == nil && n > 0 {
+		rep.Fresh = true
+	}
+	return rep, nil
 }
 
 // UserBySession возвращает пользователя по токену сессии (nil — сессии нет)

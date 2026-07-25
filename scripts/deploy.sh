@@ -13,6 +13,9 @@
 #   SERVICE      имя systemd-юнита (по умолчанию ether-server)
 #   ARCH         архитектура сервера: amd64 | arm64 (по умолчанию amd64)
 #   DOMAIN       домен для health-check после рестарта (по умолчанию etherapp.ru)
+#   API_PREFIX   префикс API на домене (по умолчанию /api — Caddy проксирует в
+#                сервер только /api/*, срезая префикс; остальное — статика
+#                ether-web). Пусто = сервер отдаёт домен целиком.
 #   SKIP_CHECKS  =1 пропустить gofmt/vet/test перед сборкой (не рекомендуется)
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -23,6 +26,7 @@ OWNER="${OWNER:-ether}"
 SERVICE="${SERVICE:-ether-server}"
 ARCH="${ARCH:-amd64}"
 DOMAIN="${DOMAIN:-etherapp.ru}"
+API_PREFIX="${API_PREFIX-/api}"
 
 # ── проверки перед сборкой (то же, что CI: format/lint/test) ──
 if [[ "${SKIP_CHECKS:-}" != "1" ]]; then
@@ -66,9 +70,12 @@ ssh "$SSH_HOST" "set -e
 	sudo systemctl is-active --quiet ${SERVICE} || { sudo journalctl -u ${SERVICE} -n 30 --no-pager; exit 1; }"
 
 # ── health-check через публичный домен (проверяет бинарник + Caddy + TLS) ──
-# /history без авторизации отдаёт 200 даже на несуществующем канале.
-echo "==> health-check https://${DOMAIN}/history"
-if curl -fsS --max-time 10 "https://${DOMAIN}/history?channel=deploy-health-check" >/dev/null; then
+# /history без авторизации отдаёт 200 даже на несуществующем канале. Идём через
+# API_PREFIX: на домене живёт ещё и статика ether-web, поэтому без префикса
+# ответит она (404), а не сервер.
+health_url="https://${DOMAIN}${API_PREFIX}/history?channel=deploy-health-check"
+echo "==> health-check ${health_url}"
+if curl -fsS --max-time 10 "$health_url" >/dev/null; then
 	echo "✓ задеплоено: ${version}"
 else
 	echo "✗ сервис перезапущен, но health-check не прошёл — проверь Caddy/логи" >&2

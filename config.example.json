@@ -4,5 +4,7 @@
   "nominatim_url": "",
   "db": "",
   "fcm_project_id": "<id проекта Firebase, напр. ether-5f4b6; пусто → пуши выключены>",
-  "fcm_credentials_file": "<путь к service-account JSON, напр. /etc/ether/fcm.json>"
+  "fcm_credentials_file": "<путь к service-account JSON, напр. /etc/ether/fcm.json>",
+  "telegram_notify_token": "<токен бота из @BotFather для канала модерации; пусто → уведомления выключены>",
+  "telegram_notify_chat_id": "<chat_id служебного канала, напр. -1001234567890; бот должен быть в нём админом>"
 }

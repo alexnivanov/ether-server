@@ -20,11 +20,13 @@ import (
 // эндпоинта есть единственное очевидное место, а не «в конец». Общие хелперы
 // ответа — в конце файла.
 
-func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth) {
+// notify может быть nil — уведомления модерации в Telegram выключены (см.
+// notify.go); на приём жалоб это не влияет.
+func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth, notify *Notifier) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
 	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg))
 	mux.HandleFunc("/history", handleHistory(store))
-	mux.HandleFunc("/report", handleReport(store))
+	mux.HandleFunc("/report", handleReport(store, notify))
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
 	mux.HandleFunc("/session/logout", handleLogout(store))
 	mux.HandleFunc("/session/resume", handleResume(store))
@@ -176,7 +178,10 @@ var reportReasons = map[string]bool{"spam": true, "abuse": true, "illegal": true
 // текст и автора сервер берёт из самого сообщения. 404 not_found — сообщения
 // нет (удалено по TTL или неверный id). Повторная жалоба на то же сообщение —
 // тоже 200: для пользователя это успех, дубля в БД не возникает.
-func handleReport(store *Store) http.HandlerFunc {
+//
+// Новая жалоба уходит в служебный Telegram-канал (notify) — в горутине: ответ
+// клиенту не должен ждать Telegram, а жалоба к этому моменту уже в БД.
+func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
@@ -200,18 +205,22 @@ func handleReport(store *Store) http.HandlerFunc {
 			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
 			return
 		}
-		ok, err := store.ReportMessage(d.MessageID, u.TgID, d.Reason)
+		rep, err := store.ReportMessage(d.MessageID, u.TgID, d.Reason)
 		if err != nil {
 			slog.Error("report", "err", err, "message_id", d.MessageID, "tg_id", u.TgID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось отправить жалобу")
 			return
 		}
-		if !ok {
+		if rep == nil {
 			writeRESTError(w, http.StatusNotFound, "not_found", "Сообщение не найдено — возможно, оно уже удалено")
 			return
 		}
-		// лог — точка входа модерации: по нему видно, на что жалуются
+		// лог — вторая точка входа модерации (первая — канал в Telegram)
 		slog.Info("message reported", "message_id", d.MessageID, "reason", d.Reason, "reporter", u.TgID)
+		// только новые жалобы: повторный тап не должен дублировать пост в канале
+		if notify != nil && rep.Fresh {
+			go notify.ReportToChannel(rep, u)
+		}
 		writeJSON(w, http.StatusOK, struct{}{})
 	}
 }

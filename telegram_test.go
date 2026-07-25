@@ -47,7 +47,8 @@ func TestAuthTelegram(t *testing.T) {
 
 	const clientID = "8705267895"
 	mux := http.NewServeMux()
-	registerREST(mux, store, NewTelegramAuth(clientID, jwks.URL))
+	// notify=nil — уведомления модерации в Telegram выключены (тесту не нужны)
+	registerREST(mux, store, NewTelegramAuth(clientID, jwks.URL), nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
