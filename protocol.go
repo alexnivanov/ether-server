@@ -38,8 +38,9 @@ type PublishData struct {
 	Text    string `json:"text"`
 }
 
-// ResumeData / AcceptRulesData / LogoutData — тела REST-запросов (см. rest.go),
-// не WS. Разнесены по типу на запрос ради читаемости, хотя поле одно и то же.
+// ResumeData / AcceptRulesData / LogoutData / DeleteAccountData — тела
+// REST-запросов (см. rest.go), не WS. Разнесены по типу на запрос ради
+// читаемости, хотя поле одно и то же.
 type ResumeData struct {
 	Token string `json:"token"`
 }
@@ -47,6 +48,9 @@ type AcceptRulesData struct {
 	Token string `json:"token"`
 }
 type LogoutData struct {
+	Token string `json:"token"`
+}
+type DeleteAccountData struct {
 	Token string `json:"token"`
 }
 

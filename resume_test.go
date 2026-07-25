@@ -68,7 +68,7 @@ func restPost(t *testing.T, url string, body any) (*http.Response, map[string]an
 func TestRESTSessionFlow(t *testing.T) {
 	srv, store := newTestServer(t)
 
-	if _, err := store.SaveUser(User{TgID: 7, TgUsername: "alex", FullName: "alex"}); err != nil {
+	if err := store.CreateUser(User{TgID: 7, TgUsername: "alex", FullName: "alex"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
 	token, err := store.NewSession(7)
@@ -187,7 +187,7 @@ func TestRESTSessionFlow(t *testing.T) {
 func TestWebSocketTokenAuth(t *testing.T) {
 	srv, store := newTestServer(t)
 
-	if _, err := store.SaveUser(User{TgID: 9, TgUsername: "bob", FullName: "bob"}); err != nil {
+	if err := store.CreateUser(User{TgID: 9, TgUsername: "bob", FullName: "bob"}); err != nil {
 		t.Fatalf("seed user: %v", err)
 	}
 	token, err := store.NewSession(9)

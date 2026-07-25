@@ -20,6 +20,7 @@ func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth) {
 	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg))
 	mux.HandleFunc("/session/resume", handleResume(store))
 	mux.HandleFunc("/session/logout", handleLogout(store))
+	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
 	mux.HandleFunc("/history", handleHistory(store))
 }
@@ -46,11 +47,21 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "Проверка входа Telegram не прошла")
 			return
 		}
-		accepted, err := store.SaveUser(User{TgID: u.ID, TgUsername: u.Username, FullName: u.Name, AvatarURL: u.AvatarURL})
+		// повторный вход обновляет профиль; если пользователя ещё нет — регистрация
+		user := User{TgID: u.ID, TgUsername: u.Username, FullName: u.Name, AvatarURL: u.AvatarURL}
+		found, accepted, err := store.UpdateUser(user)
 		if err != nil {
-			slog.Error("auth save user", "err", err, "tg_id", u.ID)
+			slog.Error("auth update user", "err", err, "tg_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
 			return
+		}
+		if !found {
+			if err := store.CreateUser(user); err != nil {
+				slog.Error("auth create user", "err", err, "tg_id", u.ID)
+				writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
+				return
+			}
+			slog.Info("account created", "tg_id", u.ID)
 		}
 		token, err := store.NewSession(u.ID)
 		if err != nil {
@@ -135,6 +146,41 @@ func handleLogout(store *Store) http.HandlerFunc {
 			writeRESTError(w, http.StatusInternalServerError, "internal", "logout failed")
 			return
 		}
+		writeJSON(w, http.StatusOK, struct{}{})
+	}
+}
+
+// handleDeleteAccount — POST /account/delete {token} → 200 {} — удаление
+// аккаунта: сносит пользователя, все его сессии (все устройства) и все
+// сообщения (каскадом, см. Store.DeleteUser), необратимо. Требует валидную
+// сессию (401 bad_session иначе).
+func handleDeleteAccount(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d DeleteAccountData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "нужен токен сессии")
+			return
+		}
+		u, err := store.UserBySession(d.Token)
+		if err != nil {
+			slog.Error("delete_account session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "сессия не найдена — войди через Telegram заново")
+			return
+		}
+		if err := store.DeleteUser(u.TgID); err != nil {
+			slog.Error("delete_account", "err", err, "tg_id", u.TgID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось удалить аккаунт")
+			return
+		}
+		slog.Info("account deleted", "tg_id", u.TgID)
 		writeJSON(w, http.StatusOK, struct{}{})
 	}
 }

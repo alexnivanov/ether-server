@@ -45,7 +45,9 @@ CREATE TABLE IF NOT EXISTS users (
 );
 CREATE TABLE IF NOT EXISTS sessions (
 	token      TEXT PRIMARY KEY,
-	tg_id      INTEGER NOT NULL REFERENCES users(tg_id),
+	-- ON DELETE CASCADE: удаление аккаунта (DeleteUser) само сносит все его
+	-- сессии; работает при foreign_keys=ON (см. OpenStore).
+	tg_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
 	created_at INTEGER NOT NULL, -- unix-миллисекунды
 	seen_at    INTEGER NOT NULL  -- unix-миллисекунды
 );
@@ -53,7 +55,9 @@ CREATE INDEX IF NOT EXISTS sessions_tg_id ON sessions(tg_id);
 CREATE TABLE IF NOT EXISTS messages (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT, -- монотонный, курсор пагинации
 	channel TEXT NOT NULL,                     -- ID канала (контракт ether-meta)
-	tg_id   INTEGER NOT NULL,                  -- автор; имя и аватар берутся JOIN из users
+	-- автор; имя/аватар — JOIN из users. ON DELETE CASCADE: удаление аккаунта
+	-- стирает и его сообщения (при foreign_keys=ON).
+	tg_id   INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
 	text    TEXT NOT NULL,
 	ts      INTEGER NOT NULL                   -- unix-миллисекунды (контракт протокола)
 );
@@ -89,26 +93,43 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
-// SaveUser создаёт или обновляет пользователя (ключ — tg id): tg_username и имя
-// подхватываются заново при каждом входе; rules_accepted_at не трогает — его
-// меняет только AcceptRules. Возвращает, принимал ли пользователь правила
-// раньше (для повторного входа тем же Telegram-аккаунтом).
-func (s *Store) SaveUser(u User) (rulesAccepted bool, err error) {
+// CreateUser заводит нового пользователя (ключ — tg id). Правила при
+// регистрации не приняты — их отмечает только AcceptRules.
+func (s *Store) CreateUser(u User) error {
 	now := time.Now().UnixMilli()
-	if _, err := s.db.Exec(`
+	_, err := s.db.Exec(`
 		INSERT INTO users (tg_id, tg_username, full_name, avatar_url, created_at, seen_at)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(tg_id) DO UPDATE SET
-			tg_username = excluded.tg_username,
-			full_name = excluded.full_name,
-			avatar_url = excluded.avatar_url,
-			seen_at = excluded.seen_at`,
-		u.TgID, u.TgUsername, u.FullName, u.AvatarURL, now, now); err != nil {
-		return false, err
-	}
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		u.TgID, u.TgUsername, u.FullName, u.AvatarURL, now, now)
+	return err
+}
+
+// UpdateUser обновляет профиль существующего пользователя: tg_username, имя и
+// аватар подхватываются заново при каждом входе, seen_at освежается.
+// rules_accepted_at не трогает — его меняет только AcceptRules.
+//
+// found=false — такого пользователя ещё нет (значит вход первый, зовите
+// CreateUser). rulesAccepted — принимал ли он правила раньше; RETURNING отдаёт
+// это тем же запросом, что и UPDATE.
+func (s *Store) UpdateUser(u User) (found, rulesAccepted bool, err error) {
 	var acceptedAt int64
-	err = s.db.QueryRow(`SELECT rules_accepted_at FROM users WHERE tg_id = ?`, u.TgID).Scan(&acceptedAt)
-	return acceptedAt > 0, err
+	err = s.db.QueryRow(`
+		UPDATE users SET
+			tg_username = ?,
+			full_name = ?,
+			avatar_url = ?,
+			seen_at = ?
+		WHERE tg_id = ?
+		RETURNING rules_accepted_at`,
+		u.TgUsername, u.FullName, u.AvatarURL, time.Now().UnixMilli(), u.TgID,
+	).Scan(&acceptedAt)
+	if err == sql.ErrNoRows {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, err
+	}
+	return true, acceptedAt > 0, nil
 }
 
 // AcceptRules отмечает, что пользователь принял правила эфира — привязано к
@@ -140,6 +161,14 @@ func (s *Store) DeleteSession(token string) error {
 	return err
 }
 
+// DeleteUser удаляет аккаунт целиком, необратимо: сам пользователь + каскадом
+// (ON DELETE CASCADE, см. схему) все его сессии (все устройства) и сообщения.
+// Идемпотентна: удаление отсутствующего tg_id — не ошибка.
+func (s *Store) DeleteUser(tgID int64) error {
+	_, err := s.db.Exec(`DELETE FROM users WHERE tg_id = ?`, tgID)
+	return err
+}
+
 // SaveMessage пишет сообщение в историю канала и возвращает его id.
 func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (int64, error) {
 	res, err := s.db.Exec(`INSERT INTO messages (channel, tg_id, text, ts) VALUES (?, ?, ?, ?)`,
@@ -155,7 +184,9 @@ func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (
 // старше него.
 func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
 	// имя, @username и аватар автора — JOIN из users по tg_id (в messages их
-	// нет); LEFT JOIN на случай, если аккаунт автора удалён — тогда пустые.
+	// нет). LEFT JOIN — защитно: при удалении аккаунта сообщения удаляются
+	// каскадом вместе с автором (см. DeleteUser), поэтому «висячих» строк без
+	// users быть не должно, но JOIN не должен ронять выборку, если что.
 	q := `SELECT m.id, m.channel, m.tg_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
 		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
 		WHERE m.channel = ?`

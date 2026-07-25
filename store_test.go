@@ -13,10 +13,15 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	defer s.Close()
 
 	u := User{TgID: 42, TgUsername: "alex", FullName: "Alex"}
-	if accepted, err := s.SaveUser(u); err != nil {
-		t.Fatalf("save: %v", err)
-	} else if accepted {
-		t.Fatal("save: rules_accepted = true для нового пользователя")
+	// до создания UpdateUser никого не находит — по этому признаку вход считается
+	// первым (см. handleAuthTelegram)
+	if found, _, err := s.UpdateUser(u); err != nil {
+		t.Fatalf("update до create: %v", err)
+	} else if found {
+		t.Fatal("update до create: found = true, want false")
+	}
+	if err := s.CreateUser(u); err != nil {
+		t.Fatalf("create: %v", err)
 	}
 
 	token, err := s.NewSession(u.TgID)
@@ -46,25 +51,29 @@ func TestStoreUsersAndSessions(t *testing.T) {
 
 	// повторный вход обновляет ник, старая сессия видит новый
 	u.FullName = "alex_new"
-	if _, err := s.SaveUser(u); err != nil {
-		t.Fatalf("re-save: %v", err)
+	if found, accepted, err := s.UpdateUser(u); err != nil {
+		t.Fatalf("update: %v", err)
+	} else if !found {
+		t.Fatal("update: found = false для существующего пользователя")
+	} else if accepted {
+		t.Fatal("update: rules_accepted = true до accept_rules")
 	}
 	got, err = s.UserBySession(token)
 	if err != nil {
-		t.Fatalf("resume after re-save: %v", err)
+		t.Fatalf("resume after update: %v", err)
 	}
 	if got == nil || got.FullName != "alex_new" {
-		t.Fatalf("resume after re-save: got %+v, want full_name alex_new", got)
+		t.Fatalf("resume after update: got %+v, want full_name alex_new", got)
 	}
 
-	// правила принимаются один раз и переживают повторные SaveUser (логин)
+	// правила принимаются один раз и переживают повторные входы (UpdateUser)
 	if err := s.AcceptRules(u.TgID); err != nil {
 		t.Fatalf("accept rules: %v", err)
 	}
-	if accepted, err := s.SaveUser(u); err != nil {
-		t.Fatalf("re-save after accept: %v", err)
+	if _, accepted, err := s.UpdateUser(u); err != nil {
+		t.Fatalf("update after accept: %v", err)
 	} else if !accepted {
-		t.Fatal("re-save after accept: rules_accepted = false, want true")
+		t.Fatal("update after accept: rules_accepted = false, want true")
 	}
 	got, err = s.UserBySession(token)
 	if err != nil {
@@ -84,7 +93,7 @@ func TestStoreMessages(t *testing.T) {
 
 	// автор: ник/@username/аватар в messages не хранятся — History берёт их
 	// JOIN из users по tg_id
-	if _, err := s.SaveUser(User{
+	if err := s.CreateUser(User{
 		TgID:       42,
 		TgUsername: "alex_tg",
 		FullName:   "alex",
@@ -140,5 +149,59 @@ func TestStoreMessages(t *testing.T) {
 	}
 	if len(msgs) != 0 {
 		t.Fatalf("history empty: %+v", msgs)
+	}
+}
+
+func TestStoreDeleteUser(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	u := User{TgID: 7, TgUsername: "alex", FullName: "Alex", AvatarURL: "https://t.me/i/a.jpg"}
+	if err := s.CreateUser(u); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// два устройства — две сессии
+	t1, err := s.NewSession(u.TgID)
+	if err != nil {
+		t.Fatalf("session 1: %v", err)
+	}
+	t2, err := s.NewSession(u.TgID)
+	if err != nil {
+		t.Fatalf("session 2: %v", err)
+	}
+	if _, err := s.SaveMessage("RU", u.TgID, "привет", 1000); err != nil {
+		t.Fatalf("save message: %v", err)
+	}
+
+	if err := s.DeleteUser(u.TgID); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	// все сессии пользователя мертвы (удаление аккаунта — со всех устройств)
+	for _, tok := range []string{t1, t2} {
+		got, err := s.UserBySession(tok)
+		if err != nil {
+			t.Fatalf("resume after delete: %v", err)
+		}
+		if got != nil {
+			t.Fatalf("resume after delete: сессия %s жива: %+v", tok, got)
+		}
+	}
+
+	// сообщения удалены каскадом вместе с аккаунтом (ON DELETE CASCADE)
+	msgs, err := s.History("RU", 0, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Fatalf("history: got %d messages, want 0 (удалены вместе с аккаунтом)", len(msgs))
+	}
+
+	// повторное удаление — не ошибка (идемпотентно)
+	if err := s.DeleteUser(u.TgID); err != nil {
+		t.Fatalf("delete again: %v", err)
 	}
 }
