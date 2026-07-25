@@ -52,13 +52,13 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 		found, accepted, err := store.UpdateUser(user)
 		if err != nil {
 			slog.Error("auth update user", "err", err, "tg_id", u.ID)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось сохранить пользователя")
 			return
 		}
 		if !found {
 			if err := store.CreateUser(user); err != nil {
 				slog.Error("auth create user", "err", err, "tg_id", u.ID)
-				writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось сохранить пользователя")
+				writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось сохранить пользователя")
 				return
 			}
 			slog.Info("account created", "tg_id", u.ID)
@@ -66,7 +66,7 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 		token, err := store.NewSession(u.ID)
 		if err != nil {
 			slog.Error("auth new session", "err", err, "tg_id", u.ID)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось создать сессию")
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось создать сессию")
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
@@ -112,7 +112,7 @@ func handleResume(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
@@ -162,7 +162,7 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 		}
 		var d DeleteAccountData
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "нужен токен сессии")
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
 			return
 		}
 		u, err := store.UserBySession(d.Token)
@@ -172,12 +172,12 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
 			return
 		}
 		if err := store.DeleteUser(u.TgID); err != nil {
 			slog.Error("delete_account", "err", err, "tg_id", u.TgID)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "не удалось удалить аккаунт")
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось удалить аккаунт")
 			return
 		}
 		slog.Info("account deleted", "tg_id", u.TgID)
@@ -195,7 +195,7 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 		}
 		var d AcceptRulesData
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "not_authed", "нужен токен сессии")
+			writeRESTError(w, http.StatusBadRequest, "not_authed", "Нужен токен сессии")
 			return
 		}
 		u, err := store.UserBySession(d.Token)
@@ -205,7 +205,7 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
 			return
 		}
 		if err := store.AcceptRules(u.TgID); err != nil {
