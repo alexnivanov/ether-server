@@ -20,11 +20,11 @@ import (
 // эндпоинта есть единственное очевидное место, а не «в конец». Общие хелперы
 // ответа — в конце файла.
 
-// notify может быть nil — уведомления модерации в Telegram выключены (см.
-// notify.go); на приём жалоб это не влияет.
+// notify может быть nil — служебные уведомления в Telegram выключены (см.
+// notify.go); на приём жалоб и регистрацию это не влияет.
 func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth, notify *Notifier) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
-	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg))
+	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg, notify))
 	mux.HandleFunc("/history", handleHistory(store))
 	mux.HandleFunc("/report", handleReport(store, notify))
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
@@ -72,7 +72,7 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 // bad_data. id_token — OIDC-токен от нативного Telegram Login SDK; сервер
 // проверяет его подпись по публичным ключам Telegram (см. telegram.go), сети к
 // api.telegram.org не нужно.
-func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
+func handleAuthTelegram(store *Store, tg *TelegramAuth, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
@@ -104,6 +104,9 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth) http.HandlerFunc {
 				return
 			}
 			slog.Info("account created", "tg_id", u.ID)
+			if notify != nil {
+				go notify.AccountCreated(user)
+			}
 		}
 		token, err := store.NewSession(u.ID)
 		if err != nil {

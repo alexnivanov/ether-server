@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,8 +48,10 @@ func TestAuthTelegram(t *testing.T) {
 
 	const clientID = "8705267895"
 	mux := http.NewServeMux()
-	// notify=nil — уведомления модерации в Telegram выключены (тесту не нужны)
-	registerREST(mux, store, NewTelegramAuth(clientID, jwks.URL), nil)
+	// уведомления в служебный канал с перехваченным транспортом (см. notify_test):
+	// проверяем, что регистрация постит в канал, а повторный вход — нет
+	notify, notified := newFakeNotifier()
+	registerREST(mux, store, NewTelegramAuth(clientID, jwks.URL), notify)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -89,6 +92,27 @@ func TestAuthTelegram(t *testing.T) {
 	}
 	if u, err := store.UserBySession(token); err != nil || u == nil || u.TgID != 777 {
 		t.Fatalf("сессия из auth не резолвится: u=%v err=%v", u, err)
+	}
+
+	// регистрация → уведомление в служебный канал (шлётся в горутине)
+	select {
+	case n := <-notified:
+		if text, _ := n["text"].(string); !strings.Contains(text, "Новый пользователь") ||
+			!strings.Contains(text, "777") {
+			t.Errorf("уведомление о регистрации: text = %q", text)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("уведомление о регистрации не отправлено")
+	}
+
+	// повторный вход тем же аккаунтом — это НЕ регистрация, в канал не пишем
+	if code, m = post(sign(key, clientID, time.Now().Add(time.Hour))); code != http.StatusOK {
+		t.Fatalf("auth(повторный) = %d %v, want 200", code, m)
+	}
+	select {
+	case n := <-notified:
+		t.Errorf("повторный вход прислал уведомление: %v", n["text"])
+	case <-time.After(300 * time.Millisecond):
 	}
 
 	// чужая подпись (другой ключ, тот же kid) → 401

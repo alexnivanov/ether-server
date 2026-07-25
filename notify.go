@@ -12,10 +12,10 @@ import (
 	"time"
 )
 
-// Notifier отправляет служебные уведомления модерации в Telegram-канал: жалобы
-// на сообщения приходят туда сразу, а не ждут, пока кто-то заглянет в
-// journalctl. Отдельный бот-токен и chat_id канала — в конфиге; оба пусты →
-// уведомления выключены (жалоба всё равно в БД и в логе).
+// Notifier отправляет служебные уведомления в Telegram-канал: жалобы на
+// сообщения и регистрации новых пользователей приходят туда сразу, а не ждут,
+// пока кто-то заглянет в journalctl. Отдельный бот-токен и chat_id канала — в
+// конфиге; оба пусты → уведомления выключены (событие всё равно в БД и в логе).
 //
 // Это ЕДИНСТВЕННОЕ место, где серверу нужен секретный токен бота: вход
 // пользователей проверяется по публичным ключам Telegram (JWKS, см.
@@ -87,6 +87,34 @@ func (n *Notifier) ReportToChannel(rep *ReportedMessage, reporter *User) {
 		html.EscapeString(from), reporter.TgID,
 	)
 
+	n.send("report", body, "message_id", rep.MessageID)
+}
+
+// AccountCreated шлёт в служебный канал уведомление о регистрации нового
+// пользователя (первый вход через Telegram, см. handleAuthTelegram). Как и
+// ReportToChannel, задумана для вызова в горутине: ответ клиенту от неё не
+// зависит, аккаунт уже создан.
+func (n *Notifier) AccountCreated(u User) {
+	who := u.FullName
+	if u.TgUsername != "" {
+		who += " @" + u.TgUsername
+	}
+	if strings.TrimSpace(who) == "" {
+		who = "без имени"
+	}
+	body := fmt.Sprintf(
+		"🎉 <b>Новый пользователь</b>\n%s (<code>%d</code>)",
+		html.EscapeString(who), u.TgID,
+	)
+	n.send("account created", body, "tg_id", u.TgID)
+}
+
+// send отправляет готовый HTML-текст в служебный канал. kind и logAttrs — только
+// для лога: ошибки здесь не возвращаются, потому что уведомление всегда
+// вторично по отношению к самому событию (оно уже записано в БД).
+func (n *Notifier) send(kind, body string, logAttrs ...any) {
+	log := slog.With(logAttrs...)
+
 	payload, _ := json.Marshal(map[string]any{
 		"chat_id":                  n.chatID,
 		"text":                     body,
@@ -98,15 +126,15 @@ func (n *Notifier) ReportToChannel(rep *ReportedMessage, reporter *User) {
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := n.http.Do(req)
 	if err != nil {
-		slog.Error("notify report", "err", err, "message_id", rep.MessageID)
+		log.Error("notify "+kind, "err", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// тело Telegram объясняет причину (нет прав в канале, неверный chat_id)
 		b, _ := io.ReadAll(resp.Body)
-		slog.Warn("notify report rejected", "status", resp.Status, "body", string(b))
+		log.Warn("notify "+kind+" rejected", "status", resp.Status, "body", string(b))
 		return
 	}
-	slog.Info("notify report", "message_id", rep.MessageID, "status", "ok")
+	log.Info("notify "+kind, "status", "ok")
 }
