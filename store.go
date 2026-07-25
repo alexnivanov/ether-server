@@ -64,6 +64,24 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
 -- под уборку старых сообщений по TTL (DeleteMessagesOlderThan)
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
+-- Жалобы на сообщения (модерация UGC — требование Apple 1.2). Храним копию
+-- текста и автора: сообщение живёт messageTTL (неделя) и удаляется, а жалоба
+-- должна остаться разбираемой, поэтому ссылку на messages не ставим — id
+-- сохраняем справочно, без FK.
+CREATE TABLE IF NOT EXISTS reports (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	message_id     INTEGER NOT NULL,        -- id сообщения на момент жалобы
+	channel        TEXT NOT NULL,           -- где было сообщение
+	author_tg_id   INTEGER NOT NULL,        -- на кого жалуются
+	message_text   TEXT NOT NULL,           -- копия: сообщение может быть удалено
+	reporter_tg_id INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	reason         TEXT NOT NULL DEFAULT '',-- код причины из клиента
+	created_at     INTEGER NOT NULL,        -- unix-миллисекунды
+	-- повторная жалоба того же человека на то же сообщение — не новая запись
+	UNIQUE(message_id, reporter_tg_id)
+);
+CREATE INDEX IF NOT EXISTS reports_created_at ON reports(created_at);
+CREATE INDEX IF NOT EXISTS reports_author ON reports(author_tg_id);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -237,6 +255,34 @@ func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageDat
 		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
 	return msgs, nil
+}
+
+// ReportMessage регистрирует жалобу на сообщение. Текст и автора копируем из
+// самого сообщения (клиент их не присылает — иначе на что жалуются, решал бы
+// он): сообщение живёт неделю, а жалоба должна остаться разбираемой после его
+// удаления. Возвращает false, если сообщения с таким id нет (уже удалено по TTL
+// или id выдуман). Повторная жалоба того же пользователя на то же сообщение —
+// не ошибка и не дубль (UNIQUE + INSERT OR IGNORE), для клиента это успех.
+func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (ok bool, err error) {
+	var channel, text string
+	var authorID int64
+	err = s.db.QueryRow(`SELECT channel, tg_id, text FROM messages WHERE id = ?`, messageID).
+		Scan(&channel, &authorID, &text)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	_, err = s.db.Exec(`
+		INSERT OR IGNORE INTO reports
+			(message_id, channel, author_tg_id, message_text, reporter_tg_id, reason, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		messageID, channel, authorID, text, reporterTgID, reason, time.Now().UnixMilli())
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // UserBySession возвращает пользователя по токену сессии (nil — сессии нет)

@@ -253,3 +253,71 @@ func TestStoreDeleteMessagesOlderThan(t *testing.T) {
 		t.Fatalf("повторная уборка: n=%d err=%v, want 0 nil", n, err)
 	}
 }
+
+func TestStoreReportMessage(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	author := User{TgID: 1, FullName: "Author"}
+	reporter := User{TgID: 2, FullName: "Reporter"}
+	for _, u := range []User{author, reporter} {
+		if err := s.CreateUser(u); err != nil {
+			t.Fatalf("create %d: %v", u.TgID, err)
+		}
+	}
+	msgID, err := s.SaveMessage("RU", author.TgID, "гадость", 1000)
+	if err != nil {
+		t.Fatalf("save message: %v", err)
+	}
+
+	ok, err := s.ReportMessage(msgID, reporter.TgID, "abuse")
+	if err != nil {
+		t.Fatalf("report: %v", err)
+	}
+	if !ok {
+		t.Fatal("report: ok = false для существующего сообщения")
+	}
+
+	// текст и автор скопированы — жалоба разбираема после удаления сообщения
+	var gotText, gotReason string
+	var gotAuthor int64
+	if err := s.db.QueryRow(
+		`SELECT message_text, author_tg_id, reason FROM reports WHERE message_id = ?`, msgID).
+		Scan(&gotText, &gotAuthor, &gotReason); err != nil {
+		t.Fatalf("select report: %v", err)
+	}
+	if gotText != "гадость" || gotAuthor != author.TgID || gotReason != "abuse" {
+		t.Fatalf("report: text=%q author=%d reason=%q", gotText, gotAuthor, gotReason)
+	}
+
+	// повторная жалоба того же пользователя — успех, но без дубля
+	if ok, err := s.ReportMessage(msgID, reporter.TgID, "spam"); err != nil || !ok {
+		t.Fatalf("report again: ok=%v err=%v", ok, err)
+	}
+	var count int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM reports WHERE message_id = ?`, msgID).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("report дублируется: %d записей", count)
+	}
+
+	// жалоба на несуществующее сообщение — ok=false, не ошибка
+	if ok, err := s.ReportMessage(9999, reporter.TgID, "spam"); err != nil || ok {
+		t.Fatalf("report missing: ok=%v err=%v", ok, err)
+	}
+
+	// жалоба переживает удаление самого сообщения (TTL-уборка)
+	if _, err := s.DeleteMessagesOlderThan(0); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM reports`).Scan(&count); err != nil {
+		t.Fatalf("count after cleanup: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("жалоба пропала после удаления сообщения: %d", count)
+	}
+}

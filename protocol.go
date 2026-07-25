@@ -54,6 +54,16 @@ type DeleteAccountData struct {
 	Token string `json:"token"`
 }
 
+// ReportData — тело POST /report: жалоба на сообщение (модерация UGC). Текст и
+// автора сервер берёт из самого сообщения по MessageID — клиент присылает лишь
+// на что жалуется и почему. Reason — код причины из фиксированного набора
+// клиента (spam/abuse/illegal/other), свободного текста нет.
+type ReportData struct {
+	Token     string `json:"token"`
+	MessageID int64  `json:"message_id"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // TelegramAuthRequest — тело POST /auth/telegram: OIDC ID-token от нативного
 // Telegram Login SDK, сервер проверяет его подпись по JWKS (см. telegram.go).
 type TelegramAuthRequest struct {
