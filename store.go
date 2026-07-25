@@ -62,6 +62,8 @@ CREATE TABLE IF NOT EXISTS messages (
 	ts      INTEGER NOT NULL                   -- unix-миллисекунды (контракт протокола)
 );
 CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
+-- под уборку старых сообщений по TTL (DeleteMessagesOlderThan)
+CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -177,6 +179,18 @@ func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (
 		return 0, err
 	}
 	return res.LastInsertId()
+}
+
+// DeleteMessagesOlderThan удаляет сообщения старше ttl и возвращает их число.
+// Зовётся по таймеру (см. cleanup.go): чат географический и живой, старая
+// история никому не нужна, а база не должна расти бесконечно.
+func (s *Store) DeleteMessagesOlderThan(ttl time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-ttl).UnixMilli()
+	res, err := s.db.Exec(`DELETE FROM messages WHERE ts < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // History возвращает до limit последних сообщений канала в хронологическом

@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStoreUsersAndSessions(t *testing.T) {
@@ -203,5 +204,52 @@ func TestStoreDeleteUser(t *testing.T) {
 	// повторное удаление — не ошибка (идемпотентно)
 	if err := s.DeleteUser(u.TgID); err != nil {
 		t.Fatalf("delete again: %v", err)
+	}
+}
+
+func TestStoreDeleteMessagesOlderThan(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	if err := s.CreateUser(User{TgID: 42, FullName: "alex"}); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+
+	ttl := 7 * 24 * time.Hour
+	now := time.Now()
+	// два сообщения по краям TTL: одно чуть старше границы, одно свежее
+	stale, err := s.SaveMessage("RU", 42, "старое", now.Add(-ttl-time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatalf("save stale: %v", err)
+	}
+	if _, err := s.SaveMessage("RU", 42, "свежее", now.Add(-time.Hour).UnixMilli()); err != nil {
+		t.Fatalf("save fresh: %v", err)
+	}
+
+	n, err := s.DeleteMessagesOlderThan(ttl)
+	if err != nil {
+		t.Fatalf("delete old: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("удалено %d сообщений, want 1", n)
+	}
+
+	msgs, err := s.History("RU", 0, 10)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].Text != "свежее" {
+		t.Fatalf("после уборки осталось %+v, want только «свежее»", msgs)
+	}
+	if msgs[0].ID == stale {
+		t.Fatal("осталось именно старое сообщение")
+	}
+
+	// повторный проход больше нечего удалять
+	if n, err := s.DeleteMessagesOlderThan(ttl); err != nil || n != 0 {
+		t.Fatalf("повторная уборка: n=%d err=%v, want 0 nil", n, err)
 	}
 }

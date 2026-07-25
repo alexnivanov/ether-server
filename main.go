@@ -55,6 +55,7 @@ func main() {
 		slog.Error("store", "err", err)
 		os.Exit(1)
 	}
+	go startMessageCleanup(store) // сообщения живут messageTTL, см. cleanup.go
 
 	nominatim := NewNominatimGeocoder()
 	if cfg.NominatimURL != "" {
