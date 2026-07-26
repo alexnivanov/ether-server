@@ -83,7 +83,8 @@ func main() {
 
 	mux := http.NewServeMux()
 	registerREST(mux, store, tg, notify)
-	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push))
+	// лимитер один на процесс: частота считается на аккаунт, а не на соединение
+	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, NewRateLimiter()))
 
 	slog.Info("listening", "version", version, "config", path, "addr", cfg.Addr)
 	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
@@ -98,7 +99,7 @@ func main() {
 // что протухший токен здесь — сигнал рассинхронизации, а не штатный путь,
 // поэтому отвечаем 401 до апгрейда. ?token= — единственный способ авторизовать
 // сокет: логин-кадров на WS больше нет.
-func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher) http.HandlerFunc {
+func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher, limiter *RateLimiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var authedUser *User
 		if token := r.URL.Query().Get("token"); token != "" {
@@ -121,12 +122,13 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher) http.HandlerF
 			return
 		}
 		c := &Client{
-			hub:   hub,
-			conn:  conn,
-			send:  make(chan Envelope, 16),
-			geo:   geo,
-			store: store,
-			push:  push,
+			hub:     hub,
+			conn:    conn,
+			send:    make(chan Envelope, 16),
+			geo:     geo,
+			store:   store,
+			push:    push,
+			limiter: limiter,
 		}
 		if authedUser != nil {
 			c.setAuthed(

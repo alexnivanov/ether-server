@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -24,6 +25,11 @@ type Client struct {
 	geo   Geocoder
 	store *Store
 	push  *Pusher // FCM-пуши о новых сообщениях; nil — пуши выключены
+
+	// частота публикаций (см. ratelimit.go); общий на все соединения, поэтому
+	// лимит держится на аккаунт, а не на сокет — иначе его обходили бы вторым
+	// подключением. nil — без ограничений (тесты).
+	limiter *RateLimiter
 
 	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
 	// дальше только читается (publish)
@@ -117,6 +123,16 @@ func (c *Client) readPump() {
 			if d.Text == "" || len(d.Text) > maxMessageLen {
 				c.sendError("bad_data", "text must be 1..4096 bytes")
 				continue
+			}
+			// Частота публикаций. rating пока всегда 0 (голосов нет) — работает
+			// базовый тир; когда появится рейтинг, сюда придёт его значение и
+			// лимит станет тирным без правок здесь (см. ratelimit.go).
+			if c.limiter != nil {
+				if ok, retry := c.limiter.Allow(userID, 0); !ok {
+					c.sendError("too_fast", fmt.Sprintf(
+						"Слишком часто — подожди %d с", int(retry.Seconds())+1))
+					continue
+				}
 			}
 			// в БД пишем только tg_id; имя/аватар для live берём из соединения,
 			// для истории — JOIN из users (см. store.History)

@@ -39,7 +39,8 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 
 	mux := http.NewServeMux()
 	registerREST(mux, store, tg, nil) // nil — без уведомлений модерации
-	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil))
+	// limiter=nil — без ограничения частоты: тесты публикуют подряд
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, nil))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
