@@ -110,6 +110,21 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth, notify *Notifier) http.H
 				go notify.AccountCreated(user)
 			}
 		}
+		// Вход запрещаем только при ПОСТОЯННОМ бане: временный — это мьют,
+		// человек продолжает читать и заходить, отбивается лишь отправка.
+		// Проверка живёт по Telegram id и переживает удаление аккаунта, поэтому
+		// вернувшийся «с чистого листа» всё равно отбивается.
+		_, until, permanent, reason, err := store.BanStatus(u.ID)
+		if err != nil {
+			slog.Error("auth ban check", "err", err, "tg_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось проверить аккаунт")
+			return
+		}
+		if permanent {
+			slog.Info("banned login attempt", "tg_id", u.ID)
+			writeRESTError(w, http.StatusForbidden, "banned", BanMessage(until, permanent, reason))
+			return
+		}
 		token, err := store.NewSession(u.ID)
 		if err != nil {
 			slog.Error("auth new session", "err", err, "tg_id", u.ID)

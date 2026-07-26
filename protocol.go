@@ -126,7 +126,7 @@ type AuthedData struct {
 	// сессионный токен: клиент сохраняет его и предъявляет в REST /session/resume
 	// после реконнекта и в query ?token= при открытии WS; пустой — вне /auth/telegram
 	Token string `json:"token,omitempty"`
-	// принимал ли этот аккаунт правила эфира раньше (POST /rules/accept) —
+	// принимал ли этот аккаунт правила Эфира раньше (POST /rules/accept) —
 	// привязано к пользователю, не к устройству/сессии; true — клиент минует
 	// экран правил
 	RulesAccepted bool `json:"rules_accepted"`

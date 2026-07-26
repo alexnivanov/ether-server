@@ -81,6 +81,12 @@ func main() {
 	notify := NewNotifier(cfg.TelegramNotifyToken, cfg.TelegramNotifyChatID)
 	slog.Info("moderation notify", "enabled", notify != nil)
 
+	// команды модерации из того же канала (/ban, /del, ...) — см. admin.go
+	if admin := NewAdminBot(notify, store); admin != nil {
+		go admin.Run()
+		slog.Info("moderation commands", "enabled", true)
+	}
+
 	mux := http.NewServeMux()
 	registerREST(mux, store, tg, notify)
 	// лимитер один на процесс: частота считается на аккаунт, а не на соединение
@@ -111,6 +117,13 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher, limiter *Rate
 			}
 			if u == nil {
 				http.Error(w, "bad session", http.StatusUnauthorized)
+				return
+			}
+			// Сокет не открываем только при постоянном бане (аккаунт удалён).
+			// Временный бан — мьют: соединение нужно, чтобы читать; отправка
+			// отбивается в publish (см. client.go).
+			if u.BanPermanent {
+				http.Error(w, "banned", http.StatusForbidden)
 				return
 			}
 			authedUser = u

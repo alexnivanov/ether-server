@@ -124,6 +124,16 @@ func (c *Client) readPump() {
 				c.sendError("bad_data", "text must be 1..4096 bytes")
 				continue
 			}
+			// Бан мог прилететь при уже открытом сокете (BanEscalate отзывает
+			// сессии, но живое соединение остаётся authed в памяти). Запрос на
+			// каждую публикацию — один SELECT к локальной SQLite; на нашем
+			// масштабе дешевле, чем индексировать соединения по пользователю.
+			if banned, until, permanent, reason, err := c.store.BanStatus(userID); err != nil {
+				slog.Error("ban check", "err", err, "tg_id", userID)
+			} else if banned {
+				c.sendError("banned", BanMessage(until, permanent, reason))
+				continue
+			}
 			// Частота публикаций. rating пока всегда 0 (голосов нет) — работает
 			// базовый тир; когда появится рейтинг, сюда придёт его значение и
 			// лимит станет тирным без правок здесь (см. ratelimit.go).

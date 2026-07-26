@@ -73,18 +73,28 @@ func (n *Notifier) ReportToChannel(rep *ReportedMessage, reporter *User) {
 
 	// HTML-разметка (parse_mode=HTML): экранируем всё пользовательское, иначе
 	// "<" в сообщении сломает разбор и Telegram отклонит запрос
+	// Счётчик нарушений автора — чтобы решение принималось не выходя из канала:
+	// автоматической эскалации нет, модератор смотрит на число и выбирает
+	// /ban (сутки) или /block (навсегда).
+	history := "первая жалоба на этого автора"
+	if rep.AuthorBanCount > 0 {
+		history = fmt.Sprintf("наказаний ранее: <b>%d</b>", rep.AuthorBanCount)
+	}
+
 	body := fmt.Sprintf(
 		"🚩 <b>Жалоба на сообщение</b>\n"+
 			"Причина: <b>%s</b>\n"+
-			"Автор: %s (<code>%d</code>)\n"+
+			"Автор: %s (<code>%d</code>) — %s\n"+
 			"Канал: <code>%s</code>\n"+
 			"Сообщение #<code>%d</code>:\n<blockquote>%s</blockquote>\n"+
-			"От: %s (<code>%d</code>)",
+			"От: %s (<code>%d</code>)\n\n"+
+			"<code>/ban %d</code> · <code>/block %d</code> · <code>/del %d</code>",
 		html.EscapeString(rep.Reason),
-		html.EscapeString(author), rep.AuthorTgID,
+		html.EscapeString(author), rep.AuthorTgID, history,
 		html.EscapeString(rep.Channel),
 		rep.MessageID, html.EscapeString(text),
 		html.EscapeString(from), reporter.TgID,
+		rep.AuthorTgID, rep.AuthorTgID, rep.MessageID,
 	)
 
 	n.send("report", body, "message_id", rep.MessageID)

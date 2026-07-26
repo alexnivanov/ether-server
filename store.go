@@ -27,10 +27,17 @@ type User struct {
 	TgUsername string // @username — для ссылки на профиль в Telegram (не для имени)
 	FullName   string // отображаемое имя (Telegram `name`); единственное для UI
 	AvatarURL  string // URL фото профиля из Telegram (claim `picture`); может быть пустым
-	// RulesAccepted — согласие с правилами эфира привязано к Telegram-аккаунту,
+	// RulesAccepted — согласие с правилами Эфира привязано к Telegram-аккаунту,
 	// а не к устройству/сессии: однажды принял — экран правил больше не увидит,
 	// даже переустановив клиент или потеряв shared_preferences.
 	RulesAccepted bool
+	// Banned — активное наказание модератора: отправка сообщений запрещена
+	// («мьют»). Чтение и вход остаются — временный бан никого не выселяет.
+	Banned bool
+	// BanPermanent — постоянный бан (повторное нарушение). Аккаунт при этом
+	// удалён, и вход запрещён совсем: иначе нарушитель просто зарегистрировался
+	// бы заново под тем же Telegram id.
+	BanPermanent bool
 }
 
 const storeSchema = `
@@ -104,6 +111,22 @@ CREATE TABLE IF NOT EXISTS user_channels (
 	PRIMARY KEY (tg_id, channel)
 );
 CREATE INDEX IF NOT EXISTS user_channels_channel ON user_channels(channel);
+-- Наказания модератора. Ключ — Telegram id, и таблица СПЕЦИАЛЬНО без FK на
+-- users: вход идёт по Telegram-аккаунту, поэтому удаление аккаунта из users не
+-- должно снимать наказание — иначе нарушитель просто войдёт заново и получит
+-- чистый профиль.
+--
+-- Автоматической эскалации нет: решает модератор. Он видит count (сколько раз
+-- наказывали) в посте жалобы и сам выбирает мьют на сутки или постоянный бан.
+CREATE TABLE IF NOT EXISTS bans (
+	tg_id      INTEGER PRIMARY KEY,          -- кого наказали (может уже не быть в users)
+	until      INTEGER NOT NULL DEFAULT 0,   -- unix-мс, до когда временный бан; 0 — нет
+	permanent  INTEGER NOT NULL DEFAULT 0,   -- 1 — постоянный запрет входа
+	count      INTEGER NOT NULL DEFAULT 0,   -- сколько раз наказывали (справочно, для модератора)
+	reason     TEXT NOT NULL DEFAULT '',     -- причина последнего наказания (показывается пользователю)
+	created_at INTEGER NOT NULL,
+	updated_at INTEGER NOT NULL
+);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -174,7 +197,7 @@ func (s *Store) UpdateUser(u User) (found, rulesAccepted bool, err error) {
 	return true, acceptedAt > 0, nil
 }
 
-// AcceptRules отмечает, что пользователь принял правила эфира — привязано к
+// AcceptRules отмечает, что пользователь принял правила Эфира — привязано к
 // Telegram-аккаунту, переживает переустановку клиента и смену устройства.
 func (s *Store) AcceptRules(tgID int64) error {
 	_, err := s.db.Exec(`UPDATE users SET rules_accepted_at = ? WHERE tg_id = ?`, time.Now().UnixMilli(), tgID)
@@ -289,6 +312,9 @@ type ReportedMessage struct {
 	AuthorUsername string // @username автора; пусто — нет username
 	Text           string
 	Reason         string
+	// AuthorBanCount — сколько раз автора уже наказывали. Показывается модератору
+	// в посте жалобы: эскалации нет, решение (мьют или блокировка) за ним.
+	AuthorBanCount int
 	// Fresh — жалоба записана впервые. false: этот пользователь уже жаловался на
 	// это сообщение — в БД дубля нет, и уведомление повторно слать не надо
 	// (иначе повторные тапы засорят канал).
@@ -324,11 +350,157 @@ func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (*Re
 	if err != nil {
 		return nil, err
 	}
+	if rep.AuthorBanCount, err = s.BanCount(rep.AuthorTgID); err != nil {
+		return nil, err
+	}
 	// 0 изменённых строк — сработал IGNORE, т.е. жалоба уже была
 	if n, err := res.RowsAffected(); err == nil && n > 0 {
 		rep.Fresh = true
 	}
 	return rep, nil
+}
+
+// banDuration — срок мьюта по умолчанию. Сутки: достаточно, чтобы остудить, и не
+// требует от модератора возвращаться и снимать вручную — истекает сам, без
+// фоновой уборки (проверка идёт по времени, см. BanStatus).
+const banDuration = 24 * time.Hour
+
+// BanTemporary закрывает отправку на banDuration («мьют»): вход и чтение
+// остаются, сессии не отзываются. reason — необязательная причина, её увидит
+// пользователь. Возвращает время окончания и накопленное число наказаний, чтобы
+// модератор видел, сколько раз этот человек уже попадался.
+func (s *Store) BanTemporary(tgID int64, reason string) (until time.Time, count int, err error) {
+	now := time.Now()
+	until = now.Add(banDuration)
+	if err = s.upsertBan(tgID, until.UnixMilli(), 0, reason, now); err != nil {
+		return time.Time{}, 0, err
+	}
+	count, err = s.BanCount(tgID)
+	return until, count, err
+}
+
+// BanPermanent закрывает вход навсегда и удаляет аккаунт (профиль, сессии,
+// сообщения и токены устройств уходят каскадом). Запись в bans остаётся —
+// именно она не даёт зарегистрироваться заново под тем же Telegram id.
+// Автоматически не вызывается: решение всегда за модератором.
+func (s *Store) BanPermanent(tgID int64, reason string) (count int, err error) {
+	now := time.Now()
+	if err = s.upsertBan(tgID, 0, 1, reason, now); err != nil {
+		return 0, err
+	}
+	if err = s.DeleteUser(tgID); err != nil {
+		return 0, err
+	}
+	return s.BanCount(tgID)
+}
+
+// upsertBan пишет наказание и увеличивает счётчик нарушений.
+func (s *Store) upsertBan(tgID, until int64, permanent int, reason string, now time.Time) error {
+	nowMs := now.UnixMilli()
+	_, err := s.db.Exec(`
+		INSERT INTO bans (tg_id, until, permanent, count, reason, created_at, updated_at)
+		VALUES (?, ?, ?, 1, ?, ?, ?)
+		ON CONFLICT(tg_id) DO UPDATE SET
+			until = excluded.until,
+			permanent = excluded.permanent,
+			count = bans.count + 1,
+			reason = excluded.reason,
+			updated_at = excluded.updated_at`,
+		tgID, until, permanent, reason, nowMs, nowMs)
+	return err
+}
+
+// BanCount — сколько раз этого человека наказывали (включая снятые). Модератор
+// видит это число в посте жалобы и решает, мьютить или банить насовсем.
+func (s *Store) BanCount(tgID int64) (int, error) {
+	var n int
+	err := s.db.QueryRow(`SELECT count FROM bans WHERE tg_id = ?`, tgID).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return n, err
+}
+
+// BanStatus — активно ли наказание. Временный бан истекает сам: сравниваем until
+// с текущим временем, поэтому фоновая уборка не нужна. permanent игнорирует until.
+func (s *Store) BanStatus(tgID int64) (banned bool, until time.Time, permanent bool, reason string, err error) {
+	var untilMs int64
+	var perm int
+	err = s.db.QueryRow(`SELECT until, permanent, reason FROM bans WHERE tg_id = ?`, tgID).
+		Scan(&untilMs, &perm, &reason)
+	if err == sql.ErrNoRows {
+		return false, time.Time{}, false, "", nil
+	}
+	if err != nil {
+		return false, time.Time{}, false, "", err
+	}
+	if perm == 1 {
+		return true, time.Time{}, true, reason, nil
+	}
+	if untilMs > time.Now().UnixMilli() {
+		return true, time.UnixMilli(untilMs), false, reason, nil
+	}
+	return false, time.Time{}, false, "", nil
+}
+
+// BanMessage — что показать наказанному. Формулировка одна на все точки входа
+// (логин, апгрейд сокета, publish), чтобы не разъезжалась.
+func BanMessage(until time.Time, permanent bool, reason string) string {
+	var msg string
+	switch {
+	case permanent:
+		msg = "Аккаунт заблокирован за нарушение правил Эфира"
+	default:
+		// временный бан — мьют: читать можно, поэтому говорим про отправку
+		left := time.Until(until).Round(time.Hour)
+		if left < time.Hour {
+			msg = "Отправка сообщений закрыта за нарушение правил Эфира. Осталось меньше часа"
+		} else {
+			msg = fmt.Sprintf(
+				"Отправка сообщений закрыта за нарушение правил Эфира. Осталось %d ч",
+				int(left.Hours()))
+		}
+	}
+	if reason != "" {
+		msg += ". Причина: " + reason
+	}
+	return msg
+}
+
+// Unban снимает наказание вручную (ошиблись, разобрались). Историю нарушений
+// (count) НЕ сбрасывает: модератор должен видеть, сколько раз человек попадался,
+// даже если прошлые наказания снимали. Возвращает false, если наказания нет.
+func (s *Store) Unban(tgID int64) (bool, error) {
+	res, err := s.db.Exec(`
+		UPDATE bans SET until = 0, permanent = 0, updated_at = ?
+		WHERE tg_id = ? AND (until > 0 OR permanent = 1)`, time.Now().UnixMilli(), tgID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// DeleteMessage удаляет одно сообщение (реакция на жалобу). Возвращает false,
+// если сообщения уже нет — оно могло уйти по TTL или быть удалено раньше.
+// Жалобы на него остаются: в них хранится копия текста (см. ReportMessage).
+func (s *Store) DeleteMessage(id int64) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// DeleteUserMessages удаляет все сообщения пользователя и возвращает их число —
+// когда одного сообщения мало (спамер засыпал канал).
+func (s *Store) DeleteUserMessages(tgID int64) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE tg_id = ?`, tgID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // SaveDeviceToken привязывает FCM-токен устройства к пользователю (upsert по
@@ -409,12 +581,20 @@ func (s *Store) PushTargets(channel string, exceptTgID int64) ([]string, error) 
 // и отмечает сессию как живую.
 func (s *Store) UserBySession(token string) (*User, error) {
 	var u User
-	var acceptedAt int64
+	var acceptedAt, banUntil int64
+	var banPermanent int
+	// LEFT JOIN bans: наказание живёт отдельно от аккаунта (см. схему), а
+	// временное истекает само — поэтому сравниваем until с текущим временем
+	// здесь же, а не полагаемся на фоновую уборку.
 	err := s.db.QueryRow(`
-		SELECT u.tg_id, u.tg_username, u.full_name, u.avatar_url, u.rules_accepted_at
-		FROM sessions s JOIN users u ON u.tg_id = s.tg_id
+		SELECT u.tg_id, u.tg_username, u.full_name, u.avatar_url, u.rules_accepted_at,
+		       COALESCE(b.until, 0), COALESCE(b.permanent, 0)
+		FROM sessions s
+		JOIN users u ON u.tg_id = s.tg_id
+		LEFT JOIN bans b ON b.tg_id = u.tg_id
 		WHERE s.token = ?`, token).
-		Scan(&u.TgID, &u.TgUsername, &u.FullName, &u.AvatarURL, &acceptedAt)
+		Scan(&u.TgID, &u.TgUsername, &u.FullName, &u.AvatarURL, &acceptedAt,
+			&banUntil, &banPermanent)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -422,6 +602,8 @@ func (s *Store) UserBySession(token string) (*User, error) {
 		return nil, err
 	}
 	u.RulesAccepted = acceptedAt > 0
+	u.BanPermanent = banPermanent == 1
+	u.Banned = u.BanPermanent || banUntil > time.Now().UnixMilli()
 	now := time.Now().UnixMilli()
 	s.db.Exec(`UPDATE sessions SET seen_at = ? WHERE token = ?`, now, token)
 	s.db.Exec(`UPDATE users SET seen_at = ? WHERE tg_id = ?`, now, u.TgID)

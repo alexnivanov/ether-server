@@ -28,6 +28,11 @@ type Config struct {
 	// FCMCredentialsFile — путь к service-account JSON (в git не идёт).
 	FCMProjectID       string `json:"fcm_project_id"`
 	FCMCredentialsFile string `json:"fcm_credentials_file"`
+	// ВНИМАНИЕ: getUpdates у бота одиночный — нельзя держать локальный сервер с
+	// теми же telegram_notify_* при работающем проде: два опросчика начнут
+	// отбирать друг у друга обновления (Telegram отвечает 409 Conflict). Для
+	// локальной отладки нужен свой бот и свой канал.
+	//
 	// Служебный Telegram-канал для жалоб на сообщения (опционально): токен бота
 	// (@BotFather) и chat_id канала, где этот бот — админ. Оба пусты →
 	// уведомления выключены, жалобы всё равно пишутся в БД и лог. Токен —

@@ -431,3 +431,140 @@ func TestStorePushTargets(t *testing.T) {
 		t.Fatalf("после удаления аккаунта осталось %d каналов", n)
 	}
 }
+
+// Наказания модератора: мьют на сутки и постоянный бан — две независимые
+// операции, автоматической эскалации нет (решает модератор, см. admin.go).
+// Главное здесь — наказание переживает удаление аккаунта: вход идёт по Telegram
+// id, и без этого нарушитель просто зарегистрировался бы заново с чистого листа.
+func TestStoreBans(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	const tgID = 99
+	if err := s.CreateUser(User{TgID: tgID, FullName: "Нарушитель"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	token, err := s.NewSession(tgID)
+	if err != nil {
+		t.Fatalf("session: %v", err)
+	}
+	if _, err := s.SaveMessage("RU", tgID, "гадость", time.Now().UnixMilli()); err != nil {
+		t.Fatalf("save message: %v", err)
+	}
+
+	// чистый аккаунт не наказан
+	if banned, _, _, _, err := s.BanStatus(tgID); err != nil || banned {
+		t.Fatalf("до бана: banned=%v err=%v", banned, err)
+	}
+
+	// мьют на сутки, с причиной
+	until, count, err := s.BanTemporary(tgID, "реклама")
+	if err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("счётчик нарушений = %d, want 1", count)
+	}
+	if d := time.Until(until); d < banDuration-time.Minute || d > banDuration+time.Minute {
+		t.Fatalf("срок мьюта %v, ожидали ~%v", d, banDuration)
+	}
+	banned, gotUntil, permanent, reason, err := s.BanStatus(tgID)
+	if err != nil || !banned || permanent || gotUntil.IsZero() || reason != "реклама" {
+		t.Fatalf("после мьюта: banned=%v perm=%v until=%v reason=%q err=%v",
+			banned, permanent, gotUntil, reason, err)
+	}
+	// Сессия ЖИВА: мьют — не выселение. Человек продолжает читать, гасится
+	// только отправка (см. publish в client.go).
+	u, err := s.UserBySession(token)
+	if err != nil || u == nil {
+		t.Fatalf("сессия после мьюта: %+v err=%v, want живую", u, err)
+	}
+	if !u.Banned || u.BanPermanent {
+		t.Fatalf("после мьюта: Banned=%v BanPermanent=%v, want true/false", u.Banned, u.BanPermanent)
+	}
+	// контент мьют не трогает
+	if msgs, err := s.History("RU", 0, 10); err != nil || len(msgs) != 1 {
+		t.Fatalf("мьют не должен удалять сообщения: %v err=%v", msgs, err)
+	}
+
+	// повторный мьют не превращается в постоянный сам — только счётчик растёт
+	if _, count, err = s.BanTemporary(tgID, ""); err != nil || count != 2 {
+		t.Fatalf("второй мьют: count=%d err=%v, want 2", count, err)
+	}
+	if _, _, permanent, _, _ := s.BanStatus(tgID); permanent {
+		t.Fatal("второй мьют стал постоянным — автоэскалации быть не должно")
+	}
+
+	// постоянный бан — отдельной командой; аккаунт и его сообщения удаляются
+	count, err = s.BanPermanent(tgID, "спам")
+	if err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("счётчик после block = %d, want 3", count)
+	}
+	if msgs, err := s.History("RU", 0, 10); err != nil || len(msgs) != 0 {
+		t.Fatalf("после блокировки сообщения остались: %v err=%v", msgs, err)
+	}
+	var users int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users WHERE tg_id = ?`, tgID).Scan(&users); err != nil {
+		t.Fatalf("count users: %v", err)
+	}
+	if users != 0 {
+		t.Fatal("аккаунт не удалён при постоянном бане")
+	}
+
+	// САМОЕ ВАЖНОЕ: наказание живо, хотя аккаунта уже нет — вернувшийся под тем
+	// же Telegram id снова отбивается
+	banned, _, permanent, _, err = s.BanStatus(tgID)
+	if err != nil || !banned || !permanent {
+		t.Fatalf("после удаления аккаунта: banned=%v perm=%v err=%v (наказание должно переживать удаление)",
+			banned, permanent, err)
+	}
+	if err := s.CreateUser(User{TgID: tgID, FullName: "Он же снова"}); err != nil {
+		t.Fatalf("повторная регистрация: %v", err)
+	}
+	if banned, _, permanent, _, _ := s.BanStatus(tgID); !banned || !permanent {
+		t.Fatal("после повторной регистрации наказание слетело")
+	}
+
+	// ручное снятие возвращает доступ, но счётчик нарушений остаётся —
+	// модератор должен видеть историю
+	if ok, err := s.Unban(tgID); err != nil || !ok {
+		t.Fatalf("unban: ok=%v err=%v", ok, err)
+	}
+	if banned, _, _, _, _ := s.BanStatus(tgID); banned {
+		t.Fatal("после unban всё ещё забанен")
+	}
+	if n, err := s.BanCount(tgID); err != nil || n != 3 {
+		t.Fatalf("счётчик после unban = %d err=%v, want 3", n, err)
+	}
+}
+
+// Временный бан истекает сам, без фоновой уборки.
+func TestStoreBanExpires(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	const tgID = 100
+	if err := s.CreateUser(User{TgID: tgID, FullName: "x"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, _, err := s.BanTemporary(tgID, ""); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	// сдвигаем срок в прошлое — эмулируем «сутки прошли»
+	if _, err := s.db.Exec(`UPDATE bans SET until = ? WHERE tg_id = ?`,
+		time.Now().Add(-time.Minute).UnixMilli(), tgID); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+	if banned, _, _, _, err := s.BanStatus(tgID); err != nil || banned {
+		t.Fatalf("истёкший мьют всё ещё активен: banned=%v err=%v", banned, err)
+	}
+}
