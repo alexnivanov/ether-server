@@ -54,6 +54,16 @@ type DeleteAccountData struct {
 	Token string `json:"token"`
 }
 
+// PushTokenData — тело POST /push/register и POST /push/unregister: FCM-токен
+// устройства. Сервер шлёт пуши адресно по токенам (а не в топики), чтобы не
+// уведомлять автора о его же сообщении, — см. push.go. Platform (ios|android)
+// нужен только для диагностики.
+type PushTokenData struct {
+	Token    string `json:"token"`     // токен сессии — кто регистрирует
+	FCMToken string `json:"fcm_token"` // токен устройства от FCM
+	Platform string `json:"platform,omitempty"`
+}
+
 // ReportData — тело POST /report: жалоба на сообщение (модерация UGC). Текст и
 // автора сервер берёт из самого сообщения по MessageID — клиент присылает лишь
 // на что жалуется и почему. Reason — код причины из фиксированного набора

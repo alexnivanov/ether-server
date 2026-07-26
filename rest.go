@@ -26,6 +26,8 @@ func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth, notify *No
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
 	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg, notify))
 	mux.HandleFunc("/history", handleHistory(store))
+	mux.HandleFunc("/push/register", handlePushRegister(store))
+	mux.HandleFunc("/push/unregister", handlePushUnregister(store))
 	mux.HandleFunc("/report", handleReport(store, notify))
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
 	mux.HandleFunc("/session/logout", handleLogout(store))
@@ -168,6 +170,65 @@ func handleHistory(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, HistoryData{Channel: channel, Messages: msgs})
+	}
+}
+
+// handlePushRegister — POST /push/register {token, fcm_token, platform} → 200 {}
+// — привязывает токен устройства FCM к аккаунту, чтобы сервер мог адресно слать
+// пуши о новых сообщениях (и НЕ слать автору его же сообщение). Требует
+// валидную сессию. Идемпотентен: повторная регистрация того же токена только
+// обновляет привязку (в т.ч. переносит токен на другой аккаунт).
+func handlePushRegister(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d PushTokenData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.FCMToken == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и токен устройства")
+			return
+		}
+		u, err := store.UserBySession(d.Token)
+		if err != nil {
+			slog.Error("push_register session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
+			return
+		}
+		if err := store.SaveDeviceToken(u.TgID, d.FCMToken, d.Platform); err != nil {
+			slog.Error("push_register", "err", err, "tg_id", u.TgID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось включить уведомления")
+			return
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
+	}
+}
+
+// handlePushUnregister — POST /push/unregister {fcm_token} → 200 {} всегда
+// (идемпотентно, как logout: важно лишь, что устройство больше не получает
+// пуши). Сессия не требуется: вызывается при выходе, когда токен уже отозван, —
+// а знание самого fcm_token достаточно для того, чтобы отписать это устройство.
+func handlePushUnregister(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d PushTokenData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.FCMToken == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен устройства")
+			return
+		}
+		if err := store.DeleteDeviceTokens([]string{d.FCMToken}); err != nil {
+			slog.Error("push_unregister", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось отключить уведомления")
+			return
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
 	}
 }
 

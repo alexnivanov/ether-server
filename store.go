@@ -82,6 +82,28 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS reports_created_at ON reports(created_at);
 CREATE INDEX IF NOT EXISTS reports_author ON reports(author_tg_id);
+-- Адресная доставка пушей (см. push.go). Топики FCM не годятся: в топик нельзя
+-- НЕ отправить конкретному подписчику, из-за чего автор получал уведомление о
+-- своём же сообщении. Поэтому сервер держит токены устройств и каналы каждого
+-- пользователя и шлёт адресно, исключая отправителя.
+CREATE TABLE IF NOT EXISTS device_tokens (
+	fcm_token  TEXT PRIMARY KEY,        -- токен устройства (он же ключ: при
+	                                    -- переустановке/смене аккаунта токен
+	                                    -- переезжает к другому tg_id)
+	tg_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	platform   TEXT NOT NULL DEFAULT '',-- ios|android, для диагностики
+	updated_at INTEGER NOT NULL         -- unix-миллисекунды
+);
+CREATE INDEX IF NOT EXISTS device_tokens_tg_id ON device_tokens(tg_id);
+-- Каналы пользователя: обновляются на каждый locate (сервер и так их вычисляет).
+-- Нужны, чтобы понять, кому слать пуш, когда WS-соединения уже нет.
+CREATE TABLE IF NOT EXISTS user_channels (
+	tg_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	channel    TEXT NOT NULL,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (tg_id, channel)
+);
+CREATE INDEX IF NOT EXISTS user_channels_channel ON user_channels(channel);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -307,6 +329,80 @@ func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (*Re
 		rep.Fresh = true
 	}
 	return rep, nil
+}
+
+// SaveDeviceToken привязывает FCM-токен устройства к пользователю (upsert по
+// токену). Ключ — сам токен: при переустановке или входе другим аккаунтом FCM
+// отдаёт тот же токен, и он должен «переехать» к новому tg_id, а не задвоиться.
+func (s *Store) SaveDeviceToken(tgID int64, fcmToken, platform string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO device_tokens (fcm_token, tg_id, platform, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(fcm_token) DO UPDATE SET
+			tg_id = excluded.tg_id,
+			platform = excluded.platform,
+			updated_at = excluded.updated_at`,
+		fcmToken, tgID, platform, time.Now().UnixMilli())
+	return err
+}
+
+// DeleteDeviceTokens удаляет токены устройств: при выходе из аккаунта (свой
+// токен) и при уборке мёртвых токенов, которые FCM отверг как UNREGISTERED.
+// Идемпотентна, пустой список — no-op.
+func (s *Store) DeleteDeviceTokens(fcmTokens []string) error {
+	for _, t := range fcmTokens {
+		if _, err := s.db.Exec(`DELETE FROM device_tokens WHERE fcm_token = ?`, t); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// SetUserChannels заменяет набор каналов пользователя (вызывается на locate).
+// Полная замена, а не добавление: при переезде старые каналы должны исчезнуть,
+// иначе пуши продолжат приходить из района, откуда пользователь уехал.
+func (s *Store) SetUserChannels(tgID int64, channels []string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM user_channels WHERE tg_id = ?`, tgID); err != nil {
+		return err
+	}
+	now := time.Now().UnixMilli()
+	for _, ch := range channels {
+		if _, err := tx.Exec(`
+			INSERT OR REPLACE INTO user_channels (tg_id, channel, updated_at) VALUES (?, ?, ?)`,
+			tgID, ch, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// PushTargets отдаёт токены устройств, которым надо доставить пуш о новом
+// сообщении в канале: все устройства пользователей, у кого этот канал в наборе,
+// **кроме** автора сообщения (exceptTgID) — иначе человек получает уведомление о
+// своём же сообщении, ради чего адресная модель и вводилась.
+func (s *Store) PushTargets(channel string, exceptTgID int64) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT d.fcm_token
+		FROM user_channels uc JOIN device_tokens d ON d.tg_id = uc.tg_id
+		WHERE uc.channel = ? AND uc.tg_id != ?`, channel, exceptTgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
 }
 
 // UserBySession возвращает пользователя по токену сессии (nil — сессии нет)

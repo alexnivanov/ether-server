@@ -70,7 +70,7 @@ func main() {
 
 	// FCM-пуши опциональны: без creds в конфиге push == nil и publish работает
 	// как раньше. Ошибка чтения creds не валит старт — просто без пушей.
-	push, err := NewPusher(cfg.FCMProjectID, cfg.FCMCredentialsFile)
+	push, err := NewPusher(cfg.FCMProjectID, cfg.FCMCredentialsFile, store)
 	if err != nil {
 		slog.Warn("fcm disabled (creds error)", "err", err)
 	}

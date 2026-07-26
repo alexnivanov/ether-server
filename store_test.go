@@ -331,3 +331,103 @@ func TestStoreReportMessage(t *testing.T) {
 		t.Fatalf("жалоба пропала после удаления сообщения: %d", count)
 	}
 }
+
+func TestStorePushTargets(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	// автор (1), сосед по каналу с двумя устройствами (2), человек из другого
+	// района (3) — пуш должен уйти только устройствам второго
+	for _, u := range []User{{TgID: 1, FullName: "Author"}, {TgID: 2, FullName: "Neighbour"}, {TgID: 3, FullName: "Far"}} {
+		if err := s.CreateUser(u); err != nil {
+			t.Fatalf("create %d: %v", u.TgID, err)
+		}
+	}
+	if err := s.SetUserChannels(1, []string{"RU", "RU-MOW", "relation/1"}); err != nil {
+		t.Fatalf("channels 1: %v", err)
+	}
+	if err := s.SetUserChannels(2, []string{"RU", "RU-MOW", "relation/1"}); err != nil {
+		t.Fatalf("channels 2: %v", err)
+	}
+	if err := s.SetUserChannels(3, []string{"RU", "relation/999"}); err != nil {
+		t.Fatalf("channels 3: %v", err)
+	}
+	for _, d := range []struct {
+		tg  int64
+		tok string
+	}{
+		{1, "dev-author"}, {2, "dev-n1"}, {2, "dev-n2"}, {3, "dev-far"},
+	} {
+		if err := s.SaveDeviceToken(d.tg, d.tok, "android"); err != nil {
+			t.Fatalf("token %s: %v", d.tok, err)
+		}
+	}
+
+	// автор исключён — это и есть суть адресной модели (в топик так было нельзя)
+	got, err := s.PushTargets("relation/1", 1)
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	want := map[string]bool{"dev-n1": true, "dev-n2": true}
+	if len(got) != len(want) {
+		t.Fatalf("targets: %v, want %v", got, want)
+	}
+	for _, tok := range got {
+		if !want[tok] {
+			t.Fatalf("лишний получатель %q (автор или чужой район): %v", tok, got)
+		}
+	}
+
+	// переезд: набор каналов заменяется целиком, из старого района пуши больше
+	// не приходят
+	if err := s.SetUserChannels(2, []string{"RU", "relation/777"}); err != nil {
+		t.Fatalf("move: %v", err)
+	}
+	if got, err := s.PushTargets("relation/1", 1); err != nil || len(got) != 0 {
+		t.Fatalf("после переезда targets=%v err=%v, want пусто", got, err)
+	}
+
+	// токен переезжает между аккаунтами (переустановка/смена аккаунта), не дублируясь
+	if err := s.SaveDeviceToken(3, "dev-n1", "ios"); err != nil {
+		t.Fatalf("re-bind: %v", err)
+	}
+	got, err = s.PushTargets("relation/999", 1)
+	if err != nil {
+		t.Fatalf("targets after re-bind: %v", err)
+	}
+	if len(got) != 2 { // dev-far + переехавший dev-n1
+		t.Fatalf("targets after re-bind: %v, want 2", got)
+	}
+
+	// мёртвые токены убираются (FCM ответил UNREGISTERED)
+	if err := s.DeleteDeviceTokens([]string{"dev-far", "dev-n1"}); err != nil {
+		t.Fatalf("delete stale: %v", err)
+	}
+	if got, err := s.PushTargets("relation/999", 1); err != nil || len(got) != 0 {
+		t.Fatalf("после уборки targets=%v err=%v, want пусто", got, err)
+	}
+
+	// удаление аккаунта уносит его токены и каналы (ON DELETE CASCADE)
+	if err := s.SaveDeviceToken(2, "dev-n3", "android"); err != nil {
+		t.Fatalf("token: %v", err)
+	}
+	if err := s.DeleteUser(2); err != nil {
+		t.Fatalf("delete user: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM device_tokens WHERE tg_id = 2`).Scan(&n); err != nil {
+		t.Fatalf("count tokens: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("после удаления аккаунта осталось %d токенов", n)
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM user_channels WHERE tg_id = 2`).Scan(&n); err != nil {
+		t.Fatalf("count channels: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("после удаления аккаунта осталось %d каналов", n)
+	}
+}

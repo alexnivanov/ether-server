@@ -93,6 +93,14 @@ func (c *Client) readPump() {
 				ids = append(ids, ch.ID)
 			}
 			c.hub.subscribe <- subscription{client: c, channels: ids}
+			// Каналы вошедшего запоминаем в БД — по ним считаются получатели
+			// пушей, когда сокета уже нет (см. Store.PushTargets). Полная
+			// замена набора: уехал из района — пуши оттуда прекращаются.
+			if userID, _, _, _, authed := c.author(); authed {
+				if err := c.store.SetUserChannels(userID, ids); err != nil {
+					slog.Error("set user channels", "err", err, "tg_id", userID)
+				}
+			}
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
 		case TypePublish:
@@ -128,10 +136,11 @@ func (c *Client) readPump() {
 			}
 			c.hub.broadcast <- m
 
-			// пуш подписчикам топика канала (Район/Квартал — клиент подписан
-			// только на них). Асинхронно: HTTP к FCM не должен тормозить сокет.
+			// пуш устройствам подписчиков канала, КРОМЕ автора (иначе человек
+			// получает уведомление о своём же сообщении). Асинхронно: HTTP к FCM
+			// не должен тормозить сокет.
 			if c.push != nil {
-				go c.push.Notify(m.Channel, name, m.Text)
+				go c.push.Notify(m.Channel, userID, name, m.Text)
 			}
 
 		default:

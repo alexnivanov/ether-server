@@ -249,3 +249,78 @@ func TestWebSocketTokenAuth(t *testing.T) {
 		t.Fatalf("anon publish: got %s %+v, want error not_authed", env.Type, e)
 	}
 }
+
+// Сквозная проверка адресной модели пушей: locate запоминает каналы вошедшего
+// (иначе рассылать некому, когда сокета уже нет), /push/register привязывает
+// устройство, а получатели считаются без автора — ради этого и отказались от
+// топиков FCM (в топик нельзя не отправить подписчику, и человек получал
+// уведомление о своём же сообщении).
+func TestPushRegistrationAndTargets(t *testing.T) {
+	srv, store := newTestServer(t)
+
+	type person struct {
+		tgID   int64
+		token  string
+		device string
+	}
+	people := []person{{tgID: 21, device: "dev-author"}, {tgID: 22, device: "dev-peer"}}
+	for i, p := range people {
+		if err := store.CreateUser(User{TgID: p.tgID, FullName: fmt.Sprintf("u%d", p.tgID)}); err != nil {
+			t.Fatalf("seed user %d: %v", p.tgID, err)
+		}
+		tok, err := store.NewSession(p.tgID)
+		if err != nil {
+			t.Fatalf("seed session %d: %v", p.tgID, err)
+		}
+		people[i].token = tok
+
+		resp, body := restPost(t, srv.URL+"/push/register",
+			PushTokenData{Token: tok, FCMToken: p.device, Platform: "android"})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("push/register %d = %d %v, want 200", p.tgID, resp.StatusCode, body)
+		}
+
+		// каналы запоминаются на locate — по ним потом считаются получатели
+		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + tok
+		ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		if err != nil {
+			t.Fatalf("dial ws %d: %v", p.tgID, err)
+		}
+		ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if err := ws.WriteJSON(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})); err != nil {
+			t.Fatalf("locate %d: %v", p.tgID, err)
+		}
+		var located Envelope
+		if err := ws.ReadJSON(&located); err != nil {
+			t.Fatalf("read located %d: %v", p.tgID, err)
+		}
+		var loc LocatedData
+		mustUnmarshal(t, located.Data, &loc)
+		if len(loc.Channels) == 0 {
+			t.Fatalf("locate %d: пустой набор каналов", p.tgID)
+		}
+		ws.Close()
+	}
+
+	channel := StubGeocoder{}
+	chans, _ := channel.Channels(55.76, 37.61)
+	target := chans[0].ID
+
+	// автор исключён, сосед получает — суть фикса
+	got, err := store.PushTargets(target, people[0].tgID)
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "dev-peer" {
+		t.Fatalf("targets = %v, want [dev-peer] (автор не должен получать пуш о своём сообщении)", got)
+	}
+
+	// после выхода устройство больше не в получателях
+	resp, body := restPost(t, srv.URL+"/push/unregister", PushTokenData{FCMToken: "dev-peer"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("push/unregister = %d %v, want 200", resp.StatusCode, body)
+	}
+	if got, err := store.PushTargets(target, people[0].tgID); err != nil || len(got) != 0 {
+		t.Fatalf("targets после unregister = %v err=%v, want пусто", got, err)
+	}
+}
