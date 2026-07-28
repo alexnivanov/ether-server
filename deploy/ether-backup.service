@@ -1,0 +1,25 @@
+[Unit]
+Description=Ether: резервная копия базы
+Documentation=https://github.com/ether/ether-server
+# Бэкап без сервера бессмыслен, но и жёсткой зависимости нет: снимок можно снять
+# и с остановленной базой (VACUUM INTO работает по файлу).
+After=network-online.target
+
+[Service]
+Type=oneshot
+# root нужен, чтобы прочитать конфиг с токеном (/etc/ether/config.prod.json
+# лежит под root) — из него берутся токен и chat_id для алертов в Telegram.
+User=root
+ExecStart=/opt/ether/backup.sh
+
+# Та же изоляция, что у самого сервиса: наружу — только каталог с базой, где
+# лежит и копия. Всё остальное read-only.
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/ether
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+# Вывод скрипта попадает в journald: journalctl -u ether-backup
+StandardOutput=journal
+StandardError=journal

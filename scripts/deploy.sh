@@ -61,10 +61,17 @@ remote_bin="${REMOTE_DIR}/ether-server"
 echo "==> upload → ${SSH_HOST}:/tmp/ether-server.new"
 scp -q "$out" "${SSH_HOST}:/tmp/ether-server.new"
 
+# Скрипт бэкапа едет вместе с бинарником — иначе версия на сервере тихо
+# разъедется с репозиторием. Юнит ether-backup.service запускает именно этот файл.
+echo "==> upload backup.sh"
+scp -q "$(dirname "${BASH_SOURCE[0]}")/backup.sh" "${SSH_HOST}:/tmp/ether-backup.sh"
+
 echo "==> install + restart ${SERVICE}"
 ssh "$SSH_HOST" "set -e
 	sudo install -o ${OWNER} -g ${OWNER} -m 0755 /tmp/ether-server.new ${remote_bin}
 	rm -f /tmp/ether-server.new
+	sudo install -o root -g root -m 0755 /tmp/ether-backup.sh ${REMOTE_DIR}/backup.sh
+	rm -f /tmp/ether-backup.sh
 	sudo systemctl restart ${SERVICE}
 	sleep 1
 	sudo systemctl is-active --quiet ${SERVICE} || { sudo journalctl -u ${SERVICE} -n 30 --no-pager; exit 1; }"

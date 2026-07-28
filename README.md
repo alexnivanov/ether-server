@@ -46,6 +46,9 @@ systemd, наружу его публикует Caddy с авто-TLS. Раск�
 | `/etc/ether/config.prod.json` | конфиг с секретами (не в git; образец — `config.example.json`), передаётся флагом `-config` |
 | `/var/lib/ether/ether.prod.db` (+`-wal`/`-shm`) | база SQLite; `/var/lib/ether` — `WorkingDirectory` и единственный writable-путь сервиса |
 | `/etc/systemd/system/ether-server.service` | юнит; запускает бинарник под пользователем `ether`. Референс — [`deploy/ether-server.service`](./deploy/ether-server.service) |
+| `/opt/ether/backup.sh` | скрипт бэкапа; ставится тем же `scripts/deploy.sh` |
+| `/etc/systemd/system/ether-backup.{service,timer}` | ежедневный бэкап базы (см. «Бэкапы»). Референс — [`deploy/`](./deploy) |
+| `/var/lib/ether/backups/ether-latest.db.gz` | последняя копия базы |
 | `/etc/caddy/Caddyfile` | reverse-proxy + TLS на `localhost:8080`. Референс — [`deploy/Caddyfile`](./deploy/Caddyfile) |
 
 Файлы в [`deploy/`](./deploy) — референс ручной первичной настройки (сервер
@@ -63,6 +66,75 @@ SSH_HOST=ether scripts/deploy.sh
 **Логи**: `sudo journalctl -u ether-server -f`.
 **Сброс базы**: команды в [`scripts/reset-db-prod.sh`](./scripts/reset-db-prod.sh)
 (запускать руками на сервере — стирает всех пользователей, сессии и сообщения).
+
+### Бэкапы
+
+[`scripts/backup.sh`](./scripts/backup.sh) снимает копию базы и кладёт её в
+`/var/lib/ether/backups/ether-latest.db.gz`. Хранится **только последняя** копия:
+база маленькая, история версий пока не нужна.
+
+Копия делается через `VACUUM INTO`, а не `cp`: база в WAL-режиме, и простое
+копирование файла при активной записи даёт битый снимок. Пишем во временный
+каталог и переносим одним `mv` — на диске никогда не лежит недописанный файл,
+выглядящий как рабочая копия.
+
+Расписание — systemd-таймер (`deploy/ether-backup.{service,timer}`), ежедневно в
+04:17. Почему таймер, а не cron: у cron вывод уходит письмом root'у, а почты на
+сервере нет (порт 25 закрыт) — то есть сбой бэкапа остался бы незамеченным. У
+таймера вывод в journald, плюс `Persistent=true` догоняет пропущенный запуск
+после простоя и не даёт запуститься двум копиям одновременно.
+
+Установка — **один раз, с локальной машины** (на сервере репозитория нет, юниты
+лежат здесь, в `deploy/`). Порядок важен: сначала на сервер попадает сам скрипт,
+иначе юнит запустится в пустоту.
+
+```sh
+SSH_HOST=ether scripts/deploy.sh          # ставит /opt/ether/backup.sh
+scp deploy/ether-backup.service deploy/ether-backup.timer ether:/tmp/
+ssh ether 'sudo install -o root -g root -m 0644 \
+    /tmp/ether-backup.service /tmp/ether-backup.timer /etc/systemd/system/ &&
+  sudo systemctl daemon-reload &&
+  sudo systemctl enable --now ether-backup.timer &&
+  sudo systemctl start ether-backup.service'   # прогнать сразу, не дожидаясь ночи
+```
+
+Скрипт едет на сервер вместе с бинарником (`scripts/deploy.sh` ставит его в
+`/opt/ether/backup.sh`), поэтому версия на сервере не разъезжается с
+репозиторием. Юниты меняются редко — их достаточно скопировать один раз, а после
+правок повторить `scp` + `daemon-reload`.
+
+Проверка и диагностика:
+
+```sh
+systemctl list-timers ether-backup.timer   # когда был и будет запуск
+journalctl -u ether-backup -n 20           # что сказал последний прогон
+ls -lh /var/lib/ether/backups/
+```
+
+Сбои (нет базы, нет места, не прошла выгрузка) уходят сообщением в служебный
+Telegram-канал — токен и `chat_id` скрипт берёт из `config.prod.json`, отдельных
+секретов не требует. Порог свободного места — 15%.
+
+**Выгрузка за пределы сервера** — по флагу `SEND_TO_TELEGRAM=1` в юните: копия
+отправляется документом в тот же канал. По умолчанию выключено осознанно: копия
+содержит персональные данные (Telegram id, имена, сообщения), и её отправка —
+это передача их в Telegram. Копия на том же диске защищает от «уронил таблицу»,
+но не от потери диска, так что для продакшена выгрузку куда-то наружу (или S3)
+всё же стоит включить.
+
+**Восстановление:**
+
+```sh
+sudo systemctl stop ether-server
+sudo gunzip -c /var/lib/ether/backups/ether-latest.db.gz > /tmp/restore.db
+sudo sqlite3 /tmp/restore.db 'pragma integrity_check;'      # ждём ok
+sudo install -o ether -g ether -m 0644 /tmp/restore.db /var/lib/ether/ether.prod.db
+sudo rm -f /var/lib/ether/ether.prod.db-wal /var/lib/ether/ether.prod.db-shm
+sudo systemctl start ether-server
+```
+
+Файлы `-wal`/`-shm` удаляем: они относятся к прежней базе, и рядом с
+восстановленной приведут к рассогласованию.
 
 ## Как это работает
 
