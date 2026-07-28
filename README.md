@@ -114,8 +114,9 @@ SSH_HOST=ether scripts/deploy.sh
 | `error` | server → client | `{code, message}` |
 
 `Channel` — `{id, level, label, name}`, где `id` — стабильный ключ
-(`RU`, `RU-MOW`, `relation/2555133`), `level` ∈ `country | region | city |
-district | quarter`.
+(`RU`, `RU-MOW`, `relation/2555133`), `level` ∈ `planet | country | region | city |
+district | quarter`. **Планета** (`EARTH`) — глобальный канал: есть у всех, из
+координат не выводится, добавляется первой константой `PlanetChannel`.
 
 ## Модерация
 

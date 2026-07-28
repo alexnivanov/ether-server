@@ -329,8 +329,10 @@ func (g *NominatimGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 		districtEntry = sub[0] // единственная подгородская — Район (пол гарантии)
 	}
 
-	// Пустые слоты опускаются (контракт Geocoder).
-	out := make([]Channel, 0, 5)
+	// Пустые слоты опускаются (контракт Geocoder). Планета идёт первой: она есть
+	// у всех и из координат не выводится (см. PlanetChannel).
+	out := make([]Channel, 0, 6)
+	out = append(out, PlanetChannel)
 	add := func(level, label, isoID string, cand *nomAddressEntry) {
 		if cand == nil {
 			return

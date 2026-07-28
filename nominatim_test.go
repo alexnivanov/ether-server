@@ -171,6 +171,11 @@ func TestChannelsKnownLocations(t *testing.T) {
 				byLevel[c.Level] = c
 			}
 
+			// планета есть всегда и первой — она не зависит от координат
+			if len(chs) == 0 || chs[0] != PlanetChannel {
+				t.Errorf("первый канал = %+v, want %+v", chs, PlanetChannel)
+			}
+
 			for level, id := range tc.want {
 				got, ok := byLevel[level]
 				if !ok {
