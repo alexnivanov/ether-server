@@ -74,7 +74,10 @@ func main() {
 	if cfg.NominatimURL != "" {
 		nominatim.BaseURL = cfg.NominatimURL
 	}
-	var geo Geocoder = nominatim
+	// Кеш поверх геокодера: набор каналов для точки стабилен, а публичный
+	// Nominatim ограничен 1 req/s (см. geocache.go). Без него задержка упирается
+	// в потолок уже на десятках активных пользователей.
+	var geo Geocoder = newCachedGeocoder(nominatim, geocodeCacheTTL, geocodeCacheMax)
 
 	// вход через нативный Telegram Login SDK: сервер проверяет OIDC ID-token по
 	// публичным ключам Telegram (JWKS тянется лениво при первом входе), поэтому
