@@ -20,8 +20,8 @@ type Channel struct {
 var PlanetChannel = Channel{
 	ID:    "EARTH",
 	Level: "planet",
-	Label: "Планета",
-	Name:  "Планета",
+	Label: "Планета", // подпись уровня, как «Город»
+	Name:  "Земля",   // имя места, как «Москва» (его клиент и показывает в UI)
 }
 
 // Geocoder: координаты → упорядоченный набор каналов (broad→specific).
