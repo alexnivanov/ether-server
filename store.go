@@ -158,6 +158,14 @@ func OpenStore(path string) (*Store, error) {
 
 func (s *Store) Close() error { return s.db.Close() }
 
+// Ping — проверка живости базы для /health. Именно запрос, а не sql.DB.Ping():
+// у SQLite соединение считается живым почти всегда, а вот что файл на месте и
+// схема читается, покажет только настоящий SELECT.
+func (s *Store) Ping() error {
+	var one int
+	return s.db.QueryRow(`SELECT 1`).Scan(&one)
+}
+
 // CreateUser заводит нового пользователя (ключ — tg id). Правила при
 // регистрации не приняты — их отмечает только AcceptRules.
 func (s *Store) CreateUser(u User) error {

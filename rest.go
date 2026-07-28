@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 )
 
 // REST — синхронный запрос-ответ без побочных эффектов на живом WS-соединении:
@@ -25,6 +26,7 @@ import (
 func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth, notify *Notifier) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
 	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg, notify))
+	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
 	mux.HandleFunc("/push/register", handlePushRegister(store))
 	mux.HandleFunc("/push/unregister", handlePushUnregister(store))
@@ -141,6 +143,38 @@ func handleAuthTelegram(store *Store, tg *TelegramAuth, notify *Notifier) http.H
 			Token:         token,
 			RulesAccepted: accepted,
 		})
+	}
+}
+
+// startedAt — момент запуска процесса, для uptime в /health.
+var startedAt = time.Now()
+
+// handleHealth — GET /health → 200 {ok, version, db, uptime_sec} | 503, если
+// база не отвечает. Без авторизации: это цель для внешнего пингера (проверять
+// живость надо снаружи — скрипт на упавшем сервере промолчит) и для
+// health-check в scripts/deploy.sh.
+//
+// Внешние зависимости (Nominatim, FCM, Telegram) здесь СПЕЦИАЛЬНО не проверяем:
+// их недоступность не значит, что сервер надо перезапускать, а пингер начал бы
+// поднимать тревогу из-за чужих сбоев. За ними — алерты в лог/канал.
+func handleHealth(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
+			return
+		}
+		data := HealthData{
+			OK:        true,
+			Version:   version,
+			DB:        "ok",
+			UptimeSec: int64(time.Since(startedAt).Seconds()),
+		}
+		status := http.StatusOK
+		if err := store.Ping(); err != nil {
+			slog.Error("health: db", "err", err)
+			data.OK, data.DB, status = false, err.Error(), http.StatusServiceUnavailable
+		}
+		writeJSON(w, status, data)
 	}
 }
 

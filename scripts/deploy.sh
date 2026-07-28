@@ -77,13 +77,14 @@ ssh "$SSH_HOST" "set -e
 	sudo systemctl is-active --quiet ${SERVICE} || { sudo journalctl -u ${SERVICE} -n 30 --no-pager; exit 1; }"
 
 # ── health-check через публичный домен (проверяет бинарник + Caddy + TLS) ──
-# /history без авторизации отдаёт 200 даже на несуществующем канале. Идём через
-# API_PREFIX: на домене живёт ещё и статика ether-web, поэтому без префикса
-# ответит она (404), а не сервер.
-health_url="https://${DOMAIN}${API_PREFIX}/history?channel=deploy-health-check"
+# /health пингует базу и отдаёт версию — то есть проверяет не только «процесс
+# отвечает», но и «база читается». Идём через API_PREFIX: на домене живёт ещё и
+# статика ether-web, поэтому без префикса ответит она (404), а не сервер.
+health_url="https://${DOMAIN}${API_PREFIX}/health"
 echo "==> health-check ${health_url}"
-if curl -fsS --max-time 10 "$health_url" >/dev/null; then
+if body=$(curl -fsS --max-time 10 "$health_url"); then
 	echo "✓ задеплоено: ${version}"
+	echo "  health: ${body}"
 else
 	echo "✗ сервис перезапущен, но health-check не прошёл — проверь Caddy/логи" >&2
 	exit 1

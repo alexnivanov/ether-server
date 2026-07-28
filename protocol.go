@@ -101,6 +101,16 @@ type MessageData struct {
 	TS        int64  `json:"ts"`
 }
 
+// HealthData — тело ответа GET /health: то, что нужно внешнему пингеру и
+// deploy.sh. Намеренно без статистики (число пользователей, сообщений):
+// эндпоинт публичный, а масштаб проекта — не то, что стоит отдавать всем.
+type HealthData struct {
+	OK        bool   `json:"ok"`
+	Version   string `json:"version"`
+	DB        string `json:"db"`         // ok | текст ошибки
+	UptimeSec int64  `json:"uptime_sec"` // сколько живёт процесс
+}
+
 // HistoryData — тело ответа REST GET /history (см. rest.go).
 type HistoryData struct {
 	Channel  string        `json:"channel"`

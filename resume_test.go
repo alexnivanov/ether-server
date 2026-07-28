@@ -325,3 +325,58 @@ func TestPushRegistrationAndTargets(t *testing.T) {
 		t.Fatalf("targets после unregister = %v err=%v, want пусто", got, err)
 	}
 }
+
+// /health — цель внешнего пингера и health-check в deploy.sh: отдаёт ok, версию
+// и uptime, а при недоступной базе — 503 (иначе пингер считал бы «живым»
+// сервер, который не может ничего записать).
+func TestHealth(t *testing.T) {
+	srv, store := newTestServer(t)
+
+	resp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var h HealthData
+	if err := json.NewDecoder(resp.Body).Decode(&h); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !h.OK || h.DB != "ok" {
+		t.Fatalf("health = %+v, want ok", h)
+	}
+	if h.Version == "" {
+		t.Fatal("версия пустая — по ней проверяют, что выкатилось")
+	}
+
+	// метод строго GET: пингеры иногда ходят HEAD/POST, поведение должно быть
+	// предсказуемым, а не «как получится»
+	postResp, err := http.Post(srv.URL+"/health", "application/json", nil)
+	if err != nil {
+		t.Fatalf("POST /health: %v", err)
+	}
+	defer postResp.Body.Close()
+	if postResp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("POST status = %d, want 405", postResp.StatusCode)
+	}
+
+	// база закрыта — сервер обязан признаться, что нездоров
+	store.Close()
+	downResp, err := http.Get(srv.URL + "/health")
+	if err != nil {
+		t.Fatalf("GET /health (db down): %v", err)
+	}
+	defer downResp.Body.Close()
+	if downResp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status при мёртвой базе = %d, want 503", downResp.StatusCode)
+	}
+	var down HealthData
+	if err := json.NewDecoder(downResp.Body).Decode(&down); err != nil {
+		t.Fatalf("decode (db down): %v", err)
+	}
+	if down.OK || down.DB == "ok" {
+		t.Fatalf("health при мёртвой базе = %+v, want ok=false", down)
+	}
+}
