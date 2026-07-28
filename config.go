@@ -40,6 +40,10 @@ type Config struct {
 	// сервера (первый прод-хост в РФ его не имел — см. историю переезда).
 	TelegramNotifyToken  string `json:"telegram_notify_token"`
 	TelegramNotifyChatID string `json:"telegram_notify_chat_id"`
+	// Sentry для ошибок и паник (опционально; пусто → выключен). См. sentry.go —
+	// там же про приватность: в события попадает tg_id, поэтому Sentry указан в
+	// privacy policy как сторонний сервис.
+	SentryDSN string `json:"sentry_dsn"`
 }
 
 func LoadConfig(path string) (*Config, error) {

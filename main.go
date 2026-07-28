@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 
+	sentryhttp "github.com/getsentry/sentry-go/http"
 	"github.com/gorilla/websocket"
 )
 
@@ -42,6 +43,18 @@ func main() {
 		slog.Error("config", "err", err)
 		os.Exit(1)
 	}
+
+	// Sentry: ошибки и паники. Оборачиваем логгер, чтобы записи уровня ERROR
+	// уходили туда же, куда пишутся (см. sentry.go) — без дублирующих вызовов
+	// SDK по коду.
+	flushSentry, err := initSentry(cfg.SentryDSN, *env, version)
+	if err != nil {
+		slog.Warn("sentry disabled (init error)", "err", err)
+	} else if cfg.SentryDSN != "" {
+		slog.SetDefault(slog.New(newSentryHandler(newConsoleHandler(os.Stderr, slog.LevelInfo))))
+	}
+	defer flushSentry()
+	slog.Info("sentry", "enabled", cfg.SentryDSN != "")
 
 	hub := NewHub()
 	go hub.Run()
@@ -92,8 +105,16 @@ func main() {
 	// лимитер один на процесс: частота считается на аккаунт, а не на соединение
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, NewRateLimiter()))
 
+	// Паники в хендлерах: net/http гасит их внутри соединения, и мы бы о них не
+	// узнали. sentryhttp перехватывает, отправляет со стектрейсом и не даёт
+	// процессу упасть.
+	var handler http.Handler = mux
+	if cfg.SentryDSN != "" {
+		handler = sentryhttp.New(sentryhttp.Options{Repanic: false}).Handle(mux)
+	}
+
 	slog.Info("listening", "version", version, "config", path, "addr", cfg.Addr)
-	if err := http.ListenAndServe(cfg.Addr, mux); err != nil {
+	if err := http.ListenAndServe(cfg.Addr, handler); err != nil {
 		slog.Error("listen", "err", err)
 		os.Exit(1)
 	}
