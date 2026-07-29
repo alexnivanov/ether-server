@@ -17,7 +17,7 @@
 
 | Поле | Смысл |
 |---|---|
-| `telegram_client_id`, `apple_client_ids`, `google_client_ids` | провайдеры входа; каждый опционален, но **хотя бы один обязателен** — иначе сервер не стартует. Незаданный провайдер не получает эндпоинта `/auth/<провайдер>` (404), поэтому в dev можно держать только один. `telegram_client_id` — числовой client id из @BotFather; `apple_client_ids` — bundle id приложения (`net.nous.ether`); `google_client_ids` — список OAuth client id (Android/iOS/Web). Всё это **audience** токенов: подписи проверяются по публичным ключам провайдеров, никаких их секретов серверу не нужно |
+| `telegram_client_id`, `apple_client_ids`, `google_client_ids` | провайдеры входа; каждый опционален, но **хотя бы один обязателен** — иначе сервер не стартует. Незаданный провайдер отвечает на `/auth/<провайдер>` кодом `501 provider_disabled` с внятным текстом (его клиент показывает как есть), поэтому в dev можно держать только один. `telegram_client_id` — числовой client id из @BotFather; `apple_client_ids` — bundle id приложения (`net.nous.ether`); `google_client_ids` — список OAuth client id (Android/iOS/Web). Всё это **audience** токенов: подписи проверяются по публичным ключам провайдеров, никаких их секретов серверу не нужно |
 | `addr` | адрес прослушивания (пусто → `:8080`) |
 | `db` | путь к файлу SQLite (пусто → `ether.<env>.db`) |
 | `nominatim_url` | свой инстанс Nominatim (пусто → публичный сервер OSM) |

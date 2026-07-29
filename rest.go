@@ -24,12 +24,15 @@ import (
 // notify может быть nil — служебные уведомления в Telegram выключены (см.
 // notify.go); на приём жалоб и регистрацию это не влияет.
 // verifiers — проверяльщики ID-token по провайдерам (ключ — ProviderTelegram и
-// т.д.). Незаданный провайдер эндпоинта не получает: пустой конфиг не должен
-// притворяться работающим входом.
+// т.д.). Эндпоинты регистрируются на ВСЕ известные провайдеры, даже незаданные:
+// незаданный отвечает `501 provider_disabled` с обычным JSON-телом. Раньше он
+// просто не регистрировался, и клиент получал текстовый `404 page not found` от
+// net/http — на нём падал разбор JSON, и любая настроечная ошибка выглядела в
+// приложении как невнятное «Не удалось войти».
 func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
-	for provider, v := range verifiers {
-		mux.HandleFunc("/auth/"+provider, handleAuth(store, provider, v, notify))
+	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
+		mux.HandleFunc("/auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
 	}
 	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
@@ -78,15 +81,26 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 
 // handleAuth — POST /auth/{telegram|apple|google} {id_token, name?} → 200 authed
 // (user + свежий token сессии + rules_accepted) | 401 bad_auth (токен не прошёл
-// проверку) | 403 banned | 400 bad_data. id_token проверяется по публичным ключам
-// провайдера (см. oidc.go), сети к самому провайдеру для этого не нужно.
+// проверку) | 403 banned | 400 bad_data | 501 provider_disabled (провайдер не
+// задан в конфиге). id_token проверяется по публичным ключам провайдера (см.
+// oidc.go), сети к самому провайдеру для этого не нужно.
 //
 // Один хендлер на всех: после проверки токена провайдер перестаёт иметь значение
 // — дальше аккаунт живёт под внутренним id (см. identities в store.go).
+//
+// v == nil — провайдер не сконфигурирован. Отвечаем 501 и внятным текстом:
+// клиент показывает его пользователю как есть, и по нему сразу видно, что
+// сломана настройка сервера, а не вход у человека.
 func handleAuth(store *Store, provider string, v *Verifier, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		if v == nil {
+			slog.Warn("auth provider not configured", "provider", provider)
+			writeRESTError(w, http.StatusNotImplemented, "provider_disabled",
+				"Вход через "+provider+" не настроен на сервере")
 			return
 		}
 		var d AuthRequest

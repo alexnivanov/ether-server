@@ -271,8 +271,9 @@ func TestAuthGoogle(t *testing.T) {
 	}
 }
 
-// Незаданный в конфиге провайдер не получает эндпоинта: пустой конфиг не должен
-// притворяться работающим входом.
+// Незаданный в конфиге провайдер отвечает 501 с обычным JSON-телом, а не
+// текстовым 404 от net/http: на 404 у клиента падал разбор ответа, и ошибка
+// настройки выглядела в приложении как загадочное «Не удалось войти».
 func TestAuthProviderNotConfigured(t *testing.T) {
 	store := openTestStore(t)
 	mux := http.NewServeMux()
@@ -282,14 +283,13 @@ func TestAuthProviderNotConfigured(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	// не restPost: 404 отдаёт net/http, и тело у него не JSON
-	resp, err := http.Post(srv.URL+"/auth/apple", "application/json", strings.NewReader(`{"id_token":"x"}`))
-	if err != nil {
-		t.Fatalf("POST: %v", err)
+	resp, body := restPost(t, srv.URL+"/auth/apple", AuthRequest{IDToken: "whatever"})
+	if resp.StatusCode != http.StatusNotImplemented || body["code"] != "provider_disabled" {
+		t.Fatalf("/auth/apple без конфига = %d %v, want 501 provider_disabled",
+			resp.StatusCode, body)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("/auth/apple без конфига = %d, want 404", resp.StatusCode)
+	if msg, _ := body["message"].(string); !strings.Contains(msg, "apple") {
+		t.Fatalf("сообщение не называет провайдера: %q", msg)
 	}
 }
 
