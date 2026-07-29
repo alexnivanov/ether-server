@@ -61,8 +61,8 @@ func NewPusher(projectID, credsFile string, store *Store) (*Pusher, error) {
 // канала, кроме автора. Задумана для вызова в горутине: блокируется на HTTP к
 // FCM (по запросу на токен — в HTTP v1 нет мультикаста), а доставка сообщения по
 // WS от пуша не зависит, поэтому ошибки только логируем.
-func (p *Pusher) Notify(channelID string, senderTgID int64, sender, text string) {
-	tokens, err := p.store.PushTargets(channelID, senderTgID)
+func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
+	tokens, err := p.store.PushTargets(channelID, senderID)
 	if err != nil {
 		slog.Error("push targets", "err", err, "channel", channelID)
 		return

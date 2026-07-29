@@ -18,8 +18,8 @@ import (
 // конфиге; оба пусты → уведомления выключены (событие всё равно в БД и в логе).
 //
 // Это ЕДИНСТВЕННОЕ место, где серверу нужен секретный токен бота: вход
-// пользователей проверяется по публичным ключам Telegram (JWKS, см.
-// telegram.go). Требует исходящего доступа к api.telegram.org — на хостах, где
+// пользователей проверяется по публичным ключам провайдеров (JWKS, см.
+// oidc.go). Требует исходящего доступа к api.telegram.org — на хостах, где
 // Telegram заблокирован, уведомления просто не уйдут (ошибка в лог, жалоба
 // сохранится).
 type Notifier struct {
@@ -90,21 +90,23 @@ func (n *Notifier) ReportToChannel(rep *ReportedMessage, reporter *User) {
 			"От: %s (<code>%d</code>)\n\n"+
 			"<code>/ban %d</code> · <code>/block %d</code> · <code>/del %d</code>",
 		html.EscapeString(rep.Reason),
-		html.EscapeString(author), rep.AuthorTgID, history,
+		html.EscapeString(author), rep.AuthorID, history,
 		html.EscapeString(rep.Channel),
 		rep.MessageID, html.EscapeString(text),
-		html.EscapeString(from), reporter.TgID,
-		rep.AuthorTgID, rep.AuthorTgID, rep.MessageID,
+		html.EscapeString(from), reporter.ID,
+		rep.AuthorID, rep.AuthorID, rep.MessageID,
 	)
 
 	n.send("report", body, "message_id", rep.MessageID)
 }
 
 // AccountCreated шлёт в служебный канал уведомление о регистрации нового
-// пользователя (первый вход через Telegram, см. handleAuthTelegram). Как и
-// ReportToChannel, задумана для вызова в горутине: ответ клиенту от неё не
-// зависит, аккаунт уже создан.
-func (n *Notifier) AccountCreated(u User) {
+// пользователя (первый вход, см. handleAuth). Как и ReportToChannel, задумана
+// для вызова в горутине: ответ клиенту от неё не зависит, аккаунт уже создан.
+//
+// provider показываем, потому что вход теперь не один: по нему видно, откуда
+// идут регистрации, и сразу понятно, будет ли у человека @username и аватар.
+func (n *Notifier) AccountCreated(u User, provider string) {
 	who := u.FullName
 	if u.TgUsername != "" {
 		who += " @" + u.TgUsername
@@ -113,10 +115,10 @@ func (n *Notifier) AccountCreated(u User) {
 		who = "без имени"
 	}
 	body := fmt.Sprintf(
-		"🎉 <b>Новый пользователь</b>\n%s (<code>%d</code>)",
-		html.EscapeString(who), u.TgID,
+		"🎉 <b>Новый пользователь</b>\n%s (<code>%d</code>)\nВход: %s",
+		html.EscapeString(who), u.ID, html.EscapeString(provider),
 	)
-	n.send("account created", body, "tg_id", u.TgID)
+	n.send("account created", body, "user_id", u.ID, "provider", provider)
 }
 
 // send отправляет готовый HTML-текст в служебный канал. kind и logAttrs — только

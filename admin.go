@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"log/slog"
@@ -22,11 +23,11 @@ import (
 //
 // Команды (причина необязательна, её увидит пользователь):
 //
-//	/ban <tg_id> [причина]    закрыть отправку на сутки; читать и заходить можно
-//	/block <tg_id> [причина]  заблокировать навсегда + удалить аккаунт
-//	/unban <tg_id>            снять наказание
-//	/del <msg_id>             удалить одно сообщение
-//	/purge <tg_id>            удалить все сообщения пользователя
+//	/ban <id> [причина]    закрыть отправку на сутки; читать и заходить можно
+//	/block <id> [причина]  заблокировать навсегда + удалить аккаунт
+//	/unban <id>            снять наказание
+//	/del <msg_id>          удалить одно сообщение
+//	/purge <id>            удалить все сообщения пользователя
 //	/help                     список команд
 //
 // Автоматической эскалации нет: в посте жалобы и в ответе на команду видно, сколько
@@ -180,22 +181,28 @@ func (a *AdminBot) execute(text string) string {
 	switch cmd {
 	case "/ban":
 		until, count, err := a.store.BanTemporary(id, reason)
+		if errors.Is(err, ErrNoIdentities) {
+			return fmt.Sprintf("Пользователя <code>%d</code> нет — аккаунт уже удалён", id)
+		}
 		if err != nil {
-			slog.Error("admin ban", "err", err, "tg_id", id)
+			slog.Error("admin ban", "err", err, "user_id", id)
 			return "Не удалось закрыть отправку — смотри логи сервера"
 		}
-		slog.Info("moderation ban", "tg_id", id, "until", until, "count", count, "reason", reason)
+		slog.Info("moderation ban", "user_id", id, "until", until, "count", count, "reason", reason)
 		return fmt.Sprintf(
 			"⏳ <code>%d</code> — отправка закрыта на сутки, до %s%s\nНарушений всего: <b>%d</b>. Если мало — <code>/block %d</code>",
 			id, until.Format("02.01 15:04"), reasonSuffix(reason), count, id)
 
 	case "/block":
 		count, err := a.store.BanPermanent(id, reason)
+		if errors.Is(err, ErrNoIdentities) {
+			return fmt.Sprintf("Пользователя <code>%d</code> нет — аккаунт уже удалён", id)
+		}
 		if err != nil {
-			slog.Error("admin block", "err", err, "tg_id", id)
+			slog.Error("admin block", "err", err, "user_id", id)
 			return "Не удалось заблокировать — смотри логи сервера"
 		}
-		slog.Info("moderation block", "tg_id", id, "count", count, "reason", reason)
+		slog.Info("moderation block", "user_id", id, "count", count, "reason", reason)
 		return fmt.Sprintf(
 			"⛔️ <code>%d</code> — заблокирован навсегда, аккаунт и его сообщения удалены%s\nНарушений всего: <b>%d</b>. Вход закрыт даже после переустановки",
 			id, reasonSuffix(reason), count)
@@ -203,13 +210,13 @@ func (a *AdminBot) execute(text string) string {
 	case "/unban":
 		ok, err := a.store.Unban(id)
 		if err != nil {
-			slog.Error("admin unban", "err", err, "tg_id", id)
+			slog.Error("admin unban", "err", err, "user_id", id)
 			return "Не удалось снять бан — смотри логи сервера"
 		}
 		if !ok {
 			return fmt.Sprintf("У <code>%d</code> нет активного наказания", id)
 		}
-		slog.Info("moderation unban", "tg_id", id)
+		slog.Info("moderation unban", "user_id", id)
 		return fmt.Sprintf(
 			"✅ <code>%d</code> — наказание снято. Счётчик нарушений сохранён: ты будешь видеть его при следующей жалобе",
 			id)
@@ -229,19 +236,19 @@ func (a *AdminBot) execute(text string) string {
 	case "/purge":
 		n, err := a.store.DeleteUserMessages(id)
 		if err != nil {
-			slog.Error("admin purge", "err", err, "tg_id", id)
+			slog.Error("admin purge", "err", err, "user_id", id)
 			return "Не удалось очистить — смотри логи сервера"
 		}
-		slog.Info("moderation purge", "tg_id", id, "deleted", n)
+		slog.Info("moderation purge", "user_id", id, "deleted", n)
 		return fmt.Sprintf("🗑 Удалено сообщений пользователя <code>%d</code>: %d", id, n)
 
 	case "/help":
 		return "<b>Команды модерации</b>\n" +
-			"<code>/ban &lt;tg_id&gt; [причина]</code> — закрыть отправку на сутки (читать можно)\n" +
-			"<code>/block &lt;tg_id&gt; [причина]</code> — заблокировать навсегда + удалить аккаунт\n" +
-			"<code>/unban &lt;tg_id&gt;</code> — снять наказание\n" +
+			"<code>/ban &lt;id&gt; [причина]</code> — закрыть отправку на сутки (читать можно)\n" +
+			"<code>/block &lt;id&gt; [причина]</code> — заблокировать навсегда + удалить аккаунт\n" +
+			"<code>/unban &lt;id&gt;</code> — снять наказание\n" +
 			"<code>/del &lt;msg_id&gt;</code> — удалить сообщение\n" +
-			"<code>/purge &lt;tg_id&gt;</code> — удалить все сообщения пользователя\n\n" +
+			"<code>/purge &lt;id&gt;</code> — удалить все сообщения пользователя\n\n" +
 			"Причина необязательна, но её увидит пользователь. Эскалации нет: " +
 			"счётчик нарушений показывается, решение за тобой."
 

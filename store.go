@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,60 +13,106 @@ import (
 )
 
 // Store — персистентность в SQLite (файл `db` из конфига, свой на окружение):
-// пользователи, сессии и сообщения каналов.
+// пользователи, способы входа, сессии и сообщения каналов.
 //
-// Пользователь создаётся/обновляется при каждом входе через Telegram (ключ —
-// tg id). Сессия — случайный токен, который клиент получает в `authed` и
-// предъявляет в `resume` после реконнекта, чтобы не ходить к боту заново.
-// Сообщение хранится под ключом-строкой ID канала; история отдаётся кадром
-// `history` страницами вверх (before_id).
+// Личность отвязана от провайдера входа: ключ пользователя — внутренний
+// `users.id`, а Telegram/Apple/Google лежат в `identities` (см. схему). Это
+// нужно было и для App Store (вход обязан работать без установки Telegram —
+// guideline 4.2.3), и для приватности: наружу уходит только внутренний id, а
+// Telegram id не покидает базу.
+//
+// Сессия — случайный токен, который клиент получает при входе и предъявляет в
+// `resume` после реконнекта. Сообщение хранится под ключом-строкой ID канала;
+// история отдаётся кадром `history` страницами вверх (before_id).
 type Store struct {
 	db *sql.DB
 }
 
+// User — аккаунт для внутреннего использования (хендлеры, WS-соединение).
+// Провайдера входа здесь нет специально: после аутентификации он никого не
+// интересует, дальше все работают с ID.
 type User struct {
-	TgID       int64
-	TgUsername string // @username — для ссылки на профиль в Telegram (не для имени)
-	FullName   string // отображаемое имя (Telegram `name`); единственное для UI
-	AvatarURL  string // URL фото профиля из Telegram (claim `picture`); может быть пустым
-	// RulesAccepted — согласие с правилами Эфира привязано к Telegram-аккаунту,
-	// а не к устройству/сессии: однажды принял — экран правил больше не увидит,
-	// даже переустановив клиент или потеряв shared_preferences.
+	ID int64 // внутренний users.id — единственный идентификатор, уходящий клиенту
+	// TgUsername — @username для ссылки на профиль в Telegram. Заполнен только
+	// у тех, кто входил через Telegram; у Apple/Google пусто.
+	TgUsername string
+	FullName   string // отображаемое имя, единственное для UI
+	AvatarURL  string // URL фото профиля; у Apple всегда пусто (SIWA его не отдаёт)
+	// CreatedAt — когда аккаунт зарегистрирован. Нужен лимитеру: у свежих
+	// аккаунтов частота публикаций ниже (см. ratelimit.go) — это делает ферму
+	// одноразовых аккаунтов бесполезной независимо от того, насколько дёшево
+	// достаётся личность у провайдера.
+	CreatedAt time.Time
+	// RulesAccepted — согласие с правилами Эфира привязано к аккаунту, а не к
+	// устройству/сессии: однажды принял — экран правил больше не увидит, даже
+	// переустановив клиент или потеряв shared_preferences.
 	RulesAccepted bool
 	// Banned — активное наказание модератора: отправка сообщений запрещена
 	// («мьют»). Чтение и вход остаются — временный бан никого не выселяет.
 	Banned bool
-	// BanPermanent — постоянный бан (повторное нарушение). Аккаунт при этом
-	// удалён, и вход запрещён совсем: иначе нарушитель просто зарегистрировался
-	// бы заново под тем же Telegram id.
+	// BanPermanent — постоянный бан. Аккаунт при этом удалён, и вход запрещён
+	// совсем: иначе нарушитель просто зарегистрировался бы заново тем же
+	// Apple ID / Telegram.
 	BanPermanent bool
+}
+
+// Провайдеры входа. Значения попадают в БД (identities.provider, bans.provider),
+// поэтому менять их нельзя без миграции.
+const (
+	ProviderTelegram = "telegram"
+	ProviderApple    = "apple"
+	ProviderGoogle   = "google"
+)
+
+// ProviderUser — результат проверки токена провайдера (см. oidc.go): кто вошёл и
+// что провайдер о нём рассказал. Name/AvatarURL могут быть пустыми — Apple
+// отдаёт имя только при ПЕРВОЙ авторизации, а фото не отдаёт никогда, поэтому
+// пустые значения не должны затирать уже сохранённые (см. UpsertByIdentity).
+type ProviderUser struct {
+	Provider  string // ProviderTelegram | ProviderApple | ProviderGoogle
+	UID       string // id у провайдера: Telegram user id, Apple/Google sub
+	Username  string // @username — только Telegram
+	Name      string // отображаемое имя
+	AvatarURL string // URL фото профиля
 }
 
 const storeSchema = `
 CREATE TABLE IF NOT EXISTS users (
-	tg_id             INTEGER PRIMARY KEY, -- Telegram user id
-	tg_username       TEXT NOT NULL DEFAULT '', -- @username (ссылка на профиль)
+	id                INTEGER PRIMARY KEY AUTOINCREMENT, -- внутренний id (наружу уходит только он)
+	tg_username       TEXT NOT NULL DEFAULT '', -- @username; только у Telegram-аккаунтов
 	full_name         TEXT NOT NULL DEFAULT '', -- отображаемое имя (для UI)
-	avatar_url        TEXT NOT NULL DEFAULT '', -- URL фото профиля из Telegram
+	avatar_url        TEXT NOT NULL DEFAULT '', -- URL фото профиля; у Apple пусто
 	created_at        INTEGER NOT NULL,    -- unix-миллисекунды (как всюду в БД)
 	seen_at           INTEGER NOT NULL,
 	rules_accepted_at INTEGER NOT NULL DEFAULT 0 -- unix-мс; 0 — не принял
 );
+-- Способы входа. У пользователя их может быть несколько (вошёл через Apple,
+-- позже привязал Telegram — аккаунт тот же); привязки в UI пока нет, но схема
+-- её не запрещает. provider_uid — строка: у Apple/Google это opaque sub, а не
+-- число, и в int64 он не влезает.
+CREATE TABLE IF NOT EXISTS identities (
+	provider     TEXT NOT NULL,           -- telegram | apple | google
+	provider_uid TEXT NOT NULL,           -- id у провайдера (Telegram id, sub)
+	user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at   INTEGER NOT NULL,
+	PRIMARY KEY (provider, provider_uid)
+);
+CREATE INDEX IF NOT EXISTS identities_user ON identities(user_id);
 CREATE TABLE IF NOT EXISTS sessions (
 	token      TEXT PRIMARY KEY,
 	-- ON DELETE CASCADE: удаление аккаунта (DeleteUser) само сносит все его
 	-- сессии; работает при foreign_keys=ON (см. OpenStore).
-	tg_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	created_at INTEGER NOT NULL, -- unix-миллисекунды
 	seen_at    INTEGER NOT NULL  -- unix-миллисекунды
 );
-CREATE INDEX IF NOT EXISTS sessions_tg_id ON sessions(tg_id);
+CREATE INDEX IF NOT EXISTS sessions_user_id ON sessions(user_id);
 CREATE TABLE IF NOT EXISTS messages (
 	id      INTEGER PRIMARY KEY AUTOINCREMENT, -- монотонный, курсор пагинации
 	channel TEXT NOT NULL,                     -- ID канала (контракт ether-meta)
 	-- автор; имя/аватар — JOIN из users. ON DELETE CASCADE: удаление аккаунта
 	-- стирает и его сообщения (при foreign_keys=ON).
-	tg_id   INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	text    TEXT NOT NULL,
 	ts      INTEGER NOT NULL                   -- unix-миллисекунды (контракт протокола)
 );
@@ -77,19 +124,19 @@ CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 -- должна остаться разбираемой, поэтому ссылку на messages не ставим — id
 -- сохраняем справочно, без FK.
 CREATE TABLE IF NOT EXISTS reports (
-	id             INTEGER PRIMARY KEY AUTOINCREMENT,
-	message_id     INTEGER NOT NULL,        -- id сообщения на момент жалобы
-	channel        TEXT NOT NULL,           -- где было сообщение
-	author_tg_id   INTEGER NOT NULL,        -- на кого жалуются
-	message_text   TEXT NOT NULL,           -- копия: сообщение может быть удалено
-	reporter_tg_id INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
-	reason         TEXT NOT NULL DEFAULT '',-- код причины из клиента
-	created_at     INTEGER NOT NULL,        -- unix-миллисекунды
+	id              INTEGER PRIMARY KEY AUTOINCREMENT,
+	message_id      INTEGER NOT NULL,        -- id сообщения на момент жалобы
+	channel         TEXT NOT NULL,           -- где было сообщение
+	author_user_id  INTEGER NOT NULL,        -- на кого жалуются
+	message_text    TEXT NOT NULL,           -- копия: сообщение может быть удалено
+	reporter_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	reason          TEXT NOT NULL DEFAULT '',-- код причины из клиента
+	created_at      INTEGER NOT NULL,        -- unix-миллисекунды
 	-- повторная жалоба того же человека на то же сообщение — не новая запись
-	UNIQUE(message_id, reporter_tg_id)
+	UNIQUE(message_id, reporter_user_id)
 );
 CREATE INDEX IF NOT EXISTS reports_created_at ON reports(created_at);
-CREATE INDEX IF NOT EXISTS reports_author ON reports(author_tg_id);
+CREATE INDEX IF NOT EXISTS reports_author ON reports(author_user_id);
 -- Адресная доставка пушей (см. push.go). Топики FCM не годятся: в топик нельзя
 -- НЕ отправить конкретному подписчику, из-за чего автор получал уведомление о
 -- своём же сообщении. Поэтому сервер держит токены устройств и каналы каждого
@@ -97,37 +144,49 @@ CREATE INDEX IF NOT EXISTS reports_author ON reports(author_tg_id);
 CREATE TABLE IF NOT EXISTS device_tokens (
 	fcm_token  TEXT PRIMARY KEY,        -- токен устройства (он же ключ: при
 	                                    -- переустановке/смене аккаунта токен
-	                                    -- переезжает к другому tg_id)
-	tg_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	                                    -- переезжает к другому пользователю)
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	platform   TEXT NOT NULL DEFAULT '',-- ios|android, для диагностики
 	updated_at INTEGER NOT NULL         -- unix-миллисекунды
 );
-CREATE INDEX IF NOT EXISTS device_tokens_tg_id ON device_tokens(tg_id);
+CREATE INDEX IF NOT EXISTS device_tokens_user_id ON device_tokens(user_id);
 -- Каналы пользователя: обновляются на каждый locate (сервер и так их вычисляет).
--- Нужны, чтобы понять, кому слать пуш, когда WS-соединения уже нет.
+-- Нужны, чтобы понять, кому слать пуш, когда WS-соединения уже нет, и чтобы
+-- показать в клиенте размер аудитории канала (ChannelSubscribers).
 CREATE TABLE IF NOT EXISTS user_channels (
-	tg_id      INTEGER NOT NULL REFERENCES users(tg_id) ON DELETE CASCADE,
+	user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	channel    TEXT NOT NULL,
 	updated_at INTEGER NOT NULL,
-	PRIMARY KEY (tg_id, channel)
+	PRIMARY KEY (user_id, channel)
 );
 CREATE INDEX IF NOT EXISTS user_channels_channel ON user_channels(channel);
--- Наказания модератора. Ключ — Telegram id, и таблица СПЕЦИАЛЬНО без FK на
--- users: вход идёт по Telegram-аккаунту, поэтому удаление аккаунта из users не
--- должно снимать наказание — иначе нарушитель просто войдёт заново и получит
--- чистый профиль.
+-- Наказания модератора.
+--
+-- Ключ — ЛИЧНОСТЬ У ПРОВАЙДЕРА, а не users.id, и таблица специально без FK:
+-- удаление аккаунта уносит users вместе с identities, а наказание должно это
+-- переживать — иначе нарушитель удалит аккаунт и войдёт тем же Apple ID
+-- (Telegram id) с чистого листа. Вход проверяется по личности ещё до того, как
+-- мы нашли или создали пользователя (см. BanStatusForIdentity).
+--
+-- user_id — копия на момент наказания, без FK: она нужна модератору (команды в
+-- канале принимают внутренний id) и продолжает работать после того, как
+-- аккаунта уже нет, — например /unban после /block.
 --
 -- Автоматической эскалации нет: решает модератор. Он видит count (сколько раз
 -- наказывали) в посте жалобы и сам выбирает мьют на сутки или постоянный бан.
 CREATE TABLE IF NOT EXISTS bans (
-	tg_id      INTEGER PRIMARY KEY,          -- кого наказали (может уже не быть в users)
-	until      INTEGER NOT NULL DEFAULT 0,   -- unix-мс, до когда временный бан; 0 — нет
-	permanent  INTEGER NOT NULL DEFAULT 0,   -- 1 — постоянный запрет входа
-	count      INTEGER NOT NULL DEFAULT 0,   -- сколько раз наказывали (справочно, для модератора)
-	reason     TEXT NOT NULL DEFAULT '',     -- причина последнего наказания (показывается пользователю)
-	created_at INTEGER NOT NULL,
-	updated_at INTEGER NOT NULL
+	provider     TEXT NOT NULL,
+	provider_uid TEXT NOT NULL,
+	user_id      INTEGER NOT NULL DEFAULT 0,   -- users.id на момент наказания (может быть удалён)
+	until        INTEGER NOT NULL DEFAULT 0,   -- unix-мс, до когда временный бан; 0 — нет
+	permanent    INTEGER NOT NULL DEFAULT 0,   -- 1 — постоянный запрет входа
+	count        INTEGER NOT NULL DEFAULT 0,   -- сколько раз наказывали (справочно, для модератора)
+	reason       TEXT NOT NULL DEFAULT '',     -- причина последнего наказания (показывается пользователю)
+	created_at   INTEGER NOT NULL,
+	updated_at   INTEGER NOT NULL,
+	PRIMARY KEY (provider, provider_uid)
 );
+CREATE INDEX IF NOT EXISTS bans_user_id ON bans(user_id);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -152,8 +211,9 @@ func OpenStore(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	// Миграций нет: до closed-beta MVP схему меняем свободно, а БД пересоздаём
-	// с нуля (единственный источник схемы — storeSchema выше).
+	// Миграций нет: пока не пройдено ревью сторов и релиза не было, схему меняем
+	// свободно, а прод-базу пересоздаём с нуля (единственный источник схемы —
+	// storeSchema выше). Появится публичный релиз — появятся и миграции.
 	return &Store{db: db}, nil
 }
 
@@ -167,61 +227,131 @@ func (s *Store) Ping() error {
 	return s.db.QueryRow(`SELECT 1`).Scan(&one)
 }
 
-// CreateUser заводит нового пользователя (ключ — tg id). Правила при
-// регистрации не приняты — их отмечает только AcceptRules.
-func (s *Store) CreateUser(u User) error {
+// ─── пользователи и способы входа ───
+
+// UpsertByIdentity — вход: находит пользователя по личности у провайдера, а если
+// такой личности ещё нет — создаёт аккаунт. Возвращает id, признак первого входа
+// (created — для приветственного уведомления) и принимал ли этот аккаунт правила.
+//
+// Пустые Name/AvatarURL НЕ затирают сохранённые: Apple отдаёт имя только при
+// первой авторизации, а фото не отдаёт вовсе, поэтому второй вход через Apple
+// иначе обнулил бы профиль. Telegram-специфичный @username трогаем только когда
+// вход шёл через Telegram (там пустое значение — законное: человек снял
+// username), при входе через Apple/Google он должен остаться как был.
+func (s *Store) UpsertByIdentity(pu ProviderUser) (userID int64, created bool, rulesAccepted bool, err error) {
 	now := time.Now().UnixMilli()
-	_, err := s.db.Exec(`
-		INSERT INTO users (tg_id, tg_username, full_name, avatar_url, created_at, seen_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		u.TgID, u.TgUsername, u.FullName, u.AvatarURL, now, now)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, false, false, err
+	}
+	defer tx.Rollback()
+
+	// @username: NULL — «не трогать», '' — «очистить» (только для Telegram)
+	var username any
+	if pu.Provider == ProviderTelegram {
+		username = pu.Username
+	}
+	// аватар: NULL — «не трогать» (Apple), иначе значение провайдера
+	var avatar any
+	if pu.AvatarURL != "" {
+		avatar = pu.AvatarURL
+	}
+
+	err = tx.QueryRow(`SELECT user_id FROM identities WHERE provider = ? AND provider_uid = ?`,
+		pu.Provider, pu.UID).Scan(&userID)
+	switch {
+	case err == sql.ErrNoRows:
+		res, err := tx.Exec(`
+			INSERT INTO users (tg_username, full_name, avatar_url, created_at, seen_at)
+			VALUES (?, ?, ?, ?, ?)`,
+			pu.Username, pu.Name, pu.AvatarURL, now, now)
+		if err != nil {
+			return 0, false, false, err
+		}
+		if userID, err = res.LastInsertId(); err != nil {
+			return 0, false, false, err
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO identities (provider, provider_uid, user_id, created_at) VALUES (?, ?, ?, ?)`,
+			pu.Provider, pu.UID, userID, now); err != nil {
+			return 0, false, false, err
+		}
+		created = true
+	case err != nil:
+		return 0, false, false, err
+	default:
+		var acceptedAt int64
+		if err := tx.QueryRow(`
+			UPDATE users SET
+				tg_username = COALESCE(?, tg_username),
+				full_name   = COALESCE(NULLIF(?, ''), full_name),
+				avatar_url  = COALESCE(?, avatar_url),
+				seen_at     = ?
+			WHERE id = ?
+			RETURNING rules_accepted_at`,
+			username, pu.Name, avatar, now, userID,
+		).Scan(&acceptedAt); err != nil {
+			return 0, false, false, err
+		}
+		rulesAccepted = acceptedAt > 0
+	}
+	return userID, created, rulesAccepted, tx.Commit()
 }
 
-// UpdateUser обновляет профиль существующего пользователя: tg_username, имя и
-// аватар подхватываются заново при каждом входе, seen_at освежается.
-// rules_accepted_at не трогает — его меняет только AcceptRules.
-//
-// found=false — такого пользователя ещё нет (значит вход первый, зовите
-// CreateUser). rulesAccepted — принимал ли он правила раньше; RETURNING отдаёт
-// это тем же запросом, что и UPDATE.
-func (s *Store) UpdateUser(u User) (found, rulesAccepted bool, err error) {
+// UserByID — профиль по внутреннему id (нужен после UpsertByIdentity, чтобы
+// отдать клиенту итоговые имя/аватар: они могли остаться от прошлого входа).
+// nil — пользователя нет.
+func (s *Store) UserByID(id int64) (*User, error) {
+	var u User
 	var acceptedAt int64
-	err = s.db.QueryRow(`
-		UPDATE users SET
-			tg_username = ?,
-			full_name = ?,
-			avatar_url = ?,
-			seen_at = ?
-		WHERE tg_id = ?
-		RETURNING rules_accepted_at`,
-		u.TgUsername, u.FullName, u.AvatarURL, time.Now().UnixMilli(), u.TgID,
-	).Scan(&acceptedAt)
+	err := s.db.QueryRow(`
+		SELECT id, tg_username, full_name, avatar_url, rules_accepted_at FROM users WHERE id = ?`, id).
+		Scan(&u.ID, &u.TgUsername, &u.FullName, &u.AvatarURL, &acceptedAt)
 	if err == sql.ErrNoRows {
-		return false, false, nil
+		return nil, nil
 	}
 	if err != nil {
-		return false, false, err
+		return nil, err
 	}
-	return true, acceptedAt > 0, nil
+	u.RulesAccepted = acceptedAt > 0
+	return &u, nil
+}
+
+// Identities — все способы входа пользователя. Нужны модерации: наказание
+// пишется на каждую личность, иначе забаненный войдёт другим провайдером.
+func (s *Store) Identities(userID int64) ([]ProviderUser, error) {
+	rows, err := s.db.Query(`SELECT provider, provider_uid FROM identities WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ProviderUser
+	for rows.Next() {
+		var p ProviderUser
+		if err := rows.Scan(&p.Provider, &p.UID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // AcceptRules отмечает, что пользователь принял правила Эфира — привязано к
-// Telegram-аккаунту, переживает переустановку клиента и смену устройства.
-func (s *Store) AcceptRules(tgID int64) error {
-	_, err := s.db.Exec(`UPDATE users SET rules_accepted_at = ? WHERE tg_id = ?`, time.Now().UnixMilli(), tgID)
+// аккаунту, переживает переустановку клиента и смену устройства.
+func (s *Store) AcceptRules(userID int64) error {
+	_, err := s.db.Exec(`UPDATE users SET rules_accepted_at = ? WHERE id = ?`, time.Now().UnixMilli(), userID)
 	return err
 }
 
 // NewSession выпускает токен сессии для пользователя. Токенов может быть
 // несколько (несколько устройств); срока жизни пока нет — прототип.
-func (s *Store) NewSession(tgID int64) (string, error) {
+func (s *Store) NewSession(userID int64) (string, error) {
 	b := make([]byte, 32)
 	rand.Read(b)
 	token := hex.EncodeToString(b)
 	now := time.Now().UnixMilli()
-	_, err := s.db.Exec(`INSERT INTO sessions (token, tg_id, created_at, seen_at) VALUES (?, ?, ?, ?)`,
-		token, tgID, now, now)
+	_, err := s.db.Exec(`INSERT INTO sessions (token, user_id, created_at, seen_at) VALUES (?, ?, ?, ?)`,
+		token, userID, now, now)
 	if err != nil {
 		return "", err
 	}
@@ -236,17 +366,60 @@ func (s *Store) DeleteSession(token string) error {
 }
 
 // DeleteUser удаляет аккаунт целиком, необратимо: сам пользователь + каскадом
-// (ON DELETE CASCADE, см. схему) все его сессии (все устройства) и сообщения.
-// Идемпотентна: удаление отсутствующего tg_id — не ошибка.
-func (s *Store) DeleteUser(tgID int64) error {
-	_, err := s.db.Exec(`DELETE FROM users WHERE tg_id = ?`, tgID)
+// (ON DELETE CASCADE, см. схему) его способы входа, все сессии (все устройства),
+// сообщения, токены устройств и каналы. Идемпотентна: удаление отсутствующего
+// id — не ошибка. Записи в bans остаются: наказание живёт по личности у
+// провайдера и переживает удаление аккаунта.
+func (s *Store) DeleteUser(userID int64) error {
+	_, err := s.db.Exec(`DELETE FROM users WHERE id = ?`, userID)
 	return err
 }
 
+// UserBySession возвращает пользователя по токену сессии (nil — сессии нет)
+// и отмечает сессию как живую.
+func (s *Store) UserBySession(token string) (*User, error) {
+	var u User
+	var acceptedAt, banUntil int64
+	var banPermanent int
+	// Наказание живёт по личности (см. схему bans), поэтому подтягиваем его
+	// через identities. MAX: у пользователя может быть несколько способов входа,
+	// и хватает наказания на любом из них — иначе бан обходился бы вторым
+	// провайдером. Временное истекает само: сравниваем until с текущим временем
+	// здесь же, фоновая уборка не нужна.
+	var createdAt int64
+	err := s.db.QueryRow(`
+		SELECT u.id, u.tg_username, u.full_name, u.avatar_url, u.rules_accepted_at, u.created_at,
+		       COALESCE(MAX(b.until), 0), COALESCE(MAX(b.permanent), 0)
+		FROM sessions s
+		JOIN users u ON u.id = s.user_id
+		LEFT JOIN identities i ON i.user_id = u.id
+		LEFT JOIN bans b ON b.provider = i.provider AND b.provider_uid = i.provider_uid
+		WHERE s.token = ?
+		GROUP BY u.id`, token).
+		Scan(&u.ID, &u.TgUsername, &u.FullName, &u.AvatarURL, &acceptedAt, &createdAt,
+			&banUntil, &banPermanent)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	u.RulesAccepted = acceptedAt > 0
+	u.CreatedAt = time.UnixMilli(createdAt)
+	u.BanPermanent = banPermanent == 1
+	u.Banned = u.BanPermanent || banUntil > time.Now().UnixMilli()
+	now := time.Now().UnixMilli()
+	s.db.Exec(`UPDATE sessions SET seen_at = ? WHERE token = ?`, now, token)
+	s.db.Exec(`UPDATE users SET seen_at = ? WHERE id = ?`, now, u.ID)
+	return &u, nil
+}
+
+// ─── сообщения ───
+
 // SaveMessage пишет сообщение в историю канала и возвращает его id.
-func (s *Store) SaveMessage(channel string, tgID int64, text string, ts int64) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO messages (channel, tg_id, text, ts) VALUES (?, ?, ?, ?)`,
-		channel, tgID, text, ts)
+func (s *Store) SaveMessage(channel string, userID int64, text string, ts int64) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO messages (channel, user_id, text, ts) VALUES (?, ?, ?, ?)`,
+		channel, userID, text, ts)
 	if err != nil {
 		return 0, err
 	}
@@ -269,12 +442,12 @@ func (s *Store) DeleteMessagesOlderThan(ttl time.Duration) (int64, error) {
 // порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
 // старше него.
 func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
-	// имя, @username и аватар автора — JOIN из users по tg_id (в messages их
+	// имя, @username и аватар автора — JOIN из users по user_id (в messages их
 	// нет). LEFT JOIN — защитно: при удалении аккаунта сообщения удаляются
 	// каскадом вместе с автором (см. DeleteUser), поэтому «висячих» строк без
 	// users быть не должно, но JOIN не должен ронять выборку, если что.
-	q := `SELECT m.id, m.channel, m.tg_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
-		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
+	q := `SELECT m.id, m.channel, m.user_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
+		FROM messages m LEFT JOIN users u ON u.id = m.user_id
 		WHERE m.channel = ?`
 	args := []any{channel}
 	if beforeID > 0 {
@@ -311,14 +484,38 @@ func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageDat
 	return msgs, nil
 }
 
+// DeleteMessage удаляет одно сообщение (реакция на жалобу). Возвращает false,
+// если сообщения уже нет — оно могло уйти по TTL или быть удалено раньше.
+// Жалобы на него остаются: в них хранится копия текста (см. ReportMessage).
+func (s *Store) DeleteMessage(id int64) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
+}
+
+// DeleteUserMessages удаляет все сообщения пользователя и возвращает их число —
+// когда одного сообщения мало (спамер засыпал канал).
+func (s *Store) DeleteUserMessages(userID int64) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ─── жалобы ───
+
 // ReportedMessage — что именно нажаловали: данные для разбора и для уведомления
 // в служебный Telegram-канал (см. notify.go).
 type ReportedMessage struct {
 	MessageID      int64
 	Channel        string
-	AuthorTgID     int64
+	AuthorID       int64  // внутренний id автора — им же оперируют команды модерации
 	AuthorName     string // имя автора на момент жалобы (JOIN из users)
-	AuthorUsername string // @username автора; пусто — нет username
+	AuthorUsername string // @username автора; пусто — нет username или вход не через Telegram
 	Text           string
 	Reason         string
 	// AuthorBanCount — сколько раз автора уже наказывали. Показывается модератору
@@ -336,15 +533,15 @@ type ReportedMessage struct {
 // удаления. Возвращает nil, если сообщения с таким id нет (уже удалено по TTL
 // или id выдуман). Повторная жалоба того же пользователя на то же сообщение —
 // не ошибка и не дубль (UNIQUE + INSERT OR IGNORE), для клиента это успех.
-func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (*ReportedMessage, error) {
+func (s *Store) ReportMessage(messageID, reporterID int64, reason string) (*ReportedMessage, error) {
 	rep := &ReportedMessage{MessageID: messageID, Reason: reason}
 	// LEFT JOIN: имя автора — удобство для разбора, его отсутствие не должно
 	// мешать принять жалобу
 	err := s.db.QueryRow(`
-		SELECT m.channel, m.tg_id, m.text, COALESCE(u.full_name, ''), COALESCE(u.tg_username, '')
-		FROM messages m LEFT JOIN users u ON u.tg_id = m.tg_id
+		SELECT m.channel, m.user_id, m.text, COALESCE(u.full_name, ''), COALESCE(u.tg_username, '')
+		FROM messages m LEFT JOIN users u ON u.id = m.user_id
 		WHERE m.id = ?`, messageID).
-		Scan(&rep.Channel, &rep.AuthorTgID, &rep.Text, &rep.AuthorName, &rep.AuthorUsername)
+		Scan(&rep.Channel, &rep.AuthorID, &rep.Text, &rep.AuthorName, &rep.AuthorUsername)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -353,13 +550,13 @@ func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (*Re
 	}
 	res, err := s.db.Exec(`
 		INSERT OR IGNORE INTO reports
-			(message_id, channel, author_tg_id, message_text, reporter_tg_id, reason, created_at)
+			(message_id, channel, author_user_id, message_text, reporter_user_id, reason, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		messageID, rep.Channel, rep.AuthorTgID, rep.Text, reporterTgID, reason, time.Now().UnixMilli())
+		messageID, rep.Channel, rep.AuthorID, rep.Text, reporterID, reason, time.Now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
-	if rep.AuthorBanCount, err = s.BanCount(rep.AuthorTgID); err != nil {
+	if rep.AuthorBanCount, err = s.BanCount(rep.AuthorID); err != nil {
 		return nil, err
 	}
 	// 0 изменённых строк — сработал IGNORE, т.е. жалоба уже была
@@ -368,6 +565,8 @@ func (s *Store) ReportMessage(messageID, reporterTgID int64, reason string) (*Re
 	}
 	return rep, nil
 }
+
+// ─── наказания ───
 
 // banDuration — срок мьюта по умолчанию. Сутки: достаточно, чтобы остудить, и не
 // требует от модератора возвращаться и снимать вручную — истекает сам, без
@@ -378,72 +577,149 @@ const banDuration = 24 * time.Hour
 // остаются, сессии не отзываются. reason — необязательная причина, её увидит
 // пользователь. Возвращает время окончания и накопленное число наказаний, чтобы
 // модератор видел, сколько раз этот человек уже попадался.
-func (s *Store) BanTemporary(tgID int64, reason string) (until time.Time, count int, err error) {
+func (s *Store) BanTemporary(userID int64, reason string) (until time.Time, count int, err error) {
 	now := time.Now()
 	until = now.Add(banDuration)
-	if err = s.upsertBan(tgID, until.UnixMilli(), 0, reason, now); err != nil {
+	if err = s.upsertBan(userID, until.UnixMilli(), 0, reason, now); err != nil {
 		return time.Time{}, 0, err
 	}
-	count, err = s.BanCount(tgID)
+	count, err = s.BanCount(userID)
 	return until, count, err
 }
 
 // BanPermanent закрывает вход навсегда и удаляет аккаунт (профиль, сессии,
-// сообщения и токены устройств уходят каскадом). Запись в bans остаётся —
-// именно она не даёт зарегистрироваться заново под тем же Telegram id.
+// сообщения и токены устройств уходят каскадом). Записи в bans остаются —
+// именно они не дают зарегистрироваться заново тем же Apple ID / Telegram.
 // Автоматически не вызывается: решение всегда за модератором.
-func (s *Store) BanPermanent(tgID int64, reason string) (count int, err error) {
+func (s *Store) BanPermanent(userID int64, reason string) (count int, err error) {
 	now := time.Now()
-	if err = s.upsertBan(tgID, 0, 1, reason, now); err != nil {
+	if err = s.upsertBan(userID, 0, 1, reason, now); err != nil {
 		return 0, err
 	}
-	if err = s.DeleteUser(tgID); err != nil {
+	// счётчик читаем ДО удаления: после него identities уже нет, и наказание
+	// находится только по user_id
+	if count, err = s.BanCount(userID); err != nil {
 		return 0, err
 	}
-	return s.BanCount(tgID)
+	if err = s.DeleteUser(userID); err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
-// upsertBan пишет наказание и увеличивает счётчик нарушений.
-func (s *Store) upsertBan(tgID, until int64, permanent int, reason string, now time.Time) error {
+// ErrNoIdentities — наказывать некого: у пользователя не осталось способов
+// входа, то есть аккаунт уже удалён. Отдельная ошибка, потому что модератору
+// нужен внятный ответ в канале, а не «смотри логи».
+var ErrNoIdentities = errors.New("у пользователя нет способов входа")
+
+// upsertBan пишет наказание на КАЖДЫЙ способ входа пользователя и увеличивает
+// счётчик нарушений. На каждый, потому что иначе забаненный войдёт другим
+// провайдером и получит чистый аккаунт.
+//
+// Если способов входа не осталось (аккаунт уже удалён), наказание не пишется:
+// привязать его не к чему — по внутреннему id вернувшегося не опознать, он
+// получит новый.
+func (s *Store) upsertBan(userID, until int64, permanent int, reason string, now time.Time) error {
+	ids, err := s.Identities(userID)
+	if err != nil {
+		return err
+	}
+	if len(ids) == 0 {
+		return ErrNoIdentities
+	}
 	nowMs := now.UnixMilli()
-	_, err := s.db.Exec(`
-		INSERT INTO bans (tg_id, until, permanent, count, reason, created_at, updated_at)
-		VALUES (?, ?, ?, 1, ?, ?, ?)
-		ON CONFLICT(tg_id) DO UPDATE SET
-			until = excluded.until,
-			permanent = excluded.permanent,
-			count = bans.count + 1,
-			reason = excluded.reason,
-			updated_at = excluded.updated_at`,
-		tgID, until, permanent, reason, nowMs, nowMs)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		if _, err := tx.Exec(`
+			INSERT INTO bans (provider, provider_uid, user_id, until, permanent, count, reason, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+			ON CONFLICT(provider, provider_uid) DO UPDATE SET
+				user_id = excluded.user_id,
+				until = excluded.until,
+				permanent = excluded.permanent,
+				count = bans.count + 1,
+				reason = excluded.reason,
+				updated_at = excluded.updated_at`,
+			id.Provider, id.UID, userID, until, permanent, reason, nowMs, nowMs); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // BanCount — сколько раз этого человека наказывали (включая снятые). Модератор
 // видит это число в посте жалобы и решает, мьютить или банить насовсем.
-func (s *Store) BanCount(tgID int64) (int, error) {
-	var n int
-	err := s.db.QueryRow(`SELECT count FROM bans WHERE tg_id = ?`, tgID).Scan(&n)
+//
+// Ищем и по личностям, и по user_id — оба варианта нужны:
+//   - по личностям, потому что после /block аккаунт удаляется, а вернувшийся
+//     регистрируется заново и получает НОВЫЙ внутренний id; счётчик обязан
+//     подтянуться к нему, иначе рецидивист выглядит новичком;
+//   - по user_id, потому что после удаления аккаунта личностей уже нет, и
+//     это единственная зацепка (её же использует Unban).
+//
+// MAX: наказания пишутся на все личности сразу, значения совпадают.
+func (s *Store) BanCount(userID int64) (int, error) {
+	var n sql.NullInt64
+	err := s.db.QueryRow(`
+		SELECT MAX(count) FROM bans
+		WHERE user_id = ?
+		   OR (provider, provider_uid) IN (SELECT provider, provider_uid FROM identities WHERE user_id = ?)`,
+		userID, userID).Scan(&n)
 	if err == sql.ErrNoRows {
 		return 0, nil
 	}
-	return n, err
+	return int(n.Int64), err
 }
 
-// BanStatus — активно ли наказание. Временный бан истекает сам: сравниваем until
-// с текущим временем, поэтому фоновая уборка не нужна. permanent игнорирует until.
-func (s *Store) BanStatus(tgID int64) (banned bool, until time.Time, permanent bool, reason string, err error) {
+// BanStatusForIdentity — активно ли наказание у конкретной личности провайдера.
+// Проверяется при входе, ДО того как мы нашли или создали пользователя: именно
+// так постоянный бан переживает удаление аккаунта.
+func (s *Store) BanStatusForIdentity(provider, uid string) (banned bool, until time.Time, permanent bool, reason string, err error) {
 	var untilMs int64
 	var perm int
-	err = s.db.QueryRow(`SELECT until, permanent, reason FROM bans WHERE tg_id = ?`, tgID).
-		Scan(&untilMs, &perm, &reason)
+	err = s.db.QueryRow(`SELECT until, permanent, reason FROM bans WHERE provider = ? AND provider_uid = ?`,
+		provider, uid).Scan(&untilMs, &perm, &reason)
 	if err == sql.ErrNoRows {
 		return false, time.Time{}, false, "", nil
 	}
 	if err != nil {
 		return false, time.Time{}, false, "", err
 	}
-	if perm == 1 {
+	return banActive(untilMs, perm, reason)
+}
+
+// BanStatus — активно ли наказание у пользователя (по всем его способам входа:
+// хватает наказания на любом). Временный бан истекает сам — сравниваем until с
+// текущим временем, поэтому фоновая уборка не нужна.
+func (s *Store) BanStatus(userID int64) (banned bool, until time.Time, permanent bool, reason string, err error) {
+	var untilMs, perm sql.NullInt64
+	var reasonNull sql.NullString
+	// Строк может не быть вовсе — тогда агрегаты придут NULL, а не ErrNoRows.
+	// reason берём у самого свежего наказания (ORDER BY updated_at внутри), но
+	// при одном пользователе они и так пишутся одинаковыми.
+	err = s.db.QueryRow(`
+		SELECT MAX(b.until), MAX(b.permanent),
+		       (SELECT b2.reason FROM bans b2 JOIN identities i2 ON i2.provider = b2.provider AND i2.provider_uid = b2.provider_uid
+		        WHERE i2.user_id = ? ORDER BY b2.updated_at DESC LIMIT 1)
+		FROM bans b JOIN identities i ON i.provider = b.provider AND i.provider_uid = b.provider_uid
+		WHERE i.user_id = ?`, userID, userID).Scan(&untilMs, &perm, &reasonNull)
+	if err == sql.ErrNoRows {
+		return false, time.Time{}, false, "", nil
+	}
+	if err != nil {
+		return false, time.Time{}, false, "", err
+	}
+	return banActive(untilMs.Int64, int(perm.Int64), reasonNull.String)
+}
+
+// banActive — общее правило: permanent игнорирует until, временный активен пока
+// until в будущем. Одно место, чтобы толкования не разъезжались.
+func banActive(untilMs int64, permanent int, reason string) (bool, time.Time, bool, string, error) {
+	if permanent == 1 {
 		return true, time.Time{}, true, reason, nil
 	}
 	if untilMs > time.Now().UnixMilli() {
@@ -479,10 +755,18 @@ func BanMessage(until time.Time, permanent bool, reason string) string {
 // Unban снимает наказание вручную (ошиблись, разобрались). Историю нарушений
 // (count) НЕ сбрасывает: модератор должен видеть, сколько раз человек попадался,
 // даже если прошлые наказания снимали. Возвращает false, если наказания нет.
-func (s *Store) Unban(tgID int64) (bool, error) {
+//
+// Ищет и по user_id, и по личностям — по тем же причинам, что BanCount: после
+// /block аккаунта уже нет (остаётся только user_id в самой записи), а после
+// повторной регистрации у человека новый внутренний id (связь остаётся только
+// через личность).
+func (s *Store) Unban(userID int64) (bool, error) {
 	res, err := s.db.Exec(`
 		UPDATE bans SET until = 0, permanent = 0, updated_at = ?
-		WHERE tg_id = ? AND (until > 0 OR permanent = 1)`, time.Now().UnixMilli(), tgID)
+		WHERE (until > 0 OR permanent = 1)
+		  AND (user_id = ?
+		       OR (provider, provider_uid) IN (SELECT provider, provider_uid FROM identities WHERE user_id = ?))`,
+		time.Now().UnixMilli(), userID, userID)
 	if err != nil {
 		return false, err
 	}
@@ -490,40 +774,21 @@ func (s *Store) Unban(tgID int64) (bool, error) {
 	return n > 0, err
 }
 
-// DeleteMessage удаляет одно сообщение (реакция на жалобу). Возвращает false,
-// если сообщения уже нет — оно могло уйти по TTL или быть удалено раньше.
-// Жалобы на него остаются: в них хранится копия текста (см. ReportMessage).
-func (s *Store) DeleteMessage(id int64) (bool, error) {
-	res, err := s.db.Exec(`DELETE FROM messages WHERE id = ?`, id)
-	if err != nil {
-		return false, err
-	}
-	n, err := res.RowsAffected()
-	return n > 0, err
-}
-
-// DeleteUserMessages удаляет все сообщения пользователя и возвращает их число —
-// когда одного сообщения мало (спамер засыпал канал).
-func (s *Store) DeleteUserMessages(tgID int64) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM messages WHERE tg_id = ?`, tgID)
-	if err != nil {
-		return 0, err
-	}
-	return res.RowsAffected()
-}
+// ─── пуши и каналы ───
 
 // SaveDeviceToken привязывает FCM-токен устройства к пользователю (upsert по
 // токену). Ключ — сам токен: при переустановке или входе другим аккаунтом FCM
-// отдаёт тот же токен, и он должен «переехать» к новому tg_id, а не задвоиться.
-func (s *Store) SaveDeviceToken(tgID int64, fcmToken, platform string) error {
+// отдаёт тот же токен, и он должен «переехать» к новому пользователю, а не
+// задвоиться.
+func (s *Store) SaveDeviceToken(userID int64, fcmToken, platform string) error {
 	_, err := s.db.Exec(`
-		INSERT INTO device_tokens (fcm_token, tg_id, platform, updated_at)
+		INSERT INTO device_tokens (fcm_token, user_id, platform, updated_at)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(fcm_token) DO UPDATE SET
-			tg_id = excluded.tg_id,
+			user_id = excluded.user_id,
 			platform = excluded.platform,
 			updated_at = excluded.updated_at`,
-		fcmToken, tgID, platform, time.Now().UnixMilli())
+		fcmToken, userID, platform, time.Now().UnixMilli())
 	return err
 }
 
@@ -542,20 +807,20 @@ func (s *Store) DeleteDeviceTokens(fcmTokens []string) error {
 // SetUserChannels заменяет набор каналов пользователя (вызывается на locate).
 // Полная замена, а не добавление: при переезде старые каналы должны исчезнуть,
 // иначе пуши продолжат приходить из района, откуда пользователь уехал.
-func (s *Store) SetUserChannels(tgID int64, channels []string) error {
+func (s *Store) SetUserChannels(userID int64, channels []string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM user_channels WHERE tg_id = ?`, tgID); err != nil {
+	if _, err := tx.Exec(`DELETE FROM user_channels WHERE user_id = ?`, userID); err != nil {
 		return err
 	}
 	now := time.Now().UnixMilli()
 	for _, ch := range channels {
 		if _, err := tx.Exec(`
-			INSERT OR REPLACE INTO user_channels (tg_id, channel, updated_at) VALUES (?, ?, ?)`,
-			tgID, ch, now); err != nil {
+			INSERT OR REPLACE INTO user_channels (user_id, channel, updated_at) VALUES (?, ?, ?)`,
+			userID, ch, now); err != nil {
 			return err
 		}
 	}
@@ -597,13 +862,13 @@ func (s *Store) ChannelSubscribers(channels []string) (map[string]int, error) {
 
 // PushTargets отдаёт токены устройств, которым надо доставить пуш о новом
 // сообщении в канале: все устройства пользователей, у кого этот канал в наборе,
-// **кроме** автора сообщения (exceptTgID) — иначе человек получает уведомление о
-// своём же сообщении, ради чего адресная модель и вводилась.
-func (s *Store) PushTargets(channel string, exceptTgID int64) ([]string, error) {
+// **кроме** автора сообщения (exceptUserID) — иначе человек получает уведомление
+// о своём же сообщении, ради чего адресная модель и вводилась.
+func (s *Store) PushTargets(channel string, exceptUserID int64) ([]string, error) {
 	rows, err := s.db.Query(`
 		SELECT d.fcm_token
-		FROM user_channels uc JOIN device_tokens d ON d.tg_id = uc.tg_id
-		WHERE uc.channel = ? AND uc.tg_id != ?`, channel, exceptTgID)
+		FROM user_channels uc JOIN device_tokens d ON d.user_id = uc.user_id
+		WHERE uc.channel = ? AND uc.user_id != ?`, channel, exceptUserID)
 	if err != nil {
 		return nil, err
 	}
@@ -617,37 +882,4 @@ func (s *Store) PushTargets(channel string, exceptTgID int64) ([]string, error) 
 		tokens = append(tokens, t)
 	}
 	return tokens, rows.Err()
-}
-
-// UserBySession возвращает пользователя по токену сессии (nil — сессии нет)
-// и отмечает сессию как живую.
-func (s *Store) UserBySession(token string) (*User, error) {
-	var u User
-	var acceptedAt, banUntil int64
-	var banPermanent int
-	// LEFT JOIN bans: наказание живёт отдельно от аккаунта (см. схему), а
-	// временное истекает само — поэтому сравниваем until с текущим временем
-	// здесь же, а не полагаемся на фоновую уборку.
-	err := s.db.QueryRow(`
-		SELECT u.tg_id, u.tg_username, u.full_name, u.avatar_url, u.rules_accepted_at,
-		       COALESCE(b.until, 0), COALESCE(b.permanent, 0)
-		FROM sessions s
-		JOIN users u ON u.tg_id = s.tg_id
-		LEFT JOIN bans b ON b.tg_id = u.tg_id
-		WHERE s.token = ?`, token).
-		Scan(&u.TgID, &u.TgUsername, &u.FullName, &u.AvatarURL, &acceptedAt,
-			&banUntil, &banPermanent)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	u.RulesAccepted = acceptedAt > 0
-	u.BanPermanent = banPermanent == 1
-	u.Banned = u.BanPermanent || banUntil > time.Now().UnixMilli()
-	now := time.Now().UnixMilli()
-	s.db.Exec(`UPDATE sessions SET seen_at = ? WHERE token = ?`, now, token)
-	s.db.Exec(`UPDATE users SET seen_at = ? WHERE tg_id = ?`, now, u.TgID)
-	return &u, nil
 }

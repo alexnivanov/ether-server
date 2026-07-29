@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"sort"
+	"strings"
 
 	sentryhttp "github.com/getsentry/sentry-go/http"
 	"github.com/gorilla/websocket"
@@ -79,10 +81,25 @@ func main() {
 	// в потолок уже на десятках активных пользователей.
 	var geo Geocoder = newCachedGeocoder(nominatim, geocodeCacheTTL, geocodeCacheMax)
 
-	// вход через нативный Telegram Login SDK: сервер проверяет OIDC ID-token по
-	// публичным ключам Telegram (JWKS тянется лениво при первом входе), поэтому
-	// старт не зависит от доступности Telegram
-	tg := NewTelegramAuth(cfg.TelegramClientID, tgJWKSURL)
+	// Провайдеры входа: сервер проверяет ID-token по публичным ключам провайдера
+	// (JWKS тянется лениво при первом входе), поэтому старт не зависит от их
+	// доступности. Незаданный провайдер эндпоинта не получает — см. registerREST.
+	verifiers := map[string]*Verifier{}
+	if cfg.TelegramClientID != "" {
+		verifiers[ProviderTelegram] = NewTelegramVerifier(cfg.TelegramClientID, tgJWKSURL)
+	}
+	if len(cfg.AppleClientIDs) > 0 {
+		verifiers[ProviderApple] = NewAppleVerifier(cfg.AppleClientIDs)
+	}
+	if len(cfg.GoogleClientIDs) > 0 {
+		verifiers[ProviderGoogle] = NewGoogleVerifier(cfg.GoogleClientIDs)
+	}
+	providers := make([]string, 0, len(verifiers))
+	for p := range verifiers {
+		providers = append(providers, p)
+	}
+	sort.Strings(providers)
+	slog.Info("auth providers", "enabled", strings.Join(providers, ","))
 
 	// FCM-пуши опциональны: без creds в конфиге push == nil и publish работает
 	// как раньше. Ошибка чтения creds не валит старт — просто без пушей.
@@ -104,7 +121,7 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	registerREST(mux, store, tg, notify)
+	registerREST(mux, store, verifiers, notify)
 	// лимитер один на процесс: частота считается на аккаунт, а не на соединение
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, NewRateLimiter()))
 
@@ -169,10 +186,11 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher, limiter *Rate
 		}
 		if authedUser != nil {
 			c.setAuthed(
-				authedUser.TgID,
+				authedUser.ID,
 				authedUser.FullName,
 				authedUser.TgUsername,
 				authedUser.AvatarURL,
+				authedUser.CreatedAt,
 			)
 		}
 		go c.writePump()

@@ -30,10 +30,8 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	if err := store.CreateUser(User{TgID: 55, FullName: "flooder"}); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
-	token, err := store.NewSession(55)
+	userID := mkTgUser(t, store, "55", "", "flooder")
+	token, err := store.NewSession(userID)
 	if err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -56,7 +54,9 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 		t.Fatalf("located: %v", err)
 	}
 
-	base := messageLimitFor(0) // рейтинга ещё нет — базовый тир
+	// аккаунт только что создан — работает узкий тир для свежих (см.
+	// newAccountWindow): именно с ним и живёт настоящий новый пользователь
+	base := messageLimitFor(0, 0)
 	for i := 0; i < base.capacity; i++ {
 		if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "поток"})); err != nil {
 			t.Fatalf("publish %d: %v", i+1, err)

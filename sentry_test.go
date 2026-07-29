@@ -51,8 +51,8 @@ func TestSentryHandlerCapturesOnlyErrors(t *testing.T) {
 
 	// атрибуты из With() тоже должны попадать в событие — иначе теряется
 	// контекст, добавленный на уровне подсистемы
-	log.With("tg_id", int64(42)).Error("ban check", "err", "boom")
-	if len(got) != 2 || got[1].attrs["tg_id"] != "42" {
+	log.With("user_id", int64(42)).Error("ban check", "err", "boom")
+	if len(got) != 2 || got[1].attrs["user_id"] != "42" {
 		t.Fatalf("атрибуты из With() потеряны: %+v", got)
 	}
 

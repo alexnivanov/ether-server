@@ -9,7 +9,7 @@ import (
 )
 
 // REST — синхронный запрос-ответ без побочных эффектов на живом WS-соединении:
-// вход через Telegram Login SDK (auth), resume, logout, удаление аккаунта,
+// вход через провайдера (auth), resume, logout, удаление аккаунта,
 // accept_rules, жалобы, history. На WebSocket остались только locate и
 // publish/message — см. client.go и ether-meta/PROTOCOL.md.
 //
@@ -23,9 +23,14 @@ import (
 
 // notify может быть nil — служебные уведомления в Telegram выключены (см.
 // notify.go); на приём жалоб и регистрацию это не влияет.
-func registerREST(mux *http.ServeMux, store *Store, tg *TelegramAuth, notify *Notifier) {
+// verifiers — проверяльщики ID-token по провайдерам (ключ — ProviderTelegram и
+// т.д.). Незаданный провайдер эндпоинта не получает: пустой конфиг не должен
+// притворяться работающим входом.
+func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
-	mux.HandleFunc("/auth/telegram", handleAuthTelegram(store, tg, notify))
+	for provider, v := range verifiers {
+		mux.HandleFunc("/auth/"+provider, handleAuth(store, provider, v, notify))
+	}
 	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
 	mux.HandleFunc("/push/register", handlePushRegister(store))
@@ -58,86 +63,91 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
 			return
 		}
-		if err := store.DeleteUser(u.TgID); err != nil {
-			slog.Error("delete_account", "err", err, "tg_id", u.TgID)
+		if err := store.DeleteUser(u.ID); err != nil {
+			slog.Error("delete_account", "err", err, "user_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось удалить аккаунт")
 			return
 		}
-		slog.Info("account deleted", "tg_id", u.TgID)
+		slog.Info("account deleted", "user_id", u.ID)
 		writeJSON(w, http.StatusOK, struct{}{})
 	}
 }
 
-// handleAuthTelegram — POST /auth/telegram {id_token} → 200 authed (user +
-// свежий token сессии + rules_accepted) | 401 bad_auth (JWT не прошёл) | 400
-// bad_data. id_token — OIDC-токен от нативного Telegram Login SDK; сервер
-// проверяет его подпись по публичным ключам Telegram (см. telegram.go), сети к
-// api.telegram.org не нужно.
-func handleAuthTelegram(store *Store, tg *TelegramAuth, notify *Notifier) http.HandlerFunc {
+// handleAuth — POST /auth/{telegram|apple|google} {id_token, name?} → 200 authed
+// (user + свежий token сессии + rules_accepted) | 401 bad_auth (токен не прошёл
+// проверку) | 403 banned | 400 bad_data. id_token проверяется по публичным ключам
+// провайдера (см. oidc.go), сети к самому провайдеру для этого не нужно.
+//
+// Один хендлер на всех: после проверки токена провайдер перестаёт иметь значение
+// — дальше аккаунт живёт под внутренним id (см. identities в store.go).
+func handleAuth(store *Store, provider string, v *Verifier, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
 			return
 		}
-		var d TelegramAuthRequest
+		var d AuthRequest
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.IDToken == "" {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "missing id_token")
 			return
 		}
-		u, err := tg.Verify(d.IDToken)
+		pu, err := v.Verify(d.IDToken, d.Name)
 		if err != nil {
-			slog.Warn("auth verify failed", "err", err)
-			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "Проверка входа Telegram не прошла")
+			slog.Warn("auth verify failed", "err", err, "provider", provider)
+			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "Проверка входа не прошла")
 			return
 		}
-		// повторный вход обновляет профиль; если пользователя ещё нет — регистрация
-		user := User{TgID: u.ID, TgUsername: u.Username, FullName: u.Name, AvatarURL: u.AvatarURL}
-		found, accepted, err := store.UpdateUser(user)
+		// Бан проверяем ДО создания аккаунта и по личности у провайдера: именно
+		// так постоянный бан переживает удаление аккаунта — иначе нарушитель
+		// удалил бы аккаунт и завёл новый тем же Apple ID. Вход закрываем только
+		// при ПОСТОЯННОМ бане: временный — это мьют, человек продолжает читать и
+		// заходить, отбивается лишь отправка.
+		_, until, permanent, reason, err := store.BanStatusForIdentity(pu.Provider, pu.UID)
 		if err != nil {
-			slog.Error("auth update user", "err", err, "tg_id", u.ID)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось сохранить пользователя")
-			return
-		}
-		if !found {
-			if err := store.CreateUser(user); err != nil {
-				slog.Error("auth create user", "err", err, "tg_id", u.ID)
-				writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось сохранить пользователя")
-				return
-			}
-			slog.Info("account created", "tg_id", u.ID)
-			if notify != nil {
-				go notify.AccountCreated(user)
-			}
-		}
-		// Вход запрещаем только при ПОСТОЯННОМ бане: временный — это мьют,
-		// человек продолжает читать и заходить, отбивается лишь отправка.
-		// Проверка живёт по Telegram id и переживает удаление аккаунта, поэтому
-		// вернувшийся «с чистого листа» всё равно отбивается.
-		_, until, permanent, reason, err := store.BanStatus(u.ID)
-		if err != nil {
-			slog.Error("auth ban check", "err", err, "tg_id", u.ID)
+			slog.Error("auth ban check", "err", err, "provider", provider)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось проверить аккаунт")
 			return
 		}
 		if permanent {
-			slog.Info("banned login attempt", "tg_id", u.ID)
+			slog.Info("banned login attempt", "provider", provider)
 			writeRESTError(w, http.StatusForbidden, "banned", BanMessage(until, permanent, reason))
 			return
 		}
-		token, err := store.NewSession(u.ID)
+		// повторный вход обновляет профиль; если такой личности ещё нет — регистрация
+		userID, created, accepted, err := store.UpsertByIdentity(*pu)
 		if err != nil {
-			slog.Error("auth new session", "err", err, "tg_id", u.ID)
+			slog.Error("auth upsert user", "err", err, "provider", provider)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось сохранить пользователя")
+			return
+		}
+		// профиль читаем из БД, а не из токена: у Apple второй вход приходит без
+		// имени и без фото, а показать надо то, что сохранено с первого раза
+		u, err := store.UserByID(userID)
+		if err != nil || u == nil {
+			slog.Error("auth load user", "err", err, "user_id", userID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось прочитать профиль")
+			return
+		}
+		if created {
+			slog.Info("account created", "user_id", userID, "provider", provider)
+			if notify != nil {
+				go notify.AccountCreated(*u, provider)
+			}
+		}
+		token, err := store.NewSession(userID)
+		if err != nil {
+			slog.Error("auth new session", "err", err, "user_id", userID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось создать сессию")
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
 			User: AuthedUser{
 				ID:        u.ID,
-				Username:  u.Username,
-				Name:      u.Name,
+				Username:  u.TgUsername,
+				Name:      u.FullName,
 				AvatarURL: u.AvatarURL,
 			},
 			Token:         token,
@@ -245,11 +255,11 @@ func handlePushRegister(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
 			return
 		}
-		if err := store.SaveDeviceToken(u.TgID, d.FCMToken, d.Platform); err != nil {
-			slog.Error("push_register", "err", err, "tg_id", u.TgID)
+		if err := store.SaveDeviceToken(u.ID, d.FCMToken, d.Platform); err != nil {
+			slog.Error("push_register", "err", err, "user_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось включить уведомления")
 			return
 		}
@@ -315,12 +325,12 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
 			return
 		}
-		rep, err := store.ReportMessage(d.MessageID, u.TgID, d.Reason)
+		rep, err := store.ReportMessage(d.MessageID, u.ID, d.Reason)
 		if err != nil {
-			slog.Error("report", "err", err, "message_id", d.MessageID, "tg_id", u.TgID)
+			slog.Error("report", "err", err, "message_id", d.MessageID, "user_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось отправить жалобу")
 			return
 		}
@@ -329,7 +339,7 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 			return
 		}
 		// лог — вторая точка входа модерации (первая — канал в Telegram)
-		slog.Info("message reported", "message_id", d.MessageID, "reason", d.Reason, "reporter", u.TgID)
+		slog.Info("message reported", "message_id", d.MessageID, "reason", d.Reason, "reporter", u.ID)
 		// только новые жалобы: повторный тап не должен дублировать пост в канале
 		if notify != nil && rep.Fresh {
 			go notify.ReportToChannel(rep, u)
@@ -358,17 +368,17 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
 			return
 		}
-		if err := store.AcceptRules(u.TgID); err != nil {
-			slog.Error("accept_rules", "err", err, "tg_id", u.TgID)
+		if err := store.AcceptRules(u.ID); err != nil {
+			slog.Error("accept_rules", "err", err, "user_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "failed to save rules acceptance")
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
 			User: AuthedUser{
-				ID:        u.TgID,
+				ID:        u.ID,
 				Username:  u.TgUsername,
 				Name:      u.FullName,
 				AvatarURL: u.AvatarURL,
@@ -421,12 +431,12 @@ func handleResume(store *Store) http.HandlerFunc {
 			return
 		}
 		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди через Telegram заново")
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
 			User: AuthedUser{
-				ID:        u.TgID,
+				ID:        u.ID,
 				Username:  u.TgUsername,
 				Name:      u.FullName,
 				AvatarURL: u.AvatarURL,

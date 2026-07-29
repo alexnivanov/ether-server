@@ -13,11 +13,17 @@ import (
 type Config struct {
 	// Адрес HTTP/WebSocket-сервера; пусто → ":8080".
 	Addr string `json:"addr"`
-	// Числовой client id приложения из @BotFather — audience OIDC ID-token'а
-	// нативного Telegram Login SDK. Обязателен: вход через Telegram —
-	// единственный механизм идентификации. Подпись токена сервер проверяет по
-	// публичным ключам Telegram (JWKS), секретный токен бота ему не нужен.
-	TelegramClientID string `json:"telegram_client_id"`
+	// Провайдеры входа (см. oidc.go). Каждый опционален по отдельности, но хотя
+	// бы один обязателен — иначе войти нечем. Подписи ID-token'ов сервер
+	// проверяет по публичным ключам провайдеров, никаких их секретов не нужно.
+	//
+	// TelegramClientID — числовой client id приложения из @BotFather.
+	// AppleClientIDs — bundle id приложения (нативный SIWA; обычно один).
+	// GoogleClientIDs — OAuth client id, под которые выписан токен: у Android,
+	// iOS и Web они разные, поэтому список.
+	TelegramClientID string   `json:"telegram_client_id"`
+	AppleClientIDs   []string `json:"apple_client_ids"`
+	GoogleClientIDs  []string `json:"google_client_ids"`
 	// Базовый URL Nominatim; пусто → публичный nominatim.openstreetmap.org
 	// (лимит 1 req/s, не для production — в prod сюда пойдёт свой инстанс).
 	NominatimURL string `json:"nominatim_url"`
@@ -41,7 +47,7 @@ type Config struct {
 	TelegramNotifyToken  string `json:"telegram_notify_token"`
 	TelegramNotifyChatID string `json:"telegram_notify_chat_id"`
 	// Sentry для ошибок и паник (опционально; пусто → выключен). См. sentry.go —
-	// там же про приватность: в события попадает tg_id, поэтому Sentry указан в
+	// там же про приватность: в события попадает внутренний id пользователя, поэтому Sentry указан в
 	// privacy policy как сторонний сервис.
 	SentryDSN string `json:"sentry_dsn"`
 }
@@ -55,8 +61,9 @@ func LoadConfig(path string) (*Config, error) {
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
-	if cfg.TelegramClientID == "" {
-		return nil, fmt.Errorf("%s: telegram_client_id не задан", path)
+	if cfg.TelegramClientID == "" && len(cfg.AppleClientIDs) == 0 && len(cfg.GoogleClientIDs) == 0 {
+		return nil, fmt.Errorf("%s: не задан ни один провайдер входа "+
+			"(telegram_client_id / apple_client_ids / google_client_ids)", path)
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"

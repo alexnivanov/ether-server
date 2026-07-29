@@ -34,10 +34,11 @@ type Client struct {
 	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
 	// дальше только читается (publish)
 	mu        sync.Mutex
-	userID    int64  // Telegram user id
-	fullName  string // отображаемое имя автора — в live-сообщения
-	username  string // @username — в live-сообщения для ссылки на профиль
-	avatarURL string // фото профиля — в live-сообщения автора
+	userID    int64     // внутренний id аккаунта
+	fullName  string    // отображаемое имя автора — в live-сообщения
+	username  string    // @username — в live-сообщения для ссылки на профиль
+	avatarURL string    // фото профиля — в live-сообщения автора
+	createdAt time.Time // когда аккаунт зарегистрирован — для лимита свежих
 	authed    bool
 }
 
@@ -47,21 +48,34 @@ func (c *Client) DisplayName() string {
 	return c.fullName
 }
 
-// author отдаёт данные автора для publish: tg id, имя, @username, аватар и
-// флаг «вход выполнен».
+// author отдаёт данные автора для publish: внутренний id, имя, @username,
+// аватар и флаг «вход выполнен».
 func (c *Client) author() (id int64, name, username, avatar string, authed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.userID, c.fullName, c.username, c.avatarURL, c.authed
 }
 
-func (c *Client) setAuthed(userID int64, fullName, username, avatarURL string) {
+// accountAge — сколько живёт аккаунт. Считается от сохранённой даты
+// регистрации, поэтому свежий аккаунт «дорастает» до обычного лимита прямо на
+// открытом соединении, без переподключения.
+func (c *Client) accountAge() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.createdAt.IsZero() {
+		return 0
+	}
+	return time.Since(c.createdAt)
+}
+
+func (c *Client) setAuthed(userID int64, fullName, username, avatarURL string, createdAt time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.userID = userID
 	c.fullName = fullName
 	c.username = username
 	c.avatarURL = avatarURL
+	c.createdAt = createdAt
 	c.authed = true
 }
 
@@ -107,7 +121,7 @@ func (c *Client) readPump() {
 			// подписчиков — иначе человек не увидел бы в счётчике себя.
 			if userID, _, _, _, authed := c.author(); authed {
 				if err := c.store.SetUserChannels(userID, ids); err != nil {
-					slog.Error("set user channels", "err", err, "tg_id", userID)
+					slog.Error("set user channels", "err", err, "user_id", userID)
 				}
 			}
 			// Число подписчиков заполняем ЗДЕСЬ, а не в геокодере: тот про
@@ -142,7 +156,7 @@ func (c *Client) readPump() {
 			// каждую публикацию — один SELECT к локальной SQLite; на нашем
 			// масштабе дешевле, чем индексировать соединения по пользователю.
 			if banned, until, permanent, reason, err := c.store.BanStatus(userID); err != nil {
-				slog.Error("ban check", "err", err, "tg_id", userID)
+				slog.Error("ban check", "err", err, "user_id", userID)
 			} else if banned {
 				c.sendError("banned", BanMessage(until, permanent, reason))
 				continue
@@ -151,14 +165,14 @@ func (c *Client) readPump() {
 			// базовый тир; когда появится рейтинг, сюда придёт его значение и
 			// лимит станет тирным без правок здесь (см. ratelimit.go).
 			if c.limiter != nil {
-				if ok, retry := c.limiter.Allow(userID, 0); !ok {
+				if ok, retry := c.limiter.Allow(userID, 0, c.accountAge()); !ok {
 					c.sendError("too_fast", fmt.Sprintf(
 						"Слишком часто — подожди %d с", int(retry.Seconds())+1))
 					continue
 				}
 			}
-			// в БД пишем только tg_id; имя/аватар для live берём из соединения,
-			// для истории — JOIN из users (см. store.History)
+			// в БД пишем только внутренний id автора; имя/аватар для live берём из
+			// соединения, для истории — JOIN из users (см. store.History)
 			m := MessageData{
 				Channel:   d.Channel,
 				SenderID:  userID,

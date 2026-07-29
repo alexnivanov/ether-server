@@ -1,6 +1,8 @@
 {
   "addr": ":8080",
-  "telegram_client_id": "<числовой client id приложения из @BotFather>",
+  "telegram_client_id": "<числовой client id приложения из @BotFather; пусто → вход через Telegram выключен>",
+  "apple_client_ids": ["<bundle id приложения, напр. net.nous.ether; пусто → Sign in with Apple выключен>"],
+  "google_client_ids": ["<OAuth client id Android>", "<OAuth client id iOS>"],
   "nominatim_url": "",
   "db": "",
   "fcm_project_id": "<id проекта Firebase, напр. ether-5f4b6; пусто → пуши выключены>",

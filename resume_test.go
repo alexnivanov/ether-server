@@ -35,10 +35,14 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 
 	hub := NewHub()
 	go hub.Run()
-	tg := NewTelegramAuth("test-client", "http://127.0.0.1:0/jwks")
+	// JWKS-адрес заведомо мёртвый: проверка токенов провайдера тут не нужна,
+	// тесты работают с уже выданными сессиями
+	verifiers := map[string]*Verifier{
+		ProviderTelegram: NewTelegramVerifier("test-client", "http://127.0.0.1:0/jwks"),
+	}
 
 	mux := http.NewServeMux()
-	registerREST(mux, store, tg, nil) // nil — без уведомлений модерации
+	registerREST(mux, store, verifiers, nil) // nil — без уведомлений модерации
 	// limiter=nil — без ограничения частоты: тесты публикуют подряд
 	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, nil))
 
@@ -69,10 +73,8 @@ func restPost(t *testing.T, url string, body any) (*http.Response, map[string]an
 func TestRESTSessionFlow(t *testing.T) {
 	srv, store := newTestServer(t)
 
-	if err := store.CreateUser(User{TgID: 7, TgUsername: "alex", FullName: "alex"}); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
-	token, err := store.NewSession(7)
+	userID := mkTgUser(t, store, "7", "alex", "alex")
+	token, err := store.NewSession(userID)
 	if err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -91,7 +93,7 @@ func TestRESTSessionFlow(t *testing.T) {
 	var authed AuthedData
 	raw, _ := json.Marshal(body)
 	mustUnmarshal(t, raw, &authed)
-	if authed.User.ID != 7 || authed.User.Name != "alex" || authed.Token != "" {
+	if authed.User.ID != userID || authed.User.Name != "alex" || authed.Token != "" {
 		t.Fatalf("resume: %+v, want token пустой (клиент его и так знает)", authed)
 	}
 	if authed.RulesAccepted {
@@ -188,10 +190,8 @@ func TestRESTSessionFlow(t *testing.T) {
 func TestWebSocketTokenAuth(t *testing.T) {
 	srv, store := newTestServer(t)
 
-	if err := store.CreateUser(User{TgID: 9, TgUsername: "bob", FullName: "bob"}); err != nil {
-		t.Fatalf("seed user: %v", err)
-	}
-	token, err := store.NewSession(9)
+	userID := mkTgUser(t, store, "9", "bob", "bob")
+	token, err := store.NewSession(userID)
 	if err != nil {
 		t.Fatalf("seed session: %v", err)
 	}
@@ -260,45 +260,44 @@ func TestPushRegistrationAndTargets(t *testing.T) {
 	srv, store := newTestServer(t)
 
 	type person struct {
-		tgID   int64
+		tgUID  string
+		id     int64
 		token  string
 		device string
 	}
-	people := []person{{tgID: 21, device: "dev-author"}, {tgID: 22, device: "dev-peer"}}
+	people := []person{{tgUID: "21", device: "dev-author"}, {tgUID: "22", device: "dev-peer"}}
 	for i, p := range people {
-		if err := store.CreateUser(User{TgID: p.tgID, FullName: fmt.Sprintf("u%d", p.tgID)}); err != nil {
-			t.Fatalf("seed user %d: %v", p.tgID, err)
-		}
-		tok, err := store.NewSession(p.tgID)
+		people[i].id = mkTgUser(t, store, p.tgUID, "", fmt.Sprintf("u%s", p.tgUID))
+		tok, err := store.NewSession(people[i].id)
 		if err != nil {
-			t.Fatalf("seed session %d: %v", p.tgID, err)
+			t.Fatalf("seed session %s: %v", p.tgUID, err)
 		}
 		people[i].token = tok
 
 		resp, body := restPost(t, srv.URL+"/push/register",
 			PushTokenData{Token: tok, FCMToken: p.device, Platform: "android"})
 		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("push/register %d = %d %v, want 200", p.tgID, resp.StatusCode, body)
+			t.Fatalf("push/register %s = %d %v, want 200", p.tgUID, resp.StatusCode, body)
 		}
 
 		// каналы запоминаются на locate — по ним потом считаются получатели
 		wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + tok
 		ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 		if err != nil {
-			t.Fatalf("dial ws %d: %v", p.tgID, err)
+			t.Fatalf("dial ws %s: %v", p.tgUID, err)
 		}
 		ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		if err := ws.WriteJSON(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})); err != nil {
-			t.Fatalf("locate %d: %v", p.tgID, err)
+			t.Fatalf("locate %s: %v", p.tgUID, err)
 		}
 		var located Envelope
 		if err := ws.ReadJSON(&located); err != nil {
-			t.Fatalf("read located %d: %v", p.tgID, err)
+			t.Fatalf("read located %s: %v", p.tgUID, err)
 		}
 		var loc LocatedData
 		mustUnmarshal(t, located.Data, &loc)
 		if len(loc.Channels) == 0 {
-			t.Fatalf("locate %d: пустой набор каналов", p.tgID)
+			t.Fatalf("locate %s: пустой набор каналов", p.tgUID)
 		}
 		ws.Close()
 	}
@@ -308,7 +307,7 @@ func TestPushRegistrationAndTargets(t *testing.T) {
 	target := chans[0].ID
 
 	// автор исключён, сосед получает — суть фикса
-	got, err := store.PushTargets(target, people[0].tgID)
+	got, err := store.PushTargets(target, people[0].id)
 	if err != nil {
 		t.Fatalf("targets: %v", err)
 	}
@@ -321,7 +320,7 @@ func TestPushRegistrationAndTargets(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("push/unregister = %d %v, want 200", resp.StatusCode, body)
 	}
-	if got, err := store.PushTargets(target, people[0].tgID); err != nil || len(got) != 0 {
+	if got, err := store.PushTargets(target, people[0].id); err != nil || len(got) != 0 {
 		t.Fatalf("targets после unregister = %v err=%v, want пусто", got, err)
 	}
 }

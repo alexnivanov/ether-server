@@ -44,7 +44,7 @@ func newFakeNotifier() (*Notifier, chan map[string]any) {
 func TestNotifierAccountCreated(t *testing.T) {
 	n, sent := newFakeNotifier()
 
-	n.AccountCreated(User{TgID: 777, TgUsername: "alex_tg", FullName: "Alex <b>"})
+	n.AccountCreated(User{ID: 777, TgUsername: "alex_tg", FullName: "Alex <b>"}, ProviderTelegram)
 
 	got := <-sent
 	if !strings.Contains(got["__url"].(string), "/botbot-token/sendMessage") {
@@ -54,7 +54,7 @@ func TestNotifierAccountCreated(t *testing.T) {
 		t.Errorf("payload = %+v", got)
 	}
 	text, _ := got["text"].(string)
-	for _, want := range []string{"Новый пользователь", "@alex_tg", "777"} {
+	for _, want := range []string{"Новый пользователь", "@alex_tg", "777", "telegram"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("text %q не содержит %q", text, want)
 		}
@@ -71,7 +71,7 @@ func TestNotifierAccountCreated(t *testing.T) {
 // без имени и @username уведомление всё равно осмысленно
 func TestNotifierAccountCreatedNoName(t *testing.T) {
 	n, sent := newFakeNotifier()
-	n.AccountCreated(User{TgID: 42})
+	n.AccountCreated(User{ID: 42}, ProviderApple)
 	text := (<-sent)["text"].(string)
 	if !strings.Contains(text, "без имени") || !strings.Contains(text, "42") {
 		t.Errorf("text = %q", text)

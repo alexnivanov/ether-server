@@ -26,11 +26,29 @@ type messageLimit struct {
 	refill   time.Duration // сколько ждать восстановления одного сообщения
 }
 
-// messageLimitFor выбирает тир по репутации. Тиры **поощряющие**: плюсы
-// поднимают лимит выше базового, минусы возвращают к узкому дну, но не затыкают
-// совсем — иначе механика становится оружием (в квартальном канале на десяток
-// человек несколько минусов закопали бы новичка).
-func messageLimitFor(rating int) messageLimit {
+// newAccountWindow — сколько аккаунт считается свежим. Полчаса: за это время
+// живой человек успевает освоиться, а спамеру приходится ждать столько же с
+// каждого нового аккаунта.
+const newAccountWindow = 30 * time.Minute
+
+// messageLimitFor выбирает тир по репутации и возрасту аккаунта. Тиры
+// **поощряющие**: плюсы поднимают лимит выше базового, минусы возвращают к
+// узкому дну, но не затыкают совсем — иначе механика становится оружием (в
+// квартальном канале на десяток человек несколько минусов закопали бы новичка).
+//
+// Отдельный тир для свежих аккаунтов — это ответ на то, что личность у любого
+// провайдера стоит дёшево: Telegram-аккаунт покупается за центы, Apple ID
+// заводится вручную. Раз цену личности поднять нельзя, поднимаем цену времени —
+// ферма одноразовых аккаунтов перестаёт быть удобным инструментом, потому что с
+// каждого можно выдать лишь несколько сообщений. На живого новичка это влияет
+// слабо: всплеск в 3 сообщения подряд остаётся.
+//
+// Возраст важнее репутации: заслуженный тир получает тот, кто уже пробыл в
+// Эфире, — иначе схема обходилась бы накруткой плюсов с тех же свежих аккаунтов.
+func messageLimitFor(rating int, accountAge time.Duration) messageLimit {
+	if accountAge < newAccountWindow {
+		return messageLimit{capacity: 3, refill: 10 * time.Second} // 6/мин
+	}
 	switch {
 	case rating < 0:
 		return messageLimit{capacity: 2, refill: 10 * time.Second} // 6/мин
@@ -51,7 +69,7 @@ type bucket struct {
 	last   time.Time
 }
 
-// RateLimiter — потокобезопасные бакеты по tg_id. Дёргается из readPump каждого
+// RateLimiter — потокобезопасные бакеты по внутреннему id пользователя. Дёргается из readPump каждого
 // соединения, поэтому под мьютексом.
 type RateLimiter struct {
 	mu      sync.Mutex
@@ -64,20 +82,21 @@ func NewRateLimiter() *RateLimiter {
 }
 
 // Allow списывает одно сообщение у пользователя. Возвращает false и время до
-// следующей возможности, если лимит исчерпан. rating — репутация (пока всегда 0).
-func (r *RateLimiter) Allow(tgID int64, rating int) (ok bool, retryAfter time.Duration) {
-	lim := messageLimitFor(rating)
+// следующей возможности, если лимит исчерпан. rating — репутация (пока всегда
+// 0), accountAge — сколько живёт аккаунт (свежим тир уже).
+func (r *RateLimiter) Allow(userID int64, rating int, accountAge time.Duration) (ok bool, retryAfter time.Duration) {
+	lim := messageLimitFor(rating, accountAge)
 	now := r.now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	b := r.buckets[tgID]
+	b := r.buckets[userID]
 	if b == nil {
 		// новый пользователь начинает с полного бакета: первое сообщение не
 		// должно ждать
 		b = &bucket{tokens: float64(lim.capacity), last: now}
-		r.buckets[tgID] = b
+		r.buckets[userID] = b
 	} else {
 		// доливаем за прошедшее время; кэп — capacity текущего тира (репутация
 		// могла измениться между сообщениями)

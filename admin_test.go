@@ -21,11 +21,10 @@ func newAdminForTest(t *testing.T) (*AdminBot, *Store) {
 
 func TestAdminCommands(t *testing.T) {
 	a, store := newAdminForTest(t)
-	const tgID = 42
-	if err := store.CreateUser(User{TgID: tgID, FullName: "Нарушитель"}); err != nil {
-		t.Fatalf("create: %v", err)
-	}
-	msgID, err := store.SaveMessage("RU", tgID, "гадость", time.Now().UnixMilli())
+	// команды модерации принимают ВНУТРЕННИЙ id (он же в посте жалобы);
+	// Telegram id модератор не видит вовсе
+	userID := mkTgUser(t, store, "9000042", "", "Нарушитель")
+	msgID, err := store.SaveMessage("RU", userID, "гадость", time.Now().UnixMilli())
 	if err != nil {
 		t.Fatalf("save message: %v", err)
 	}
@@ -64,14 +63,14 @@ func TestAdminCommands(t *testing.T) {
 	}
 
 	// /ban с причиной и с именем бота в команде (как в группах): мьют на сутки
-	reply = a.execute("/ban@ether_app_bot 42 реклама в квартале")
+	reply = a.execute("/ban@ether_app_bot " + itoa(userID) + " реклама в квартале")
 	if !strings.Contains(reply, "сутки") {
 		t.Fatalf("/ban = %q", reply)
 	}
 	if !strings.Contains(reply, "Нарушений всего: <b>1</b>") {
 		t.Fatalf("/ban не показал счётчик нарушений: %q", reply)
 	}
-	banned, _, permanent, reason, _ := store.BanStatus(tgID)
+	banned, _, permanent, reason, _ := store.BanStatus(userID)
 	if !banned || permanent {
 		t.Fatalf("после /ban: banned=%v permanent=%v", banned, permanent)
 	}
@@ -80,48 +79,49 @@ func TestAdminCommands(t *testing.T) {
 	}
 
 	// повторный /ban НЕ эскалирует сам: снова мьют, только счётчик растёт
-	reply = a.execute("/ban 42")
+	reply = a.execute("/ban " + itoa(userID))
 	if strings.Contains(reply, "навсегда") {
 		t.Fatalf("повторный /ban эскалировал автоматически: %q", reply)
 	}
 	if !strings.Contains(reply, "Нарушений всего: <b>2</b>") {
 		t.Fatalf("счётчик не вырос: %q", reply)
 	}
-	if _, _, permanent, _, _ := store.BanStatus(tgID); permanent {
+	if _, _, permanent, _, _ := store.BanStatus(userID); permanent {
 		t.Fatal("повторный /ban поставил постоянный бан — эскалации быть не должно")
 	}
 
 	// снятие наказания
-	if reply := a.execute("/unban 42"); !strings.Contains(reply, "снято") {
+	if reply := a.execute("/unban " + itoa(userID)); !strings.Contains(reply, "снято") {
 		t.Fatalf("/unban = %q", reply)
 	}
 
 	// постоянный бан — только явной командой
-	reply = a.execute("/block 42 спам")
+	reply = a.execute("/block " + itoa(userID) + " спам")
 	if !strings.Contains(reply, "навсегда") {
 		t.Fatalf("/block = %q", reply)
 	}
 	var users int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM users WHERE tg_id = ?`, tgID).Scan(&users); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, userID).Scan(&users); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if users != 0 {
-		t.Fatal("аккаунт не удалён при повторном /ban")
+		t.Fatal("аккаунт не удалён при /block")
+	}
+	// команда по удалённому аккаунту отвечает по-человечески, а не «смотри логи»
+	if reply := a.execute("/ban " + itoa(userID)); !strings.Contains(reply, "уже удалён") {
+		t.Fatalf("/ban удалённого = %q", reply)
 	}
 }
 
 func TestAdminPurge(t *testing.T) {
 	a, store := newAdminForTest(t)
-	const tgID = 7
-	if err := store.CreateUser(User{TgID: tgID, FullName: "Спамер"}); err != nil {
-		t.Fatalf("create: %v", err)
-	}
+	userID := mkTgUser(t, store, "7", "", "Спамер")
 	for i := 0; i < 3; i++ {
-		if _, err := store.SaveMessage("RU", tgID, "спам", time.Now().UnixMilli()); err != nil {
+		if _, err := store.SaveMessage("RU", userID, "спам", time.Now().UnixMilli()); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 	}
-	if reply := a.execute("/purge 7"); !strings.Contains(reply, ": 3") {
+	if reply := a.execute("/purge " + itoa(userID)); !strings.Contains(reply, ": 3") {
 		t.Fatalf("/purge = %q (ожидали 3 удалённых)", reply)
 	}
 	if msgs, err := store.History("RU", 0, 10); err != nil || len(msgs) != 0 {

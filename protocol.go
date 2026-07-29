@@ -6,8 +6,8 @@ import "encoding/json"
 // пуш или живой сокет как побочный эффект: locate — подписывает соединение;
 // publish/message — рассылка. Сокет авторизуется единственным способом —
 // токеном сессии в query ?token= при апгрейде (см. wsHandler). Аутентификация
-// (вход через нативный Telegram Login SDK), resume, accept_rules, history — в
-// REST (см. rest.go).
+// (вход через провайдера — Telegram/Apple/Google), resume, accept_rules,
+// history — в REST (см. rest.go).
 //
 // Каждый кадр WebSocket — это Envelope: тег типа + сырой payload, который
 // доразбирается по типу.
@@ -74,10 +74,16 @@ type ReportData struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
-// TelegramAuthRequest — тело POST /auth/telegram: OIDC ID-token от нативного
-// Telegram Login SDK, сервер проверяет его подпись по JWKS (см. telegram.go).
-type TelegramAuthRequest struct {
+// AuthRequest — тело POST /auth/{telegram,apple,google}: ID-token от провайдера,
+// сервер проверяет его подпись по публичным ключам провайдера (JWKS, см. oidc.go).
+//
+// Name нужен ровно для Apple: Sign in with Apple отдаёт имя ОДИН раз, при первой
+// авторизации, и не внутри токена, а в ответе системного диалога — значит
+// прислать его может только клиент. У остальных провайдеров имя есть в токене, и
+// это поле игнорируется.
+type AuthRequest struct {
 	IDToken string `json:"id_token"`
+	Name    string `json:"name,omitempty"`
 }
 
 // server → client
@@ -86,14 +92,15 @@ type LocatedData struct {
 }
 
 // MessageData — сообщение для клиента. Sender/Username/AvatarURL не хранятся в
-// таблице messages (там только tg_id автора): для истории собираются JOIN из
-// users, для live — из авторского соединения. SenderID/Username нужны клиенту,
-// чтобы по тапу на аватар открыть профиль автора в Telegram. AvatarURL/Username
-// пустые — у автора нет фото / нет @username.
+// таблице messages (там только внутренний id автора): для истории собираются
+// JOIN из users, для live — из авторского соединения. SenderID нужен клиенту,
+// чтобы отличать свои сообщения; Username — чтобы открыть профиль автора в
+// Telegram. AvatarURL/Username пустые — у автора нет фото / нет @username
+// (у входа через Apple их не бывает вовсе).
 type MessageData struct {
 	ID        int64  `json:"id,omitempty"` // курсор для before_id; 0 — не сохранилось
 	Channel   string `json:"channel"`
-	SenderID  int64  `json:"sender_id,omitempty"` // Telegram user id автора
+	SenderID  int64  `json:"sender_id,omitempty"` // внутренний id автора (не id у провайдера)
 	Sender    string `json:"sender"`
 	Username  string `json:"username,omitempty"`
 	AvatarURL string `json:"avatar_url,omitempty"`
@@ -121,16 +128,16 @@ type ErrorData struct {
 	Message string `json:"message"`
 }
 type AuthedUser struct {
-	ID        int64  `json:"id"`                   // Telegram user id
+	ID        int64  `json:"id"`                   // внутренний id аккаунта
 	Username  string `json:"username,omitempty"`   // @username — ссылка на профиль
 	Name      string `json:"name,omitempty"`       // отображаемое имя (единственное для UI)
-	AvatarURL string `json:"avatar_url,omitempty"` // URL фото профиля из Telegram
+	AvatarURL string `json:"avatar_url,omitempty"` // URL фото профиля; пусто у входа через Apple
 }
 
-// AuthedData — общий шейп REST-ответов про личность: POST /auth/telegram (вход
-// через Telegram Login SDK), POST /session/resume и POST /rules/accept (см. rest.go).
-// В resume/accept_rules поле Token пустое — клиент и так прислал его в запросе;
-// заполнено оно только в ответе /auth/telegram (новая сессия).
+// AuthedData — общий шейп REST-ответов про личность: POST /auth/{provider},
+// POST /session/resume и POST /rules/accept (см. rest.go). В resume/accept_rules
+// поле Token пустое — клиент и так прислал его в запросе; заполнено оно только в
+// ответе /auth/{provider} (новая сессия).
 type AuthedData struct {
 	User AuthedUser `json:"user"`
 	// сессионный токен: клиент сохраняет его и предъявляет в REST /session/resume
