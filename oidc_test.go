@@ -332,3 +332,61 @@ func TestAuthBannedIdentity(t *testing.T) {
 		t.Fatalf("забаненный вход создал %d аккаунтов", n)
 	}
 }
+
+// Имя можно задать вручную: без этого аккаунт, зарегистрированный через Apple без
+// имени (оно приходит только при первой авторизации и вне токена), навсегда
+// остался бы безымянным — починить его нечем, кроме как спросить человека.
+func TestSetName(t *testing.T) {
+	store := openTestStore(t)
+	mux := http.NewServeMux()
+	registerREST(mux, store, map[string]*Verifier{}, nil)
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	// аккаунт без имени — как после входа через Apple, когда имя не доехало
+	id, _, _, err := store.UpsertByIdentity(ProviderUser{Provider: ProviderApple, UID: "sub-noname"})
+	if err != nil {
+		t.Fatalf("создать аккаунт: %v", err)
+	}
+	token, err := store.NewSession(id)
+	if err != nil {
+		t.Fatalf("сессия: %v", err)
+	}
+
+	// без сессии не пускаем
+	resp, body := restPost(t, srv.URL+"/profile/name", SetNameData{Token: "garbage", Name: "Кто-то"})
+	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
+		t.Fatalf("чужой токен = %d %v, want 401 bad_session", resp.StatusCode, body)
+	}
+	// пустое имя — не имя
+	for _, empty := range []string{"", "   ", "\n"} {
+		resp, body = restPost(t, srv.URL+"/profile/name", SetNameData{Token: token, Name: empty})
+		if resp.StatusCode != http.StatusBadRequest || body["code"] != "bad_data" {
+			t.Fatalf("имя %q = %d %v, want 400 bad_data", empty, resp.StatusCode, body)
+		}
+	}
+
+	// нормальный случай: имя сохранено и вернулось в ответе
+	resp, body = restPost(t, srv.URL+"/profile/name", SetNameData{Token: token, Name: "  Мария  "})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("set name = %d %v, want 200", resp.StatusCode, body)
+	}
+	if u, _ := body["user"].(map[string]any); u == nil || u["name"] != "Мария" {
+		t.Fatalf("ответ: %v, want имя без лишних пробелов", body["user"])
+	}
+	if u, err := store.UserByID(id); err != nil || u == nil || u.FullName != "Мария" {
+		t.Fatalf("в БД имя = %+v err=%v", u, err)
+	}
+
+	// присланное клиентом имя нормализуется так же, как при входе: без переводов
+	// строк и не длиннее maxNameLen — иначе им можно испортить вёрстку ленты
+	long := strings.Repeat("я", maxNameLen+10)
+	if resp, body = restPost(t, srv.URL+"/profile/name",
+		SetNameData{Token: token, Name: "мно\nго " + long}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("длинное имя = %d %v", resp.StatusCode, body)
+	}
+	got, _ := body["user"].(map[string]any)["name"].(string)
+	if strings.Contains(got, "\n") || len([]rune(got)) > maxNameLen {
+		t.Fatalf("имя не нормализовано: %q (%d рун)", got, len([]rune(got)))
+	}
+}

@@ -36,6 +36,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	}
 	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
+	mux.HandleFunc("/profile/name", handleSetName(store))
 	mux.HandleFunc("/push/register", handlePushRegister(store))
 	mux.HandleFunc("/push/unregister", handlePushUnregister(store))
 	mux.HandleFunc("/report", handleReport(store, notify))
@@ -243,6 +244,61 @@ func handleHistory(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, HistoryData{Channel: channel, Messages: msgs})
+	}
+}
+
+// handleSetName — POST /profile/name {token, name} → 200 authed | 401 bad_session
+// | 400 bad_data (пустое имя) — задать отображаемое имя вручную.
+//
+// Нужен потому, что имя есть не у всех провайдеров: Apple отдаёт его только при
+// первой авторизации и вне токена (см. oidc.go), так что аккаунт может остаться
+// безымянным — и починить это, кроме как спросив человека, нечем. Клиент
+// показывает экран ввода имени в онбординге, когда сервер вернул пустое `name`.
+//
+// Имя нормализуется тем же cleanName, что и присланное при входе: без переводов
+// строк и не длиннее maxNameLen. Ответ — обычный шейп authed, чтобы клиент взял
+// итоговое (уже обрезанное) значение с сервера, а не додумывал своё.
+func handleSetName(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d SetNameData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+			return
+		}
+		name := cleanName(d.Name)
+		if name == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Имя не может быть пустым")
+			return
+		}
+		u, err := store.UserBySession(d.Token)
+		if err != nil {
+			slog.Error("set_name session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+			return
+		}
+		if err := store.SetUserName(u.ID, name); err != nil {
+			slog.Error("set_name", "err", err, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось сохранить имя")
+			return
+		}
+		slog.Info("name set", "user_id", u.ID)
+		writeJSON(w, http.StatusOK, AuthedData{
+			User: AuthedUser{
+				ID:        u.ID,
+				Username:  u.TgUsername,
+				Name:      name,
+				AvatarURL: u.AvatarURL,
+			},
+			RulesAccepted: u.RulesAccepted,
+		})
 	}
 }
 

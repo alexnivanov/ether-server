@@ -54,6 +54,14 @@ type DeleteAccountData struct {
 	Token string `json:"token"`
 }
 
+// SetNameData — тело POST /profile/name: отображаемое имя, заданное вручную.
+// Отдельный запрос, а не поле входа: имя может понадобиться задать и позже
+// (аккаунт остался без имени, потому что провайдер его не дал).
+type SetNameData struct {
+	Token string `json:"token"`
+	Name  string `json:"name"`
+}
+
 // PushTokenData — тело POST /push/register и POST /push/unregister: FCM-токен
 // устройства. Сервер шлёт пуши адресно по токенам (а не в топики), чтобы не
 // уведомлять автора о его же сообщении, — см. push.go. Platform (ios|android)

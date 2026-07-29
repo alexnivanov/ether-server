@@ -336,6 +336,16 @@ func (s *Store) Identities(userID int64) ([]ProviderUser, error) {
 	return out, rows.Err()
 }
 
+// SetUserName задаёт отображаемое имя вручную. Нужно, когда провайдер имени не
+// дал: Apple отдаёт его только при первой авторизации и вне токена, и если тот
+// вход не доехал (сеть, ошибка сервера) — взять имя больше негде, а безымянный
+// аккаунт в чате бесполезен. Пустое имя не принимаем: это работа вызывающего
+// (см. handleSetName).
+func (s *Store) SetUserName(userID int64, name string) error {
+	_, err := s.db.Exec(`UPDATE users SET full_name = ? WHERE id = ?`, name, userID)
+	return err
+}
+
 // AcceptRules отмечает, что пользователь принял правила Эфира — привязано к
 // аккаунту, переживает переустановку клиента и смену устройства.
 func (s *Store) AcceptRules(userID int64) error {
