@@ -8,6 +8,11 @@ type Channel struct {
 	Level string `json:"level"` // planet | country | region | city | district | quarter
 	Label string `json:"label"` // подпись уровня для UI: "Город"
 	Name  string `json:"name"`  // отображаемое имя: "Москва"
+	// Subscribers — сколько людей привязано к каналу (по user_channels).
+	// Заполняется НЕ геокодером: он про географию, а счётчик живой и меняется.
+	// Проставляется на locate, уже после кеша геокодинга (см. client.go) — иначе
+	// число заморозилось бы в кеше на сутки.
+	Subscribers int `json:"subscribers"`
 }
 
 // PlanetChannel — единственный глобальный канал: он есть у всех и **не зависит от

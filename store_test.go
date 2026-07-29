@@ -568,3 +568,51 @@ func TestStoreBanExpires(t *testing.T) {
 		t.Fatalf("истёкший мьют всё ещё активен: banned=%v err=%v", banned, err)
 	}
 }
+
+func TestStoreChannelSubscribers(t *testing.T) {
+	s, err := OpenStore(filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+
+	for _, u := range []User{{TgID: 1}, {TgID: 2}, {TgID: 3}} {
+		if err := s.CreateUser(u); err != nil {
+			t.Fatalf("create %d: %v", u.TgID, err)
+		}
+	}
+	// трое в стране, двое в одном районе, третий в своём
+	if err := s.SetUserChannels(1, []string{"RU", "relation/1"}); err != nil {
+		t.Fatalf("channels 1: %v", err)
+	}
+	if err := s.SetUserChannels(2, []string{"RU", "relation/1"}); err != nil {
+		t.Fatalf("channels 2: %v", err)
+	}
+	if err := s.SetUserChannels(3, []string{"RU", "relation/2"}); err != nil {
+		t.Fatalf("channels 3: %v", err)
+	}
+
+	got, err := s.ChannelSubscribers([]string{"EARTH", "RU", "relation/1", "relation/2"})
+	if err != nil {
+		t.Fatalf("subscribers: %v", err)
+	}
+	// EARTH никто ещё не локейтил — канала в карте нет, вызывающий читает 0
+	for ch, want := range map[string]int{"EARTH": 0, "RU": 3, "relation/1": 2, "relation/2": 1} {
+		if got[ch] != want {
+			t.Fatalf("%s: %d, want %d (all=%v)", ch, got[ch], want, got)
+		}
+	}
+
+	// пустой список — не паника и не SQL с болтающимся IN ()
+	if m, err := s.ChannelSubscribers(nil); err != nil || len(m) != 0 {
+		t.Fatalf("пустой список: %v %v", m, err)
+	}
+
+	// удаление аккаунта уносит его каналы (ON DELETE CASCADE) — счётчик падает
+	if err := s.DeleteUser(2); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if m, err := s.ChannelSubscribers([]string{"relation/1"}); err != nil || m["relation/1"] != 1 {
+		t.Fatalf("после удаления аккаунта relation/1=%d err=%v, want 1", m["relation/1"], err)
+	}
+}

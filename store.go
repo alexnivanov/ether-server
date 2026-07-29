@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite" // чистый Go, без cgo
@@ -559,6 +560,39 @@ func (s *Store) SetUserChannels(tgID int64, channels []string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// ChannelSubscribers — сколько пользователей привязано к каждому из каналов
+// (по user_channels, которые обновляются на каждый locate). Один запрос на весь
+// набор, а не по каналу: locate отдаёт 5–6 каналов, и N+1 здесь ни к чему.
+//
+// В карте могут отсутствовать каналы без подписчиков — вызывающий трактует
+// отсутствие как 0.
+func (s *Store) ChannelSubscribers(channels []string) (map[string]int, error) {
+	if len(channels) == 0 {
+		return map[string]int{}, nil
+	}
+	q := `SELECT channel, COUNT(*) FROM user_channels WHERE channel IN (?` +
+		strings.Repeat(`, ?`, len(channels)-1) + `) GROUP BY channel`
+	args := make([]any, len(channels))
+	for i, ch := range channels {
+		args[i] = ch
+	}
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]int, len(channels))
+	for rows.Next() {
+		var ch string
+		var n int
+		if err := rows.Scan(&ch, &n); err != nil {
+			return nil, err
+		}
+		out[ch] = n
+	}
+	return out, rows.Err()
 }
 
 // PushTargets отдаёт токены устройств, которым надо доставить пуш о новом

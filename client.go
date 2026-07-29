@@ -102,9 +102,22 @@ func (c *Client) readPump() {
 			// Каналы вошедшего запоминаем в БД — по ним считаются получатели
 			// пушей, когда сокета уже нет (см. Store.PushTargets). Полная
 			// замена набора: уехал из района — пуши оттуда прекращаются.
+			//
+			// Порядок важен: сначала записываем свои каналы, потом считаем
+			// подписчиков — иначе человек не увидел бы в счётчике себя.
 			if userID, _, _, _, authed := c.author(); authed {
 				if err := c.store.SetUserChannels(userID, ids); err != nil {
 					slog.Error("set user channels", "err", err, "tg_id", userID)
+				}
+			}
+			// Число подписчиков заполняем ЗДЕСЬ, а не в геокодере: тот про
+			// географию и его ответы кешируются на сутки, а счётчик живой.
+			// Сбой запроса не повод рушить locate — покажем нули.
+			if counts, err := c.store.ChannelSubscribers(ids); err != nil {
+				slog.Error("channel subscribers", "err", err)
+			} else {
+				for i := range chans {
+					chans[i].Subscribers = counts[chans[i].ID]
 				}
 			}
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
