@@ -86,9 +86,8 @@ CREATE TABLE IF NOT EXISTS users (
 	seen_at           INTEGER NOT NULL,
 	rules_accepted_at INTEGER NOT NULL DEFAULT 0 -- unix-мс; 0 — не принял
 );
--- Способы входа. У пользователя их может быть несколько (вошёл через Apple,
--- позже привязал Telegram — аккаунт тот же); привязки в UI пока нет, но схема
--- её не запрещает. provider_uid — строка: у Apple/Google это opaque sub, а не
+-- Способы входа. У пользователя их может быть несколько: вошёл через Apple,
+-- позже привязал Telegram (POST /profile/link/<провайдер>) — аккаунт тот же. provider_uid — строка: у Apple/Google это opaque sub, а не
 -- число, и в int64 он не влезает.
 CREATE TABLE IF NOT EXISTS identities (
 	provider     TEXT NOT NULL,           -- telegram | apple | google
@@ -233,9 +232,19 @@ func (s *Store) Ping() error {
 // такой личности ещё нет — создаёт аккаунт. Возвращает id, признак первого входа
 // (created — для приветственного уведомления) и принимал ли этот аккаунт правила.
 //
-// Пустые Name/AvatarURL НЕ затирают сохранённые: Apple отдаёт имя только при
-// первой авторизации, а фото не отдаёт вовсе, поэтому второй вход через Apple
-// иначе обнулил бы профиль. Telegram-специфичный @username трогаем только когда
+// Имя провайдер задаёт ОДИН раз — при регистрации, пока оно пустое; дальше не
+// трогает. Отдельный флаг «имя задано вручную» для этого не нужен: непустое имя
+// и есть признак того, что оно уже чьё-то — либо пришло от провайдера при
+// регистрации, либо человек ввёл его сам (SetUserName). Иначе тот, кто вводил
+// имя на экране онбординга, терял бы его при следующем входе через Telegram.
+// Правило то же, что при привязке (LinkIdentity), — одно на оба пути.
+//
+// Плата за это: сменив имя в Telegram, человек не увидит его в Эфире. Аватар под
+// правило не попадает и обновляется с каждым входом — своего аватара у нас
+// завести нельзя, так что провайдер тут единственный источник.
+//
+// Пустой AvatarURL сохранённый не затирает: Apple фото не отдаёт вовсе, и второй
+// вход через Apple иначе обнулил бы аватар, подтянутый привязкой Telegram. Telegram-специфичный @username трогаем только когда
 // вход шёл через Telegram (там пустое значение — законное: человек снял
 // username), при входе через Apple/Google он должен остаться как был.
 func (s *Store) UpsertByIdentity(pu ProviderUser) (userID int64, created bool, rulesAccepted bool, err error) {
@@ -284,7 +293,7 @@ func (s *Store) UpsertByIdentity(pu ProviderUser) (userID int64, created bool, r
 		if err := tx.QueryRow(`
 			UPDATE users SET
 				tg_username = COALESCE(?, tg_username),
-				full_name   = COALESCE(NULLIF(?, ''), full_name),
+				full_name   = CASE WHEN full_name = '' THEN COALESCE(NULLIF(?, ''), full_name) ELSE full_name END,
 				avatar_url  = COALESCE(?, avatar_url),
 				seen_at     = ?
 			WHERE id = ?
@@ -296,6 +305,58 @@ func (s *Store) UpsertByIdentity(pu ProviderUser) (userID int64, created bool, r
 		rulesAccepted = acceptedAt > 0
 	}
 	return userID, created, rulesAccepted, tx.Commit()
+}
+
+// ErrIdentityTaken — эту личность уже занял другой аккаунт. Сливать два аккаунта
+// мы не умеем (у каждого свои сообщения, каналы и наказания, и «слияние» — это
+// всегда чьи-то потери), поэтому при привязке честнее отказать и объяснить.
+var ErrIdentityTaken = errors.New("личность уже привязана к другому аккаунту")
+
+// LinkIdentity привязывает к существующему аккаунту ещё один способ входа.
+// Идемпотентна: если эта личность уже привязана к ЭТОМУ аккаунту — не ошибка.
+//
+// Заодно обогащает профиль тем, что дал провайдер: @username (только Telegram —
+// это его атрибут), а имя и аватар — лишь если их не было. Не перезаписываем
+// заполненное: человек мог задать имя вручную, и привязка Telegram не повод
+// менять его без спроса.
+func (s *Store) LinkIdentity(userID int64, pu ProviderUser) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var owner int64
+	err = tx.QueryRow(`SELECT user_id FROM identities WHERE provider = ? AND provider_uid = ?`,
+		pu.Provider, pu.UID).Scan(&owner)
+	switch {
+	case err == nil && owner != userID:
+		return ErrIdentityTaken
+	case err == sql.ErrNoRows:
+		if _, err := tx.Exec(`
+			INSERT INTO identities (provider, provider_uid, user_id, created_at) VALUES (?, ?, ?, ?)`,
+			pu.Provider, pu.UID, userID, time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	case err != nil:
+		return err
+	}
+
+	// @username: атрибут Telegram-входа, при привязке именно его и обновляем
+	var username any
+	if pu.Provider == ProviderTelegram {
+		username = pu.Username
+	}
+	if _, err := tx.Exec(`
+		UPDATE users SET
+			tg_username = COALESCE(?, tg_username),
+			full_name   = CASE WHEN full_name = '' THEN COALESCE(NULLIF(?, ''), full_name) ELSE full_name END,
+			avatar_url  = CASE WHEN avatar_url = '' THEN COALESCE(NULLIF(?, ''), avatar_url) ELSE avatar_url END
+		WHERE id = ?`,
+		username, pu.Name, pu.AvatarURL, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UserByID — профиль по внутреннему id (нужен после UpsertByIdentity, чтобы

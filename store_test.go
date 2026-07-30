@@ -79,7 +79,7 @@ func TestStoreUsersAndSessions(t *testing.T) {
 		t.Fatalf("unknown token: got %+v, want nil", got)
 	}
 
-	// повторный вход тем же провайдером — тот же аккаунт, ник обновлён
+	// повторный вход тем же провайдером — тот же аккаунт, НЕ регистрация
 	pu.Name = "alex_new"
 	again, created, _, err := s.UpsertByIdentity(pu)
 	if err != nil {
@@ -91,12 +91,15 @@ func TestStoreUsersAndSessions(t *testing.T) {
 	if again != id {
 		t.Fatalf("повторный вход дал другой id: %d != %d", again, id)
 	}
+	// ...и имя при этом НЕ меняется: провайдер заполняет его только при
+	// регистрации, пока оно пустое. Иначе имя, введённое человеком на экране
+	// онбординга, слетало бы при каждом входе через провайдера.
 	got, err = s.UserBySession(token)
 	if err != nil {
 		t.Fatalf("resume after update: %v", err)
 	}
-	if got == nil || got.FullName != "alex_new" {
-		t.Fatalf("resume after update: got %+v, want full_name alex_new", got)
+	if got == nil || got.FullName != "Alex" {
+		t.Fatalf("resume after update: got %+v, want full_name Alex (провайдер не должен перезаписывать имя)", got)
 	}
 
 	// правила принимаются один раз и переживают повторные входы

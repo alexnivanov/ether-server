@@ -62,6 +62,15 @@ type SetNameData struct {
 	Name  string `json:"name"`
 }
 
+// LinkRequest — тело POST /profile/link/{провайдер}: токен сессии (к какому
+// аккаунту привязываем) + ID-token провайдера (что привязываем). Name — как в
+// AuthRequest, нужен только Apple.
+type LinkRequest struct {
+	Token   string `json:"token"`
+	IDToken string `json:"id_token"`
+	Name    string `json:"name,omitempty"`
+}
+
 // PushTokenData — тело POST /push/register и POST /push/unregister: FCM-токен
 // устройства. Сервер шлёт пуши адресно по токенам (а не в топики), чтобы не
 // уведомлять автора о его же сообщении, — см. push.go. Platform (ios|android)
@@ -140,6 +149,10 @@ type AuthedUser struct {
 	Username  string `json:"username,omitempty"`   // @username — ссылка на профиль
 	Name      string `json:"name,omitempty"`       // отображаемое имя (единственное для UI)
 	AvatarURL string `json:"avatar_url,omitempty"` // URL фото профиля; пусто у входа через Apple
+	// Providers — какие способы входа привязаны к аккаунту (`telegram`, `apple`,
+	// `google`), отсортированы. Клиенту нужны, чтобы показать кнопку привязки
+	// только для непривязанного провайдера.
+	Providers []string `json:"providers,omitempty"`
 }
 
 // AuthedData — общий шейп REST-ответов про личность: POST /auth/{provider},

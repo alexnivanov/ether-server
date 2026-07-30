@@ -378,6 +378,18 @@ func TestSetName(t *testing.T) {
 		t.Fatalf("в БД имя = %+v err=%v", u, err)
 	}
 
+	// Непустое имя провайдер не перезаписывает: раз оно есть — оно уже чьё-то.
+	// Иначе тот, кто ввёл имя на экране онбординга, терял бы его при следующем
+	// входе через провайдера.
+	if _, _, _, err := store.UpsertByIdentity(ProviderUser{
+		Provider: ProviderApple, UID: "sub-noname", Name: "Имя От Провайдера",
+	}); err != nil {
+		t.Fatalf("повторный вход: %v", err)
+	}
+	if u, _ := store.UserByID(id); u == nil || u.FullName != "Мария" {
+		t.Fatalf("провайдер перезаписал заданное вручную имя: %+v", u)
+	}
+
 	// присланное клиентом имя нормализуется так же, как при входе: без переводов
 	// строк и не длиннее maxNameLen — иначе им можно испортить вёрстку ленты
 	long := strings.Repeat("я", maxNameLen+10)
@@ -388,5 +400,90 @@ func TestSetName(t *testing.T) {
 	got, _ := body["user"].(map[string]any)["name"].(string)
 	if strings.Contains(got, "\n") || len([]rune(got)) > maxNameLen {
 		t.Fatalf("имя не нормализовано: %q (%d рун)", got, len([]rune(got)))
+	}
+}
+
+// Привязка второго способа входа: аккаунт, созданный через Apple (без
+// @username и аватара), привязывает Telegram — и получает их, оставаясь тем же
+// аккаунтом. Слияния аккаунтов нет: занятая личность отбивается 409.
+func TestLinkIdentity(t *testing.T) {
+	e := newAuthTestEnv(t)
+	hour := time.Now().Add(time.Hour)
+
+	appleToken := e.sign(e.key, appleIssuer, testAppleClientID, hour, oidcClaims{
+		RegisteredClaims: jwt.RegisteredClaims{Subject: "sub-linker"},
+	})
+	code, m := e.post(ProviderApple, AuthRequest{IDToken: appleToken, Name: "Мария"})
+	if code != http.StatusOK {
+		t.Fatalf("вход через Apple = %d %v", code, m)
+	}
+	<-e.notified // регистрация
+	session, _ := m["token"].(string)
+	user, _ := m["user"].(map[string]any)
+	if got := user["providers"]; fmt.Sprint(got) != "[apple]" {
+		t.Fatalf("providers после входа = %v, want [apple]", got)
+	}
+
+	tgClaims := func(id string) oidcClaims {
+		return oidcClaims{
+			ID:                json.RawMessage(id),
+			PreferredUsername: "alex_tg",
+			Picture:           "https://t.me/i/a.jpg",
+		}
+	}
+	link := func(body LinkRequest) (int, map[string]any) {
+		resp, out := restPost(t, e.srv.URL+"/profile/link/telegram", body)
+		return resp.StatusCode, out
+	}
+
+	// привязка: аккаунт тот же, но появились @username и аватар
+	code, m = link(LinkRequest{
+		Token:   session,
+		IDToken: e.sign(e.key, tgIssuer, testTgClientID, hour, tgClaims("555")),
+	})
+	if code != http.StatusOK {
+		t.Fatalf("привязка = %d %v, want 200", code, m)
+	}
+	u, _ := m["user"].(map[string]any)
+	if u["username"] != "alex_tg" || u["avatar_url"] != "https://t.me/i/a.jpg" {
+		t.Fatalf("привязка не дозаполнила профиль: %v", u)
+	}
+	if u["name"] != "Мария" {
+		t.Fatalf("привязка перезаписала имя: %v", u["name"])
+	}
+	if got := fmt.Sprint(u["providers"]); got != "[apple telegram]" {
+		t.Fatalf("providers = %v, want [apple telegram]", got)
+	}
+
+	// повторная привязка той же личности — не ошибка
+	if code, m = link(LinkRequest{
+		Token:   session,
+		IDToken: e.sign(e.key, tgIssuer, testTgClientID, hour, tgClaims("555")),
+	}); code != http.StatusOK {
+		t.Fatalf("повторная привязка = %d %v, want 200", code, m)
+	}
+
+	// личность, занятая другим аккаунтом → 409, без слияния
+	if _, _, _, err := e.store.UpsertByIdentity(ProviderUser{
+		Provider: ProviderTelegram, UID: "999", Name: "Другой",
+	}); err != nil {
+		t.Fatalf("второй аккаунт: %v", err)
+	}
+	code, m = link(LinkRequest{
+		Token:   session,
+		IDToken: e.sign(e.key, tgIssuer, testTgClientID, hour, tgClaims("999")),
+	})
+	if code != http.StatusConflict || m["code"] != "identity_taken" {
+		t.Fatalf("занятая личность = %d %v, want 409 identity_taken", code, m)
+	}
+
+	// мусорная сессия и мусорный токен провайдера
+	if code, m = link(LinkRequest{Token: "garbage", IDToken: "x"}); code != http.StatusUnauthorized ||
+		m["code"] != "bad_session" {
+		t.Fatalf("чужая сессия = %d %v, want 401 bad_session", code, m)
+	}
+	if code, m = link(LinkRequest{Token: session, IDToken: "not-a-jwt"}); code != http.StatusUnauthorized ||
+		m["code"] != "bad_auth" {
+		t.Fatalf("мусорный id_token = %d %v, want 401 bad_auth", code, m)
 	}
 }

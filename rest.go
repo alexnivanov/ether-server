@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -37,6 +39,10 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
 	mux.HandleFunc("/profile/name", handleSetName(store))
+	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
+		mux.HandleFunc("/profile/link/"+provider,
+			handleLink(store, provider, verifiers[provider]))
+	}
 	mux.HandleFunc("/push/register", handlePushRegister(store))
 	mux.HandleFunc("/push/unregister", handlePushUnregister(store))
 	mux.HandleFunc("/report", handleReport(store, notify))
@@ -159,12 +165,7 @@ func handleAuth(store *Store, provider string, v *Verifier, notify *Notifier) ht
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
-			User: AuthedUser{
-				ID:        u.ID,
-				Username:  u.TgUsername,
-				Name:      u.FullName,
-				AvatarURL: u.AvatarURL,
-			},
+			User:          authedUser(store, u),
 			Token:         token,
 			RulesAccepted: accepted,
 		})
@@ -247,6 +248,91 @@ func handleHistory(store *Store) http.HandlerFunc {
 	}
 }
 
+// handleLink — POST /profile/link/{telegram|apple|google} {token, id_token, name?}
+// → 200 authed | 401 bad_session | 401 bad_auth | 403 banned | 409 identity_taken
+// | 501 provider_disabled — привязать к текущему аккаунту ещё один способ входа.
+//
+// Зачем: аккаунт, созданный через Apple, не имеет ни @username, ни аватара — а
+// привязав Telegram, человек получает и то и другое (и на его сообщениях
+// появляется «Открыть в Telegram»). Обратный смысл тоже есть: второй способ
+// входа — это страховка на случай потери доступа к первому.
+//
+// Чего эндпоинт НЕ делает — не сливает аккаунты. Если предъявленная личность уже
+// принадлежит другому аккаунту, отвечаем 409: слияние означало бы перенос
+// сообщений, каналов и наказаний, то есть неизбежные потери, и молча делать это
+// нельзя.
+//
+// Забаненную личность привязать нельзя (403): наказание считается по всем
+// личностям аккаунта, так что привязка мгновенно перенесла бы бан на этот
+// аккаунт — вместо этого честно отказываем.
+func handleLink(store *Store, provider string, v *Verifier) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		if v == nil {
+			writeRESTError(w, http.StatusNotImplemented, "provider_disabled",
+				"Вход через "+provider+" не настроен на сервере")
+			return
+		}
+		var d LinkRequest
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.IDToken == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id_token")
+			return
+		}
+		u, err := store.UserBySession(d.Token)
+		if err != nil {
+			slog.Error("link session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+			return
+		}
+		pu, err := v.Verify(d.IDToken, d.Name)
+		if err != nil {
+			slog.Warn("link verify failed", "err", err, "provider", provider)
+			writeRESTError(w, http.StatusUnauthorized, "bad_auth", "Проверка входа не прошла")
+			return
+		}
+		banned, until, permanent, reason, err := store.BanStatusForIdentity(pu.Provider, pu.UID)
+		if err != nil {
+			slog.Error("link ban check", "err", err, "provider", provider)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось проверить аккаунт")
+			return
+		}
+		if banned {
+			slog.Info("link of banned identity", "provider", provider, "user_id", u.ID)
+			writeRESTError(w, http.StatusForbidden, "banned", BanMessage(until, permanent, reason))
+			return
+		}
+		if err := store.LinkIdentity(u.ID, *pu); errors.Is(err, ErrIdentityTaken) {
+			writeRESTError(w, http.StatusConflict, "identity_taken",
+				"Этот "+provider+" уже привязан к другому аккаунту Эфира. "+
+					"Войди через него или сначала удали тот аккаунт")
+			return
+		} else if err != nil {
+			slog.Error("link identity", "err", err, "provider", provider, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось привязать аккаунт")
+			return
+		}
+		slog.Info("identity linked", "provider", provider, "user_id", u.ID)
+		// перечитываем: привязка могла дозаполнить @username, имя и аватар
+		fresh, err := store.UserByID(u.ID)
+		if err != nil || fresh == nil {
+			slog.Error("link reload user", "err", err, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось прочитать профиль")
+			return
+		}
+		writeJSON(w, http.StatusOK, AuthedData{
+			User:          authedUser(store, fresh),
+			RulesAccepted: fresh.RulesAccepted,
+		})
+	}
+}
+
 // handleSetName — POST /profile/name {token, name} → 200 authed | 401 bad_session
 // | 400 bad_data (пустое имя) — задать отображаемое имя вручную.
 //
@@ -290,13 +376,9 @@ func handleSetName(store *Store) http.HandlerFunc {
 			return
 		}
 		slog.Info("name set", "user_id", u.ID)
+		u.FullName = name
 		writeJSON(w, http.StatusOK, AuthedData{
-			User: AuthedUser{
-				ID:        u.ID,
-				Username:  u.TgUsername,
-				Name:      name,
-				AvatarURL: u.AvatarURL,
-			},
+			User:          authedUser(store, u),
 			RulesAccepted: u.RulesAccepted,
 		})
 	}
@@ -447,12 +529,7 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
-			User: AuthedUser{
-				ID:        u.ID,
-				Username:  u.TgUsername,
-				Name:      u.FullName,
-				AvatarURL: u.AvatarURL,
-			},
+			User:          authedUser(store, u),
 			RulesAccepted: true,
 		})
 	}
@@ -505,18 +582,36 @@ func handleResume(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
-			User: AuthedUser{
-				ID:        u.ID,
-				Username:  u.TgUsername,
-				Name:      u.FullName,
-				AvatarURL: u.AvatarURL,
-			},
+			User:          authedUser(store, u),
 			RulesAccepted: u.RulesAccepted,
 		})
 	}
 }
 
 // ─── общие хелперы ответа ───
+
+// authedUser собирает ответ про личность. Providers (какие способы входа
+// привязаны) читаются из БД: по ним клиент решает, показывать ли кнопку
+// «Привязать Telegram». Ошибка чтения не повод ронять ответ — это подсказка для
+// UI, а не сама личность, поэтому в худшем случае список будет пустым.
+func authedUser(store *Store, u *User) AuthedUser {
+	var providers []string
+	ids, err := store.Identities(u.ID)
+	if err != nil {
+		slog.Error("identities", "err", err, "user_id", u.ID)
+	}
+	for _, id := range ids {
+		providers = append(providers, id.Provider)
+	}
+	sort.Strings(providers) // стабильный порядок: клиент сравнивает списки
+	return AuthedUser{
+		ID:        u.ID,
+		Username:  u.TgUsername,
+		Name:      u.FullName,
+		AvatarURL: u.AvatarURL,
+		Providers: providers,
+	}
+}
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
