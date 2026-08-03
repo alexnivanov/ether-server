@@ -159,6 +159,19 @@ CREATE TABLE IF NOT EXISTS user_channels (
 	PRIMARY KEY (user_id, channel)
 );
 CREATE INDEX IF NOT EXISTS user_channels_channel ON user_channels(channel);
+-- Блокировка пользователя пользователем (Apple 1.2: «mechanism for users to
+-- block abusive users»). Односторонняя: блокирующий перестаёт видеть сообщения
+-- заблокированного (в истории — фильтром на сервере, в живой ленте — на
+-- клиенте), но не наоборот. Отдельная от bans: там наказание модератора, здесь
+-- личное решение человека, и модерацию оно не заменяет.
+CREATE TABLE IF NOT EXISTS blocks (
+	blocker_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	blocked_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	created_at      INTEGER NOT NULL,
+	PRIMARY KEY (blocker_user_id, blocked_user_id)
+);
+-- под фильтр истории (кого скрывать этому читателю) и под исключение из пушей
+CREATE INDEX IF NOT EXISTS blocks_blocked ON blocks(blocked_user_id);
 -- Наказания модератора.
 --
 -- Ключ — ЛИЧНОСТЬ У ПРОВАЙДЕРА, а не users.id, и таблица специально без FK:
@@ -485,6 +498,48 @@ func (s *Store) UserBySession(token string) (*User, error) {
 	return &u, nil
 }
 
+// ─── блокировки (пользователь → пользователя) ───
+
+// BlockUser — блокирующий больше не видит сообщения заблокированного.
+// Идемпотентна. Себя заблокировать нельзя: молча игнорируем, чтобы клиент не
+// пришлось учить особому случаю.
+func (s *Store) BlockUser(blockerID, blockedID int64) error {
+	if blockerID == blockedID {
+		return nil
+	}
+	_, err := s.db.Exec(`
+		INSERT OR IGNORE INTO blocks (blocker_user_id, blocked_user_id, created_at)
+		VALUES (?, ?, ?)`, blockerID, blockedID, time.Now().UnixMilli())
+	return err
+}
+
+// UnblockUser снимает блокировку. Идемпотентна.
+func (s *Store) UnblockUser(blockerID, blockedID int64) error {
+	_, err := s.db.Exec(`
+		DELETE FROM blocks WHERE blocker_user_id = ? AND blocked_user_id = ?`,
+		blockerID, blockedID)
+	return err
+}
+
+// BlockedBy — кого заблокировал этот пользователь. Клиент получает список при
+// входе и прячет их сообщения в живой ленте (историю фильтрует сервер).
+func (s *Store) BlockedBy(userID int64) ([]int64, error) {
+	rows, err := s.db.Query(`SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // ─── сообщения ───
 
 // SaveMessage пишет сообщение в историю канала и возвращает его id.
@@ -512,7 +567,11 @@ func (s *Store) DeleteMessagesOlderThan(ttl time.Duration) (int64, error) {
 // History возвращает до limit последних сообщений канала в хронологическом
 // порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
 // старше него.
-func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageData, error) {
+// viewerID > 0 — читатель известен (клиент прислал токен), и из выборки
+// исключаются авторы, которых он заблокировал: иначе после блокировки чужие
+// сообщения возвращались бы при каждой подгрузке истории. 0 — анонимное чтение,
+// фильтровать нечего.
+func (s *Store) History(channel string, beforeID int64, limit int, viewerID int64) ([]MessageData, error) {
 	// имя, @username и аватар автора — JOIN из users по user_id (в messages их
 	// нет). LEFT JOIN — защитно: при удалении аккаунта сообщения удаляются
 	// каскадом вместе с автором (см. DeleteUser), поэтому «висячих» строк без
@@ -521,6 +580,10 @@ func (s *Store) History(channel string, beforeID int64, limit int) ([]MessageDat
 		FROM messages m LEFT JOIN users u ON u.id = m.user_id
 		WHERE m.channel = ?`
 	args := []any{channel}
+	if viewerID > 0 {
+		q += ` AND m.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?)`
+		args = append(args, viewerID)
+	}
 	if beforeID > 0 {
 		q += ` AND m.id < ?`
 		args = append(args, beforeID)
@@ -936,10 +999,14 @@ func (s *Store) ChannelSubscribers(channels []string) (map[string]int, error) {
 // **кроме** автора сообщения (exceptUserID) — иначе человек получает уведомление
 // о своём же сообщении, ради чего адресная модель и вводилась.
 func (s *Store) PushTargets(channel string, exceptUserID int64) ([]string, error) {
+	// Заблокировавшие автора исключаются вместе с самим автором: обещание «я его
+	// больше не вижу» иначе ломалось бы уведомлением на заблокированное сообщение.
 	rows, err := s.db.Query(`
 		SELECT d.fcm_token
 		FROM user_channels uc JOIN device_tokens d ON d.user_id = uc.user_id
-		WHERE uc.channel = ? AND uc.user_id != ?`, channel, exceptUserID)
+		WHERE uc.channel = ? AND uc.user_id != ?
+		  AND uc.user_id NOT IN (SELECT blocker_user_id FROM blocks WHERE blocked_user_id = ?)`,
+		channel, exceptUserID, exceptUserID)
 	if err != nil {
 		return nil, err
 	}

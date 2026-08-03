@@ -100,6 +100,36 @@ func (n *Notifier) ReportToChannel(rep *ReportedMessage, reporter *User) {
 	n.send("report", body, "message_id", rep.MessageID)
 }
 
+// BlockToChannel сообщает в служебный канал, что один пользователь заблокировал
+// другого. Требование Apple 1.2: блокировка должна уведомлять разработчика о
+// неприемлемом контенте — то есть это не только личное действие человека, но и
+// сигнал модератору, даже если жалобу он не отправил.
+//
+// Жалобой это не подменяется и наоборот: жалоба приходит с id сообщения и
+// причиной, блокировка — с тем, кого и за что скрыли. Несколько блокировок одного
+// человека без жалоб — как раз повод посмотреть на него самому.
+//
+// Как и остальные уведомления, задумана для вызова в горутине: блокировка уже в
+// БД, и ответ клиенту от Telegram не зависит.
+func (n *Notifier) BlockToChannel(blockerID, blockedID int64, messageText string) {
+	body := fmt.Sprintf(
+		"🚫 <b>Блокировка</b>\n"+
+			"<code>%d</code> заблокировал <code>%d</code>",
+		blockerID, blockedID,
+	)
+	if t := strings.TrimSpace(messageText); t != "" {
+		if r := []rune(t); len(r) > maxNotifyText {
+			t = string(r[:maxNotifyText]) + "…"
+		}
+		body += fmt.Sprintf("\nСообщение:\n<blockquote>%s</blockquote>", html.EscapeString(t))
+	}
+	body += fmt.Sprintf(
+		"\n\nЖалобы не было — решай, смотреть ли самому: "+
+			"<code>/ban %d</code> · <code>/block %d</code>",
+		blockedID, blockedID)
+	n.send("user blocked", body, "user_id", blockerID, "target", blockedID)
+}
+
 // AccountCreated шлёт в служебный канал уведомление о регистрации нового
 // пользователя (первый вход, см. handleAuth). Как и ReportToChannel, задумана
 // для вызова в горутине: ответ клиенту от неё не зависит, аккаунт уже создан.

@@ -62,6 +62,18 @@ type SetNameData struct {
 	Name  string `json:"name"`
 }
 
+// BlockData — тело POST /block: кого блокируем (внутренний id) и, опционально,
+// текст сообщения, из-за которого это делают, — он уходит в уведомление
+// модератору (Apple 1.2 требует, чтобы блокировка сообщала разработчику о
+// контенте). Unblock=true — обратная операция тем же эндпоинтом: отдельный путь
+// ради одного флага не нужен.
+type BlockData struct {
+	Token       string `json:"token"`
+	UserID      int64  `json:"user_id"`
+	MessageText string `json:"message_text,omitempty"`
+	Unblock     bool   `json:"unblock,omitempty"`
+}
+
 // LinkRequest — тело POST /profile/link/{провайдер}: токен сессии (к какому
 // аккаунту привязываем) + ID-token провайдера (что привязываем). Name — как в
 // AuthRequest, нужен только Apple.
@@ -153,6 +165,10 @@ type AuthedUser struct {
 	// `google`), отсортированы. Клиенту нужны, чтобы показать кнопку привязки
 	// только для непривязанного провайдера.
 	Providers []string `json:"providers,omitempty"`
+	// Blocked — внутренние id тех, кого этот пользователь заблокировал. Историю
+	// сервер фильтрует сам, а живую ленту прячет клиент, и для этого ему нужен
+	// список. Уходит только владельцу аккаунта: AuthedUser другим не показывается.
+	Blocked []int64 `json:"blocked,omitempty"`
 }
 
 // AuthedData — общий шейп REST-ответов про личность: POST /auth/{provider},

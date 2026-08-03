@@ -54,7 +54,7 @@ func TestAdminCommands(t *testing.T) {
 	if !strings.Contains(reply, "удалено") {
 		t.Fatalf("/del = %q", reply)
 	}
-	if msgs, err := store.History("RU", 0, 10); err != nil || len(msgs) != 0 {
+	if msgs, err := store.History("RU", 0, 10, 0); err != nil || len(msgs) != 0 {
 		t.Fatalf("сообщение не удалено: %v err=%v", msgs, err)
 	}
 	// повторное удаление — понятный ответ, а не ошибка
@@ -124,7 +124,7 @@ func TestAdminPurge(t *testing.T) {
 	if reply := a.execute("/purge " + itoa(userID)); !strings.Contains(reply, ": 3") {
 		t.Fatalf("/purge = %q (ожидали 3 удалённых)", reply)
 	}
-	if msgs, err := store.History("RU", 0, 10); err != nil || len(msgs) != 0 {
+	if msgs, err := store.History("RU", 0, 10, 0); err != nil || len(msgs) != 0 {
 		t.Fatalf("после purge осталось: %v err=%v", msgs, err)
 	}
 }

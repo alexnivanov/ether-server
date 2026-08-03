@@ -91,7 +91,7 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 	}
 
 	// отбитое сообщение не сохранилось: лимит проверяется ДО записи в историю
-	msgs, err := store.History("RU", 0, 100)
+	msgs, err := store.History("RU", 0, 100, 0)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}

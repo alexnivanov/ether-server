@@ -221,7 +221,7 @@ func TestStoreMessages(t *testing.T) {
 	}
 
 	// последняя страница: 3 новейших, хронологически
-	msgs, err := s.History("RU", 0, 3)
+	msgs, err := s.History("RU", 0, 3, 0)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -240,7 +240,7 @@ func TestStoreMessages(t *testing.T) {
 	}
 
 	// страница вверх от начала предыдущей
-	msgs, err = s.History("RU", msgs[0].ID, 10)
+	msgs, err = s.History("RU", msgs[0].ID, 10, 0)
 	if err != nil {
 		t.Fatalf("history before: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestStoreMessages(t *testing.T) {
 	}
 
 	// чужой канал не подмешивается, пустой — пустой список
-	msgs, err = s.History("FR", 0, 10)
+	msgs, err = s.History("FR", 0, 10, 0)
 	if err != nil {
 		t.Fatalf("history empty: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestStoreDeleteUser(t *testing.T) {
 	}
 
 	// сообщения удалены каскадом вместе с аккаунтом (ON DELETE CASCADE)
-	msgs, err := s.History("RU", 0, 10)
+	msgs, err := s.History("RU", 0, 10, 0)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -334,7 +334,7 @@ func TestStoreDeleteMessagesOlderThan(t *testing.T) {
 		t.Fatalf("удалено %d сообщений, want 1", n)
 	}
 
-	msgs, err := s.History("RU", 0, 10)
+	msgs, err := s.History("RU", 0, 10, 0)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -564,7 +564,7 @@ func TestStoreBans(t *testing.T) {
 		t.Fatalf("после мьюта: Banned=%v BanPermanent=%v, want true/false", u.Banned, u.BanPermanent)
 	}
 	// контент мьют не трогает
-	if msgs, err := s.History("RU", 0, 10); err != nil || len(msgs) != 1 {
+	if msgs, err := s.History("RU", 0, 10, 0); err != nil || len(msgs) != 1 {
 		t.Fatalf("мьют не должен удалять сообщения: %v err=%v", msgs, err)
 	}
 
@@ -584,7 +584,7 @@ func TestStoreBans(t *testing.T) {
 	if count != 3 {
 		t.Fatalf("счётчик после block = %d, want 3", count)
 	}
-	if msgs, err := s.History("RU", 0, 10); err != nil || len(msgs) != 0 {
+	if msgs, err := s.History("RU", 0, 10, 0); err != nil || len(msgs) != 0 {
 		t.Fatalf("после блокировки сообщения остались: %v err=%v", msgs, err)
 	}
 	var users int
@@ -720,5 +720,121 @@ func TestStoreChannelSubscribers(t *testing.T) {
 	}
 	if m, err := s.ChannelSubscribers([]string{"relation/1"}); err != nil || m["relation/1"] != 1 {
 		t.Fatalf("после удаления аккаунта relation/1=%d err=%v, want 1", m["relation/1"], err)
+	}
+}
+
+// Блокировка пользователя пользователем (Apple 1.2). Односторонняя: блокирующий
+// перестаёт видеть сообщения в истории, обратная сторона ничего не теряет. Плюс
+// заблокировавший не получает пушей от заблокированного — иначе обещание «я его
+// больше не вижу» ломалось бы уведомлением.
+func TestStoreBlocks(t *testing.T) {
+	s := openTestStore(t)
+
+	me := mkTgUser(t, s, "1", "", "Я")
+	troll := mkTgUser(t, s, "2", "", "Тролль")
+	other := mkTgUser(t, s, "3", "", "Сосед")
+
+	for _, m := range []struct {
+		author int64
+		text   string
+	}{{me, "моё"}, {troll, "гадость"}, {other, "нормальное"}} {
+		if _, err := s.SaveMessage("RU", m.author, m.text, time.Now().UnixMilli()); err != nil {
+			t.Fatalf("save %q: %v", m.text, err)
+		}
+	}
+
+	// до блокировки видно всё
+	if msgs, err := s.History("RU", 0, 10, me); err != nil || len(msgs) != 3 {
+		t.Fatalf("до блокировки: %d сообщений err=%v, want 3", len(msgs), err)
+	}
+
+	if err := s.BlockUser(me, troll); err != nil {
+		t.Fatalf("block: %v", err)
+	}
+	// у блокирующего сообщений тролля больше нет
+	msgs, err := s.History("RU", 0, 10, me)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	for _, m := range msgs {
+		if m.SenderID == troll {
+			t.Fatalf("сообщение заблокированного осталось в истории: %+v", m)
+		}
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("после блокировки %d сообщений, want 2", len(msgs))
+	}
+	// односторонность: тролль по-прежнему видит всё, включая свои
+	if msgs, err := s.History("RU", 0, 10, troll); err != nil || len(msgs) != 3 {
+		t.Fatalf("у заблокированного: %d сообщений err=%v, want 3 (блокировка односторонняя)", len(msgs), err)
+	}
+	// анонимное чтение (viewerID = 0) не фильтруется — фильтровать нечего
+	if msgs, err := s.History("RU", 0, 10, 0); err != nil || len(msgs) != 3 {
+		t.Fatalf("анонимно: %d сообщений err=%v, want 3", len(msgs), err)
+	}
+
+	// список для клиента: живую ленту прячет он сам
+	if ids, err := s.BlockedBy(me); err != nil || len(ids) != 1 || ids[0] != troll {
+		t.Fatalf("BlockedBy: %v err=%v, want [%d]", ids, err, troll)
+	}
+
+	// пуши: тролль пишет — заблокировавший его не будится, сосед будится
+	for _, p := range []struct {
+		user int64
+		dev  string
+	}{{me, "dev-me"}, {other, "dev-other"}} {
+		if err := s.SaveDeviceToken(p.user, p.dev, "android"); err != nil {
+			t.Fatalf("token %s: %v", p.dev, err)
+		}
+		if err := s.SetUserChannels(p.user, []string{"RU"}); err != nil {
+			t.Fatalf("channels %d: %v", p.user, err)
+		}
+	}
+	if err := s.SetUserChannels(troll, []string{"RU"}); err != nil {
+		t.Fatalf("channels troll: %v", err)
+	}
+	got, err := s.PushTargets("RU", troll)
+	if err != nil {
+		t.Fatalf("targets: %v", err)
+	}
+	if len(got) != 1 || got[0] != "dev-other" {
+		t.Fatalf("targets = %v, want [dev-other] (заблокировавший не должен получать пуш)", got)
+	}
+
+	// снятие блокировки возвращает всё как было; повторные вызовы идемпотентны
+	if err := s.BlockUser(me, troll); err != nil {
+		t.Fatalf("повторная блокировка: %v", err)
+	}
+	if err := s.UnblockUser(me, troll); err != nil {
+		t.Fatalf("unblock: %v", err)
+	}
+	if err := s.UnblockUser(me, troll); err != nil {
+		t.Fatalf("повторный unblock: %v", err)
+	}
+	if msgs, err := s.History("RU", 0, 10, me); err != nil || len(msgs) != 3 {
+		t.Fatalf("после снятия: %d сообщений err=%v, want 3", len(msgs), err)
+	}
+
+	// себя заблокировать нельзя — иначе человек скрыл бы свои же сообщения
+	if err := s.BlockUser(me, me); err != nil {
+		t.Fatalf("self-block: %v", err)
+	}
+	if ids, _ := s.BlockedBy(me); len(ids) != 0 {
+		t.Fatalf("самоблокировка записалась: %v", ids)
+	}
+
+	// удаление аккаунта уносит его блокировки (ON DELETE CASCADE)
+	if err := s.BlockUser(me, troll); err != nil {
+		t.Fatalf("block перед удалением: %v", err)
+	}
+	if err := s.DeleteUser(me); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM blocks`).Scan(&n); err != nil {
+		t.Fatalf("count blocks: %v", err)
+	}
+	if n != 0 {
+		t.Fatalf("после удаления аккаунта осталось %d блокировок", n)
 	}
 }

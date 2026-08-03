@@ -487,3 +487,63 @@ func TestLinkIdentity(t *testing.T) {
 		t.Fatalf("мусорный id_token = %d %v, want 401 bad_auth", code, m)
 	}
 }
+
+// Блокировка через REST: список заблокированных приезжает в ответах про личность
+// (живую ленту прячет клиент), модератору уходит уведомление — этого требует
+// Apple 1.2 («blocking should also notify the developer»).
+func TestBlockEndpoint(t *testing.T) {
+	e := newAuthTestEnv(t)
+
+	me := mkTgUser(t, e.store, "10", "", "Я")
+	troll := mkTgUser(t, e.store, "11", "", "Тролль")
+	token, err := e.store.NewSession(me)
+	if err != nil {
+		t.Fatalf("сессия: %v", err)
+	}
+
+	// без сессии не пускаем
+	resp, body := restPost(t, e.srv.URL+"/block", BlockData{Token: "garbage", UserID: troll})
+	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
+		t.Fatalf("чужой токен = %d %v, want 401 bad_session", resp.StatusCode, body)
+	}
+	// без id тоже
+	if resp, body = restPost(t, e.srv.URL+"/block", BlockData{Token: token}); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("без user_id = %d %v, want 400", resp.StatusCode, body)
+	}
+
+	if resp, body = restPost(t, e.srv.URL+"/block",
+		BlockData{Token: token, UserID: troll, MessageText: "гадость"}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("block = %d %v, want 200", resp.StatusCode, body)
+	}
+
+	// уведомление модератору — с обоими id и текстом сообщения
+	select {
+	case n := <-e.notified:
+		text, _ := n["text"].(string)
+		for _, want := range []string{"Блокировка", "гадость", itoa(troll)} {
+			if !strings.Contains(text, want) {
+				t.Errorf("уведомление о блокировке не содержит %q: %s", want, text)
+			}
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("блокировка не уведомила модератора")
+	}
+
+	// список заблокированных приходит в resume
+	_, body = restPost(t, e.srv.URL+"/session/resume", ResumeData{Token: token})
+	u, _ := body["user"].(map[string]any)
+	blocked, _ := u["blocked"].([]any)
+	if len(blocked) != 1 || int64(blocked[0].(float64)) != troll {
+		t.Fatalf("resume.user.blocked = %v, want [%d]", u["blocked"], troll)
+	}
+
+	// снятие тем же эндпоинтом
+	if resp, body = restPost(t, e.srv.URL+"/block",
+		BlockData{Token: token, UserID: troll, Unblock: true}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("unblock = %d %v, want 200", resp.StatusCode, body)
+	}
+	_, body = restPost(t, e.srv.URL+"/session/resume", ResumeData{Token: token})
+	if u, _ := body["user"].(map[string]any); u["blocked"] != nil {
+		t.Fatalf("после снятия blocked = %v, want пусто", u["blocked"])
+	}
+}

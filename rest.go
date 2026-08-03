@@ -38,6 +38,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	}
 	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
+	mux.HandleFunc("/block", handleBlock(store, notify))
 	mux.HandleFunc("/profile/name", handleSetName(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
 		mux.HandleFunc("/profile/link/"+provider,
@@ -49,6 +50,65 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
 	mux.HandleFunc("/session/logout", handleLogout(store))
 	mux.HandleFunc("/session/resume", handleResume(store))
+}
+
+// handleBlock — POST /block {token, user_id, unblock?} → 200 {} | 401 bad_session
+// | 400 bad_data — заблокировать (или разблокировать) другого пользователя.
+//
+// Требование Apple 1.2: «mechanism for users to block abusive users», причём
+// блокировка обязана убрать контент из ленты немедленно и уведомить
+// разработчика. Поэтому здесь три эффекта: запись в blocks (историю сервер
+// фильтрует сразу, живую ленту — клиент), исключение из пушей (см. PushTargets)
+// и пост в служебный канал модерации.
+//
+// Блокировка односторонняя и модерацию не заменяет: заблокированный ничего не
+// узнаёт и продолжает писать другим. Себя заблокировать нельзя — Store молча
+// игнорирует такой вызов.
+func handleBlock(store *Store, notify *Notifier) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		var d BlockData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.UserID <= 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id пользователя")
+			return
+		}
+		u, err := store.UserBySession(d.Token)
+		if err != nil {
+			slog.Error("block session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+			return
+		}
+		if d.Unblock {
+			if err := store.UnblockUser(u.ID, d.UserID); err != nil {
+				slog.Error("unblock", "err", err, "user_id", u.ID, "target", d.UserID)
+				writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось снять блокировку")
+				return
+			}
+			slog.Info("user unblocked", "user_id", u.ID, "target", d.UserID)
+			writeJSON(w, http.StatusOK, struct{}{})
+			return
+		}
+		if err := store.BlockUser(u.ID, d.UserID); err != nil {
+			slog.Error("block", "err", err, "user_id", u.ID, "target", d.UserID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось заблокировать")
+			return
+		}
+		slog.Info("user blocked", "user_id", u.ID, "target", d.UserID)
+		// Apple требует, чтобы блокировка уведомляла разработчика: это сигнал о
+		// проблемном человеке даже без жалобы. В горутине — ответ клиенту не
+		// должен ждать Telegram, блокировка уже записана.
+		if notify != nil {
+			go notify.BlockToChannel(u.ID, d.UserID, d.MessageText)
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
+	}
 }
 
 // handleDeleteAccount — POST /account/delete {token} → 200 {} — удаление
@@ -238,7 +298,18 @@ func handleHistory(store *Store) http.HandlerFunc {
 				beforeID = n
 			}
 		}
-		msgs, err := store.History(channel, beforeID, limit)
+		// Токен опционален: читать историю можно и не входя. Но если он прислан,
+		// из выборки уходят заблокированные этим человеком авторы — иначе
+		// заблокированный возвращался бы при каждой подгрузке истории.
+		var viewerID int64
+		if token := q.Get("token"); token != "" {
+			if u, err := store.UserBySession(token); err != nil {
+				slog.Error("history session lookup", "err", err)
+			} else if u != nil {
+				viewerID = u.ID
+			}
+		}
+		msgs, err := store.History(channel, beforeID, limit, viewerID)
 		if err != nil {
 			slog.Error("history", "err", err, "channel", channel)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "history lookup failed")
@@ -604,12 +675,17 @@ func authedUser(store *Store, u *User) AuthedUser {
 		providers = append(providers, id.Provider)
 	}
 	sort.Strings(providers) // стабильный порядок: клиент сравнивает списки
+	blocked, err := store.BlockedBy(u.ID)
+	if err != nil {
+		slog.Error("blocked by", "err", err, "user_id", u.ID)
+	}
 	return AuthedUser{
 		ID:        u.ID,
 		Username:  u.TgUsername,
 		Name:      u.FullName,
 		AvatarURL: u.AvatarURL,
 		Providers: providers,
+		Blocked:   blocked,
 	}
 }
 
