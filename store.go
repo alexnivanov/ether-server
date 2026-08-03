@@ -521,6 +521,43 @@ func (s *Store) UnblockUser(blockerID, blockedID int64) error {
 	return err
 }
 
+// BlockedUser — заблокированный для показа в списке: id нужен, чтобы снять
+// блокировку, остальное — чтобы человек узнал, кого именно он скрыл.
+type BlockedUser struct {
+	ID        int64  `json:"id"`
+	Name      string `json:"name,omitempty"`
+	Username  string `json:"username,omitempty"`
+	AvatarURL string `json:"avatar_url,omitempty"`
+}
+
+// BlockedUsers — заблокированные с профилями, для экрана «Заблокированные».
+// Отдельно от BlockedBy: там нужны только id (фильтр живой ленты, и он
+// приезжает с каждым authed), а здесь профили — и запрашиваются они лишь когда
+// человек открыл список.
+//
+// Новые сверху: если кого-то заблокировали только что и хотят отменить, он
+// первый в списке.
+func (s *Store) BlockedUsers(userID int64) ([]BlockedUser, error) {
+	rows, err := s.db.Query(`
+		SELECT u.id, u.full_name, u.tg_username, u.avatar_url
+		FROM blocks b JOIN users u ON u.id = b.blocked_user_id
+		WHERE b.blocker_user_id = ?
+		ORDER BY b.created_at DESC`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []BlockedUser{}
+	for rows.Next() {
+		var u BlockedUser
+		if err := rows.Scan(&u.ID, &u.Name, &u.Username, &u.AvatarURL); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
 // BlockedBy — кого заблокировал этот пользователь. Клиент получает список при
 // входе и прячет их сообщения в живой ленте (историю фильтрует сервер).
 func (s *Store) BlockedBy(userID int64) ([]int64, error) {

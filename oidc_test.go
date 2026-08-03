@@ -537,6 +537,34 @@ func TestBlockEndpoint(t *testing.T) {
 		t.Fatalf("resume.user.blocked = %v, want [%d]", u["blocked"], troll)
 	}
 
+	// список для экрана «Заблокированные» — с профилем, чтобы человек понял, кого
+	// именно он скрыл, и мог снять блокировку
+	resp2, err := http.Get(e.srv.URL + "/blocked?token=" + token)
+	if err != nil {
+		t.Fatalf("GET /blocked: %v", err)
+	}
+	defer resp2.Body.Close()
+	var list BlockedData
+	if err := json.NewDecoder(resp2.Body).Decode(&list); err != nil {
+		t.Fatalf("decode /blocked: %v", err)
+	}
+	if len(list.Users) != 1 || list.Users[0].ID != troll || list.Users[0].Name != "Тролль" {
+		t.Fatalf("/blocked = %+v, want одного «Тролль» с id %d", list.Users, troll)
+	}
+	// без токена — 400, с чужим — 401
+	if r, err := http.Get(e.srv.URL + "/blocked"); err == nil {
+		r.Body.Close()
+		if r.StatusCode != http.StatusBadRequest {
+			t.Fatalf("/blocked без токена = %d, want 400", r.StatusCode)
+		}
+	}
+	if r, err := http.Get(e.srv.URL + "/blocked?token=garbage"); err == nil {
+		r.Body.Close()
+		if r.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("/blocked с чужим токеном = %d, want 401", r.StatusCode)
+		}
+	}
+
 	// снятие тем же эндпоинтом
 	if resp, body = restPost(t, e.srv.URL+"/block",
 		BlockData{Token: token, UserID: troll, Unblock: true}); resp.StatusCode != http.StatusOK {
@@ -545,5 +573,13 @@ func TestBlockEndpoint(t *testing.T) {
 	_, body = restPost(t, e.srv.URL+"/session/resume", ResumeData{Token: token})
 	if u, _ := body["user"].(map[string]any); u["blocked"] != nil {
 		t.Fatalf("после снятия blocked = %v, want пусто", u["blocked"])
+	}
+	if r, err := http.Get(e.srv.URL + "/blocked?token=" + token); err == nil {
+		defer r.Body.Close()
+		var after BlockedData
+		json.NewDecoder(r.Body).Decode(&after)
+		if len(after.Users) != 0 {
+			t.Fatalf("после снятия список = %+v, want пустой", after.Users)
+		}
 	}
 }

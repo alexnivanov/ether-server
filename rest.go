@@ -39,6 +39,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("/health", handleHealth(store))
 	mux.HandleFunc("/history", handleHistory(store))
 	mux.HandleFunc("/block", handleBlock(store, notify))
+	mux.HandleFunc("/blocked", handleBlocked(store))
 	mux.HandleFunc("/profile/name", handleSetName(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
 		mux.HandleFunc("/profile/link/"+provider,
@@ -108,6 +109,44 @@ func handleBlock(store *Store, notify *Notifier) http.HandlerFunc {
 			go notify.BlockToChannel(u.ID, d.UserID, d.MessageText)
 		}
 		writeJSON(w, http.StatusOK, struct{}{})
+	}
+}
+
+// handleBlocked — GET /blocked?token= → 200 {"users": [...]} | 401 bad_session —
+// кого этот человек заблокировал, с именами и аватарами.
+//
+// Отдельный запрос, а не поле в authed: там нужны только id (по ним клиент
+// прячет живую ленту), профили же нужны ровно в одном месте — на экране
+// «Заблокированные», и тянуть их при каждом входе незачем. GET, потому что это
+// чтение без побочных эффектов; токен в query — как у /history.
+func handleBlocked(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
+			return
+		}
+		token := r.URL.Query().Get("token")
+		if token == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+			return
+		}
+		u, err := store.UserBySession(token)
+		if err != nil {
+			slog.Error("blocked session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+			return
+		}
+		users, err := store.BlockedUsers(u.ID)
+		if err != nil {
+			slog.Error("blocked users", "err", err, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось получить список")
+			return
+		}
+		writeJSON(w, http.StatusOK, BlockedData{Users: users})
 	}
 }
 

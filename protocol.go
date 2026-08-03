@@ -74,6 +74,11 @@ type BlockData struct {
 	Unblock     bool   `json:"unblock,omitempty"`
 }
 
+// BlockedData — тело ответа GET /blocked: заблокированные с профилями.
+type BlockedData struct {
+	Users []BlockedUser `json:"users"`
+}
+
 // LinkRequest — тело POST /profile/link/{провайдер}: токен сессии (к какому
 // аккаунту привязываем) + ID-token провайдера (что привязываем). Name — как в
 // AuthRequest, нужен только Apple.
