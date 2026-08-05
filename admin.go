@@ -35,16 +35,29 @@ import (
 type AdminBot struct {
 	notify *Notifier // токен, chat_id и HTTP-клиент; сюда же отвечаем
 	store  *Store
+	// hub нужен, чтобы удалённый контент исчезал из открытых лент сразу: в БД
+	// его уже нет, но подключённые клиенты историю не перезапрашивают и держали
+	// бы сообщение до перезапуска приложения. nil — в тестах.
+	hub    *Hub
 	offset int64 // update_id + 1: подтверждает обработанные обновления
 }
 
 // NewAdminBot возвращает nil, если уведомления выключены: без токена и канала
 // команды принимать неоткуда.
-func NewAdminBot(notify *Notifier, store *Store) *AdminBot {
+func NewAdminBot(notify *Notifier, store *Store, hub *Hub) *AdminBot {
 	if notify == nil {
 		return nil
 	}
-	return &AdminBot{notify: notify, store: store}
+	return &AdminBot{notify: notify, store: store, hub: hub}
+}
+
+// announceRemoved говорит подключённым клиентам убрать контент из ленты. Без
+// этого модерация выглядит для них так, будто ничего не произошло.
+func (a *AdminBot) announceRemoved(d RemovedData) {
+	if a.hub == nil {
+		return
+	}
+	a.hub.announce <- envelope(TypeRemoved, d)
 }
 
 // Run в бесконечном цикле забирает обновления бота (long-poll) и исполняет
@@ -203,6 +216,8 @@ func (a *AdminBot) execute(text string) string {
 			return "Не удалось заблокировать — смотри логи сервера"
 		}
 		slog.Info("moderation block", "user_id", id, "count", count, "reason", reason)
+		// постоянный бан удаляет аккаунт, а с ним каскадом и сообщения
+		a.announceRemoved(RemovedData{UserID: id})
 		return fmt.Sprintf(
 			"⛔️ <code>%d</code> — заблокирован навсегда, аккаунт и его сообщения удалены%s\nНарушений всего: <b>%d</b>. Вход закрыт даже после переустановки",
 			id, reasonSuffix(reason), count)
@@ -231,6 +246,7 @@ func (a *AdminBot) execute(text string) string {
 			return fmt.Sprintf("Сообщения <code>%d</code> нет — уже удалено или истёк срок хранения", id)
 		}
 		slog.Info("moderation delete message", "message_id", id)
+		a.announceRemoved(RemovedData{MessageID: id})
 		return fmt.Sprintf("🗑 Сообщение <code>%d</code> удалено", id)
 
 	case "/purge":
@@ -240,6 +256,7 @@ func (a *AdminBot) execute(text string) string {
 			return "Не удалось очистить — смотри логи сервера"
 		}
 		slog.Info("moderation purge", "user_id", id, "deleted", n)
+		a.announceRemoved(RemovedData{UserID: id})
 		return fmt.Sprintf("🗑 Удалено сообщений пользователя <code>%d</code>: %d", id, n)
 
 	case "/help":

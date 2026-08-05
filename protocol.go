@@ -19,6 +19,7 @@ const (
 	// server → client
 	TypeLocated = "located" // {channels: [...]}
 	TypeMessage = "message" // {id, channel, sender_id, sender, username, avatar_url, text, ts}
+	TypeRemoved = "removed" // {message_id} | {user_id} — модератор убрал контент
 	TypeError   = "error"   // {code, message}
 )
 
@@ -140,6 +141,18 @@ type MessageData struct {
 	AvatarURL string `json:"avatar_url,omitempty"`
 	Text      string `json:"text"`
 	TS        int64  `json:"ts"`
+}
+
+// RemovedData — контент убран модератором: либо одно сообщение (MessageID),
+// либо все сообщения автора (UserID — при `/purge` и при постоянном бане, где
+// аккаунт удаляется вместе с сообщениями).
+//
+// Зачем кадр вообще: `/del` удаляет строку в БД, но у подключённых клиентов
+// сообщение остаётся в ленте до перезапуска — они её не перезапрашивают.
+// Получив `removed`, клиент убирает сообщение сразу.
+type RemovedData struct {
+	MessageID int64 `json:"message_id,omitempty"`
+	UserID    int64 `json:"user_id,omitempty"`
 }
 
 // HealthData — тело ответа GET /health: то, что нужно внешнему пингеру и

@@ -146,3 +146,55 @@ func TestAdminChatIDGuard(t *testing.T) {
 }
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
+
+// Модерация обязана убирать контент из ОТКРЫТЫХ лент, а не только из БД: клиенты
+// историю не перезапрашивают, и без кадра `removed` удалённое сообщение висело
+// бы у них до перезапуска приложения (так и было замечено на проде).
+func TestAdminAnnouncesRemoval(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	a, store := newAdminForTest(t)
+	a.hub = hub
+
+	userID := mkTgUser(t, store, "77", "", "Спамер")
+	msgID, err := store.SaveMessage("RU", userID, "спам", time.Now().UnixMilli())
+	if err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	// подписчик канала — он и должен получить кадры
+	client := &Client{send: make(chan Envelope, 8)}
+	hub.subscribe <- subscription{client: client, channels: []string{"RU"}}
+
+	next := func(what string) RemovedData {
+		select {
+		case env := <-client.send:
+			if env.Type != TypeRemoved {
+				t.Fatalf("%s: тип кадра %q, want %q", what, env.Type, TypeRemoved)
+			}
+			var d RemovedData
+			mustUnmarshal(t, env.Data, &d)
+			return d
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: кадр removed не пришёл — контент останется в ленте до перезапуска", what)
+			return RemovedData{}
+		}
+	}
+
+	a.execute("/del " + itoa(msgID))
+	if d := next("/del"); d.MessageID != msgID {
+		t.Fatalf("/del: removed = %+v, want message_id %d", d, msgID)
+	}
+
+	a.execute("/purge " + itoa(userID))
+	if d := next("/purge"); d.UserID != userID {
+		t.Fatalf("/purge: removed = %+v, want user_id %d", d, userID)
+	}
+
+	// постоянный бан удаляет аккаунт, а с ним каскадом сообщения — про это
+	// клиентам тоже надо сказать
+	a.execute("/block " + itoa(userID))
+	if d := next("/block"); d.UserID != userID {
+		t.Fatalf("/block: removed = %+v, want user_id %d", d, userID)
+	}
+}
