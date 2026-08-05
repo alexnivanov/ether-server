@@ -600,10 +600,20 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 			writeRESTError(w, http.StatusNotFound, "not_found", "Сообщение не найдено — возможно, оно уже удалено")
 			return
 		}
+		// повторный тап того же человека по тому же сообщению (UNIQUE в reports) —
+		// не новое событие модерации: ни строки в лог, ни поста в канал, но для
+		// клиента это успех, жалоба уже принята.
+		if !rep.Fresh {
+			slog.Info("report notify skipped", "message_id", d.MessageID, "reason", "duplicate")
+			writeJSON(w, http.StatusOK, struct{}{})
+			return
+		}
 		// лог — вторая точка входа модерации (первая — канал в Telegram)
 		slog.Info("message reported", "message_id", d.MessageID, "reason", d.Reason, "reporter", u.ID)
-		// только новые жалобы: повторный тап не должен дублировать пост в канале
-		if notify != nil && rep.Fresh {
+		if notify == nil {
+			// иначе «жалоба в логе есть, а поста нет» выглядит как потерянное уведомление
+			slog.Info("report notify skipped", "message_id", d.MessageID, "reason", "disabled")
+		} else {
 			go notify.ReportToChannel(rep, u)
 		}
 		writeJSON(w, http.StatusOK, struct{}{})
