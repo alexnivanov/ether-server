@@ -151,10 +151,27 @@ func (n *Notifier) AccountCreated(u User, provider string) {
 	n.send("account created", body, "user_id", u.ID, "provider", provider)
 }
 
+// WeeklyStats шлёт в служебный канал еженедельную сводку (см. stats.go).
+//
+// Единственное уведомление, чей результат важен вызывающему: по нему решается,
+// ставить ли отметку об отправке. Остальные вторичны по отношению к своему
+// событию и ошибку глотают, а несостоявшаяся сводка — это потерянная неделя,
+// поэтому здесь ошибка возвращается наверх и попытка повторяется.
+//
+// n == nil (уведомления не настроены) — не ошибка: считаем, что отправлять
+// некуда, и отметку ставить не мешаем.
+func (n *Notifier) WeeklyStats(text string) error {
+	if n == nil {
+		return nil
+	}
+	return n.send("weekly stats", text)
+}
+
 // send отправляет готовый HTML-текст в служебный канал. kind и logAttrs — только
-// для лога: ошибки здесь не возвращаются, потому что уведомление всегда
-// вторично по отношению к самому событию (оно уже записано в БД).
-func (n *Notifier) send(kind, body string, logAttrs ...any) {
+// для лога. Ошибку возвращает, но почти все вызывающие её игнорируют осознанно:
+// уведомление вторично по отношению к самому событию (оно уже записано в БД).
+// Исключение — WeeklyStats, см. выше.
+func (n *Notifier) send(kind, body string, logAttrs ...any) error {
 	log := slog.With(logAttrs...)
 
 	payload, _ := json.Marshal(map[string]any{
@@ -169,14 +186,15 @@ func (n *Notifier) send(kind, body string, logAttrs ...any) {
 	resp, err := n.http.Do(req)
 	if err != nil {
 		log.Error("notify "+kind, "err", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		// тело Telegram объясняет причину (нет прав в канале, неверный chat_id)
 		b, _ := io.ReadAll(resp.Body)
 		log.Warn("notify "+kind+" rejected", "status", resp.Status, "body", string(b))
-		return
+		return fmt.Errorf("telegram %s: %s", resp.Status, strings.TrimSpace(string(b)))
 	}
 	log.Info("notify "+kind, "status", "ok")
+	return nil
 }

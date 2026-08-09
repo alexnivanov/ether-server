@@ -237,6 +237,22 @@ CREATE TABLE IF NOT EXISTS app_access (
 );
 CREATE INDEX IF NOT EXISTS app_access_ts  ON app_access(ts);
 CREATE INDEX IF NOT EXISTS app_access_uid ON app_access(uid, ts);
+-- Отметки об отправленных еженедельных сводках (см. stats.go). Одна строка на
+-- момент расписания (суббота 10:00), за который сводка ушла в Telegram.
+--
+-- Это не журнал, а ЗАЩЁЛКА, и она решает две задачи сразу. Сервер проверяет
+-- расписание раз в час, а не спит до нужной минуты: пропущенный из-за
+-- перезапуска или простоя момент догоняется следующей проверкой, а не теряется
+-- (у крона в такой ситуации запуск просто пропадает). При этом PRIMARY KEY по
+-- моменту расписания не даёт отправить одну и ту же сводку дважды, сколько бы
+-- раз сервер ни перезапускался за неделю.
+--
+-- Название не weekly_reports: reports рядом — это жалобы на сообщения, и две
+-- таблицы с почти одинаковым именем и разным смыслом путали бы.
+CREATE TABLE IF NOT EXISTS weekly_stats (
+	scheduled_at INTEGER PRIMARY KEY, -- unix-мс момента расписания, за который сводка отправлена
+	sent_at      INTEGER NOT NULL     -- unix-мс фактической отправки
+);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -1125,5 +1141,155 @@ func (s *Store) SaveAppAccess(a AppAccess) error {
 		INSERT INTO app_access (ts, uid, src, platform, outcome, ua, lang, ip)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		time.Now().UnixMilli(), uid, a.Src, a.Platform, a.Outcome, a.UA, a.Lang, a.IP)
+	return err
+}
+
+// ─── еженедельная сводка ───
+
+// CountRow — «что-то и сколько его»: строка любой группировки в сводке.
+type CountRow struct {
+	Key   string
+	Count int
+}
+
+// AccessRow — один заход по ссылке установки для построчного списка в сводке.
+// InviterName пустое, если позвавший не указан или его аккаунт уже удалён
+// (app_access специально без FK на users, см. схему).
+type AccessRow struct {
+	TS          int64
+	UID         int64 // 0 — без приглашающего
+	InviterName string
+	Src         string
+	Platform    string
+	Outcome     string
+	Lang        string
+	UA          string
+}
+
+// WeeklyStats — всё, что попадает в еженедельную сводку.
+type WeeklyStats struct {
+	NewUsers   int
+	TotalUsers int
+	Messages   int
+	// Channels — сколько РАЗНЫХ каналов получило хотя бы одно сообщение.
+	// Названий каналов сервер не хранит (в messages лежит ID вида
+	// relation/2555133, а имена живут только в памяти геокодера), поэтому топ
+	// каналов в сводке не выводим: список сырых ID нечитаем.
+	Channels   int
+	Accesses   int
+	BySrc      []CountRow
+	ByPlatform []CountRow
+	ByInviter  []CountRow
+	AccessRows []AccessRow
+}
+
+// WeeklyStats собирает сводку за [from, to). Границы полуоткрытые: соседние
+// недели не пересекаются и ни одна строка не попадает в две сводки сразу.
+func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
+	st := &WeeklyStats{}
+
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM users WHERE created_at >= ? AND created_at < ?`,
+		from, to).Scan(&st.NewUsers); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`SELECT COUNT(*) FROM users`).Scan(&st.TotalUsers); err != nil {
+		return nil, err
+	}
+	// Сообщения живут messageTTL (неделя) и удаляются уборщиком, а окно сводки —
+	// ровно неделя: то, что отправлено в самом начале периода, к субботе может
+	// уже исчезнуть. Поэтому число сообщений — нижняя оценка, а не точный счёт.
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*), COUNT(DISTINCT channel) FROM messages WHERE ts >= ? AND ts < ?`,
+		from, to).Scan(&st.Messages, &st.Channels); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM app_access WHERE ts >= ? AND ts < ?`,
+		from, to).Scan(&st.Accesses); err != nil {
+		return nil, err
+	}
+
+	var err error
+	// COALESCE: src не заполнен у прямых заходов на /app, и в сводке они должны
+	// быть видимой строкой, а не пропасть из группировки.
+	if st.BySrc, err = s.countRows(`
+		SELECT COALESCE(NULLIF(src, ''), 'без источника'), COUNT(*) n
+		FROM app_access WHERE ts >= ? AND ts < ?
+		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
+		return nil, err
+	}
+	if st.ByPlatform, err = s.countRows(`
+		SELECT platform, COUNT(*) n
+		FROM app_access WHERE ts >= ? AND ts < ?
+		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
+		return nil, err
+	}
+	// Только заходы с приглашающим: строки без uid в «кто позвал» не отвечают.
+	// LEFT JOIN — аккаунт мог быть удалён уже после перехода.
+	if st.ByInviter, err = s.countRows(`
+		SELECT COALESCE(NULLIF(u.full_name, ''), 'id ' || a.uid), COUNT(*) n
+		FROM app_access a LEFT JOIN users u ON u.id = a.uid
+		WHERE a.ts >= ? AND a.ts < ? AND a.uid IS NOT NULL
+		GROUP BY a.uid ORDER BY n DESC`, from, to); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(`
+		SELECT a.ts, COALESCE(a.uid, 0), COALESCE(u.full_name, ''),
+		       COALESCE(a.src, ''), a.platform, a.outcome,
+		       COALESCE(a.lang, ''), COALESCE(a.ua, '')
+		FROM app_access a LEFT JOIN users u ON u.id = a.uid
+		WHERE a.ts >= ? AND a.ts < ?
+		ORDER BY a.ts`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r AccessRow
+		if err := rows.Scan(&r.TS, &r.UID, &r.InviterName, &r.Src,
+			&r.Platform, &r.Outcome, &r.Lang, &r.UA); err != nil {
+			return nil, err
+		}
+		st.AccessRows = append(st.AccessRows, r)
+	}
+	return st, rows.Err()
+}
+
+// countRows — общий разбор группировок «ключ, количество» для сводки.
+func (s *Store) countRows(query string, args ...any) ([]CountRow, error) {
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CountRow
+	for rows.Next() {
+		var r CountRow
+		if err := rows.Scan(&r.Key, &r.Count); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// WeeklyStatsSent — уходила ли уже сводка за этот момент расписания.
+func (s *Store) WeeklyStatsSent(scheduledAt int64) (bool, error) {
+	var n int
+	err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM weekly_stats WHERE scheduled_at = ?`, scheduledAt).Scan(&n)
+	return n > 0, err
+}
+
+// MarkWeeklyStatsSent запоминает, что сводка за этот момент расписания
+// отправлена. Зовётся ТОЛЬКО после успешной отправки: иначе сбой сети навсегда
+// съел бы недельный отчёт (в обратном порядке — Telegram недоступен, а отметка
+// уже стоит). INSERT OR IGNORE делает повтор безобидным.
+func (s *Store) MarkWeeklyStatsSent(scheduledAt int64) error {
+	_, err := s.db.Exec(
+		`INSERT OR IGNORE INTO weekly_stats (scheduled_at, sent_at) VALUES (?, ?)`,
+		scheduledAt, time.Now().UnixMilli())
 	return err
 }
