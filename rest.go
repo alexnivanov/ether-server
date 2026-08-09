@@ -4,9 +4,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -33,6 +35,7 @@ import (
 // приложении как невнятное «Не удалось войти».
 func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
+	mux.HandleFunc("/app", handleAppLink(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
 		mux.HandleFunc("/auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
 	}
@@ -183,6 +186,157 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 		slog.Info("account deleted", "user_id", u.ID)
 		writeJSON(w, http.StatusOK, struct{}{})
 	}
+}
+
+// Куда уводит /app. playURL пуст намеренно: Android-сборки в Google Play ещё
+// нет (лендинг на её месте показывает заглушку «скоро»), поэтому Android пока
+// уходит на лендинг. Появится страница — достаточно вписать её сюда, схема и
+// хендлер не меняются.
+const (
+	appStoreURL = "https://apps.apple.com/app/id6790150915"
+	playURL     = ""
+	landingURL  = "/"
+)
+
+// Значения app_access.outcome — куда фактически отправили.
+const (
+	outcomeAppStore = "appstore"
+	outcomePlay     = "play"
+	outcomeLanding  = "landing"
+)
+
+// Значения app_access.platform — догадка о клиенте по User-Agent.
+const (
+	platformIOS     = "ios"
+	platformAndroid = "android"
+	platformDesktop = "desktop"
+	platformUnknown = "unknown"
+)
+
+// Границы для строк из запроса: эндпоинт открытый и без аутентификации, а всё,
+// что в него пришло, попадает в базу. Живой User-Agent в эти рамки укладывается
+// с запасом, так что режется только мусор.
+const (
+	maxSrcLen  = 32
+	maxUALen   = 512
+	maxLangLen = 64
+)
+
+// handleAppLink — GET /app?src=&uid= → 302 в App Store, Google Play или на
+// лендинг; попутно пишет строку в app_access.
+//
+// Это ссылка установки: её отдаёт кнопка «Пригласить» в приложении и QR-код.
+// Единственный здесь незалогиненный хендлер, отвечающий редиректом, а не JSON, —
+// на той стороне обычный браузер, а не клиент Эфира.
+//
+// Запись в лог не должна мешать переходу: ошибку вставки логируем, а человека
+// всё равно отправляем в стор. Статистика важнее пользы от неё не бывает.
+//
+// Ссылка одновременно зарезервирована под universal link (namespace /app/*, см.
+// ether-web). Когда подключим apple-app-site-association, у кого приложение уже
+// установлено — ссылка откроется прямо в нём, сюда запрос не придёт, и в
+// app_access останутся только те, у кого Эфира нет. Для метрики приглашений это
+// и нужно.
+//
+// Отдельная неточность, о которой стоит помнить при чтении цифр: превью ссылок в
+// мессенджерах (Telegram, WhatsApp) сами дёргают URL, и такие заходы тоже
+// попадают в таблицу. Узнать их можно по platform=unknown — у ботов нет
+// браузерного User-Agent.
+func handleAppLink(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		// HEAD разрешён вместе с GET: им ходят те самые сборщики превью, и
+		// отвечать им ошибкой незачем.
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
+			return
+		}
+		q := r.URL.Query()
+		// uid кривой или отсутствует — не повод отказывать в переходе: человек
+		// пришёл ставить приложение, а приглашение просто останется неизвестным.
+		uid, _ := strconv.ParseInt(q.Get("uid"), 10, 64)
+		ua := r.Header.Get("User-Agent")
+
+		platform := detectPlatform(ua)
+		target, outcome := landingURL, outcomeLanding
+		switch platform {
+		case platformIOS:
+			target, outcome = appStoreURL, outcomeAppStore
+		case platformAndroid:
+			if playURL != "" {
+				target, outcome = playURL, outcomePlay
+			}
+		}
+
+		if err := store.SaveAppAccess(AppAccess{
+			UID:      uid,
+			Src:      truncate(q.Get("src"), maxSrcLen),
+			Platform: platform,
+			Outcome:  outcome,
+			UA:       truncate(ua, maxUALen),
+			Lang:     truncate(r.Header.Get("Accept-Language"), maxLangLen),
+			IP:       clientIP(r),
+		}); err != nil {
+			slog.Error("app access", "err", err, "uid", uid)
+		}
+
+		// Редирект кэшировать нельзя: закэшированный переход не дойдёт до
+		// сервера, и следующие заходы просто не посчитаются.
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, target, http.StatusFound)
+	}
+}
+
+// detectPlatform разбирает User-Agent настолько, насколько нужно для выбора
+// стора. Точности здесь не требуется: сырой UA лежит в app_access.ua, и разбор
+// всегда можно переделать задним числом.
+//
+// iPad в Safari по умолчанию представляется десктопным Macintosh, поэтому часть
+// планшетов попадёт в desktop. Это осознанно: отличать их пришлось бы по
+// косвенным признакам, а цена ошибки — лендинг вместо App Store.
+func detectPlatform(ua string) string {
+	if ua == "" {
+		return platformUnknown
+	}
+	s := strings.ToLower(ua)
+	switch {
+	case strings.Contains(s, "android"):
+		return platformAndroid
+	case strings.Contains(s, "iphone"), strings.Contains(s, "ipad"), strings.Contains(s, "ipod"):
+		return platformIOS
+	case strings.Contains(s, "windows"), strings.Contains(s, "macintosh"),
+		strings.Contains(s, "x11"), strings.Contains(s, "linux"):
+		return platformDesktop
+	default:
+		return platformUnknown
+	}
+}
+
+// clientIP достаёт адрес посетителя. На проде запрос приходит через свой Caddy,
+// поэтому r.RemoteAddr — это всегда 127.0.0.1, а настоящий адрес лежит в
+// X-Forwarded-For.
+//
+// Берём ПОСЛЕДНИЙ элемент списка, а не первый: заголовок дописывается по цепочке
+// прокси, и последним его дописал наш собственный Caddy. Клиент может прислать
+// свой X-Forwarded-For с любым содержимым — оно окажется в начале списка, и
+// первый элемент подделывается тривиально.
+func clientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		parts := strings.Split(xff, ",")
+		if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
+			return ip
+		}
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+func truncate(s string, max int) string {
+	if len(s) > max {
+		return s[:max]
+	}
+	return s
 }
 
 // handleAuth — POST /auth/{telegram|apple|google} {id_token, name?} → 200 authed

@@ -199,6 +199,44 @@ CREATE TABLE IF NOT EXISTS bans (
 	PRIMARY KEY (provider, provider_uid)
 );
 CREATE INDEX IF NOT EXISTS bans_user_id ON bans(user_id);
+-- Обращения к ссылке установки (GET /app, см. handleInvite в rest.go): кто
+-- позвал, откуда взята ссылка и куда мы человека отправили. Основной сценарий —
+-- приглашение из приложения, но строка пишется на любой заход, поэтому таблица
+-- называется по событию, а не по приглашению (uid опционален).
+--
+-- Пишется, только когда ссылку открыл БРАУЗЕР. Как подключим
+-- apple-app-site-association, у кого приложение уже стоит — ссылка откроется
+-- прямо в нём, минуя сервер. То есть таблица считает заходы тех, у кого Эфира
+-- нет, а это и есть смысл метрики приглашений.
+CREATE TABLE IF NOT EXISTS app_access (
+	id       INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts       INTEGER NOT NULL,   -- unix-миллисекунды (как всюду в БД)
+	-- пригласивший (users.id из ссылки); NULL — ссылку открыли без приглашения.
+	-- Специально без REFERENCES users(id): удаление аккаунта не должно стирать
+	-- историю заходов, она про факт перехода, а не про живого пользователя.
+	-- После удаления аккаунта uid остаётся осиротевшим числом, и это безопасно:
+	-- users.id объявлен AUTOINCREMENT, а такие id SQLite никогда не выдаёт
+	-- повторно — значит новый пользователь чужие заходы себе не заберёт.
+	uid      INTEGER,
+	-- откуда взята ссылка (значения задаёт клиент, приходят как есть):
+	--   apli — меню «Пригласить» в приложении
+	--   apqr — QR-код
+	-- Коды короткие намеренно: ссылка печатается в QR, лишние символы там
+	-- поднимают версию кода и делают его плотнее.
+	src      TEXT,
+	platform TEXT NOT NULL,      -- ios|android|desktop|unknown — ДОГАДКА по User-Agent
+	-- outcome — куда фактически отправили: appstore|play|landing. Отдельно от
+	-- platform намеренно: platform — это разбор UA, и он меняет смысл задним
+	-- числом, когда правишь парсер; outcome — записанное решение сервера, и оно
+	-- останется верным, когда появится Google Play или переход в уже
+	-- установленное приложение.
+	outcome  TEXT NOT NULL,
+	ua       TEXT,               -- сырой User-Agent: platform можно перечитать заново
+	lang     TEXT,               -- Accept-Language
+	ip       TEXT                -- для определения гео-региона
+);
+CREATE INDEX IF NOT EXISTS app_access_ts  ON app_access(ts);
+CREATE INDEX IF NOT EXISTS app_access_uid ON app_access(uid, ts);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -453,7 +491,9 @@ func (s *Store) DeleteSession(token string) error {
 // (ON DELETE CASCADE, см. схему) его способы входа, все сессии (все устройства),
 // сообщения, токены устройств и каналы. Идемпотентна: удаление отсутствующего
 // id — не ошибка. Записи в bans остаются: наказание живёт по личности у
-// провайдера и переживает удаление аккаунта.
+// провайдера и переживает удаление аккаунта. Строки app_access тоже остаются
+// (см. схему): заход по ссылке — факт из прошлого, а осиротевший uid сопоставить
+// уже не с чем.
 func (s *Store) DeleteUser(userID int64) error {
 	_, err := s.db.Exec(`DELETE FROM users WHERE id = ?`, userID)
 	return err
@@ -1057,4 +1097,33 @@ func (s *Store) PushTargets(channel string, exceptUserID int64) ([]string, error
 		tokens = append(tokens, t)
 	}
 	return tokens, rows.Err()
+}
+
+// ─── обращения к ссылке установки ───
+
+// AppAccess — один заход на /app (см. схему app_access и handleInvite).
+// UID = 0 значит «без приглашающего» и пишется в базу как NULL: 0 не бывает
+// валидным users.id, а NULL честнее говорит «неизвестно» в отчётах.
+type AppAccess struct {
+	UID      int64
+	Src      string
+	Platform string
+	Outcome  string
+	UA       string
+	Lang     string
+	IP       string
+}
+
+// SaveAppAccess пишет заход на ссылку установки. Зовётся из хендлера редиректа,
+// и его ошибка не должна мешать редиректу — вызывающий только логирует её.
+func (s *Store) SaveAppAccess(a AppAccess) error {
+	var uid any
+	if a.UID > 0 {
+		uid = a.UID
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO app_access (ts, uid, src, platform, outcome, ua, lang, ip)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		time.Now().UnixMilli(), uid, a.Src, a.Platform, a.Outcome, a.UA, a.Lang, a.IP)
+	return err
 }
