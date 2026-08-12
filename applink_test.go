@@ -106,24 +106,25 @@ func TestAppLinkIOS(t *testing.T) {
 	}
 }
 
-// TestAppLinkAndroidGoesToLanding — Android-сборки в Google Play ещё нет
-// (playURL пуст), поэтому человек уходит на лендинг. Важно, что platform при
-// этом всё равно android: outcome записан отдельно и не подменяет догадку о
-// клиенте — иначе после публикации в Play старые строки стали бы неразличимы.
-func TestAppLinkAndroidGoesToLanding(t *testing.T) {
+// TestAppLinkAndroidGoesToPlay — приложение опубликовано в Google Play, значит
+// Android уходит в стор, а не на лендинг (так было, пока playURL пустовал).
+// Важно, что platform и outcome остаются разными полями: platform — догадка по
+// User-Agent, outcome — записанное решение сервера. Старые строки со времён
+// заглушки так и лежат как android/landing и остаются читаемыми.
+func TestAppLinkAndroidGoesToPlay(t *testing.T) {
 	srv, store := newTestServer(t)
 
 	resp := getAppLink(t, srv.URL, "/app?src=apqr&uid=7", uaAndroid)
 
-	if got := resp.Header.Get("Location"); got != landingURL {
-		t.Errorf("Location = %q, want %q", got, landingURL)
+	if got := resp.Header.Get("Location"); got != playURL {
+		t.Errorf("Location = %q, want %q", got, playURL)
 	}
 	row := lastAppAccess(t, store)
 	if row.Platform != platformAndroid {
 		t.Errorf("platform = %q, want android", row.Platform)
 	}
-	if row.Outcome != outcomeLanding {
-		t.Errorf("outcome = %q, want landing", row.Outcome)
+	if row.Outcome != outcomePlay {
+		t.Errorf("outcome = %q, want play", row.Outcome)
 	}
 	if row.Src != "apqr" {
 		t.Errorf("src = %q, want apqr", row.Src)
