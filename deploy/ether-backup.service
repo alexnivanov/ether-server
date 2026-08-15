@@ -7,7 +7,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-# root нужен, чтобы прочитать конфиг с токеном (/etc/ether/config.prod.json
+# root нужен, чтобы прочитать конфиг с токеном (/etc/ether/config.prod.yaml
 # лежит под root) — из него берутся токен и chat_id для алертов в Telegram.
 User=root
 ExecStart=/opt/ether/backup.sh

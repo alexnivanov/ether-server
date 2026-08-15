@@ -63,16 +63,23 @@ fi
 
 DB="${DB:-/var/lib/ether/ether.prod.db}"
 BACKUP="${BACKUP:-/var/lib/ether/backups/ether-latest.db.gz}"
-CONFIG="${CONFIG:-/etc/ether/config.prod.json}"
+CONFIG="${CONFIG:-/etc/ether/config.prod.yaml}"
 MIN_FREE_PCT="${MIN_FREE_PCT:-15}"
 
 # ── алерты в служебный Telegram-канал (тот же, что у модерации) ──
 # Токен и chat_id читаем из конфига сервера, чтобы не дублировать секреты.
+# Конфиг — YAML, но нам нужны две плоские строки, поэтому хватает sed: тащить
+# PyYAML/yq на сервер ради этого незачем. Снимаем кавычки, если они есть.
+yaml_value() {
+	sed -n "s/^$1:[[:space:]]*//p" "$CONFIG" 2>/dev/null |
+		head -1 |
+		sed -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'$/\1/"
+}
 tg_token=""
 tg_chat=""
 if [[ -r "$CONFIG" ]]; then
-	tg_token=$(python3 -c "import json;print(json.load(open('$CONFIG')).get('telegram_notify_token',''))" 2>/dev/null || true)
-	tg_chat=$(python3 -c "import json;print(json.load(open('$CONFIG')).get('telegram_notify_chat_id',''))" 2>/dev/null || true)
+	tg_token=$(yaml_value telegram_notify_token || true)
+	tg_chat=$(yaml_value telegram_notify_chat_id || true)
 fi
 
 alert() {

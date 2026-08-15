@@ -3,7 +3,7 @@
 # на сервер, атомарно подменить и перезапустить systemd-сервис.
 #
 # Скрипт трогает только бинарник (/opt/ether/ether-server). Конфиг
-# (/etc/ether/config.prod.json, секреты) и база (/var/lib/ether/ether.prod.db,
+# (/etc/ether/config.prod.yaml, секреты) и база (/var/lib/ether/ether.prod.db,
 # состояние) живут на сервере и не трогаются. Деплой = новый бинарник + рестарт.
 #
 # Настройка через окружение (или инлайном: SSH_HOST=... scripts/deploy.sh):

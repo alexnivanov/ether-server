@@ -32,13 +32,13 @@ var version = "dev"
 func main() {
 	setupLogging()
 
-	env := flag.String("env", "dev", "окружение: берётся конфиг config.<env>.json")
+	env := flag.String("env", "dev", "окружение: берётся конфиг config.<env>.yaml")
 	configPath := flag.String("config", "", "явный путь к конфигу (перекрывает -env)")
 	flag.Parse()
 
 	path := *configPath
 	if path == "" {
-		path = "config." + *env + ".json"
+		path = "config." + *env + ".yaml"
 	}
 	cfg, err := LoadConfig(path)
 	if err != nil {

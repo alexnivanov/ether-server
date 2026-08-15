@@ -4,9 +4,9 @@
 # Скомпилированный бинарник (go build)
 /ether-server
 
-# Конфиги окружений с секретами (образец — config.example.json)
-/config*.json
-!/config.example.json
+# Конфиги окружений с секретами (образец — config.example.yaml)
+/config*.yaml
+!/config.example.yaml
 
 # SQLite-база (пользователи, сессии) и её WAL-файлы
 /*.db

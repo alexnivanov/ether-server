@@ -12,8 +12,8 @@
 
 ## Запуск
 
-Конфиг — на окружение: `config.<env>.json` (в git не идёт, образец —
-[`config.example.json`](./config.example.json)).
+Конфиг — на окружение: `config.<env>.yaml` (в git не идёт, образец —
+[`config.example.yaml`](./config.example.yaml)).
 
 | Поле | Смысл |
 |---|---|
@@ -26,10 +26,10 @@
 | `sentry_dsn` | ошибки и паники в Sentry (см. «Мониторинг»); пусто → выключено |
 
 ```sh
-cp config.example.json config.dev.json   # вписать хотя бы один провайдер входа
+cp config.example.yaml config.dev.yaml   # вписать хотя бы один провайдер входа
 go run .                                 # -env dev по умолчанию
-go run . -env prod                       # возьмёт config.prod.json
-go run . -config /etc/ether/custom.json  # явный путь вместо -env
+go run . -env prod                       # возьмёт config.prod.yaml
+go run . -config /etc/ether/custom.yaml  # явный путь вместо -env
 ```
 
 Сервер принимает WebSocket-соединения на `/ws` (`ws://localhost:8080/ws`).
@@ -44,7 +44,7 @@ systemd, наружу его публикует Caddy с авто-TLS. Раск�
 | Путь | Что это |
 |---|---|
 | `/opt/ether/ether-server` | бинарник, read-only для сервиса (владелец `ether:ether`, `0755`) |
-| `/etc/ether/config.prod.json` | конфиг с секретами (не в git; образец — `config.example.json`), передаётся флагом `-config` |
+| `/etc/ether/config.prod.yaml` | конфиг с секретами (не в git; образец — `config.example.yaml`), передаётся флагом `-config` |
 | `/var/lib/ether/ether.prod.db` (+`-wal`/`-shm`) | база SQLite; `/var/lib/ether` — `WorkingDirectory` и единственный writable-путь сервиса |
 | `/etc/systemd/system/ether-server.service` | юнит; запускает бинарник под пользователем `ether`. Референс — [`deploy/ether-server.service`](./deploy/ether-server.service) |
 | `/opt/ether/backup.sh` | скрипт бэкапа; ставится тем же `scripts/deploy.sh` |
@@ -167,7 +167,7 @@ ls -lh /var/lib/ether/backups/
 ```
 
 Сбои (нет базы, нет места, не прошла выгрузка) уходят сообщением в служебный
-Telegram-канал — токен и `chat_id` скрипт берёт из `config.prod.json`, отдельных
+Telegram-канал — токен и `chat_id` скрипт берёт из `config.prod.yaml`, отдельных
 секретов не требует. Порог свободного места — 15%.
 
 #### Выгрузка за пределы сервера
@@ -179,7 +179,7 @@ Telegram-канал — токен и `chat_id` скрипт берёт из `co
 Куда именно — скрипт не знает: адрес в `BACKUP_REMOTE`, сам remote описан
 переменными `RCLONE_CONFIG_*` в `/etc/ether/backup.env` (root, `0600`; образец —
 [`deploy/backup.env.example`](./deploy/backup.env.example)). Смена провайдера =
-правка этого файла. Отдельным файлом, а не в `config.prod.json`: Go-серверу
+правка этого файла. Отдельным файлом, а не в `config.prod.yaml`: Go-серверу
 доступы к хранилищу ни к чему.
 
 Что выбрать. **Яндекс.Диск** — 5 ГБ, карта не нужна, WebDAV из коробки, российская
@@ -197,7 +197,7 @@ Telegram-канал — токен и `chat_id` скрипт берёт из `co
 в открытом виде хуже, чем не отправить.
 
 **Вместе с базой уезжает конфиг** — `ether-config-latest.tar.age` и версия с
-датой: `config.prod.json`, `backup.env` и service-account FCM. Без него
+датой: `config.prod.yaml`, `backup.env` и service-account FCM. Без него
 восстановленная база не поднимется, а собирать заново по консолям (перевыпустить
 токен бота, скачать ключ Firebase, найти DSN Sentry) — час работы в худший для
 этого момент. В локальную нешифрованную копию секреты не попадают.
@@ -275,7 +275,7 @@ sudo systemctl start ether-server
 | Файл | Роль |
 |---|---|
 | `main.go` | точка входа: флаги `-env`/`-config`, WebSocket-эндпоинт `/ws`, поднятие хаба |
-| `config.go` | `Config` — конфиг окружения (`config.<env>.json`) |
+| `config.go` | `Config` — конфиг окружения (`config.<env>.yaml`) |
 | `store.go` | `Store` — персистентность в SQLite: аккаунты (внутренний id), способы входа (`identities`), сессии, сообщения каналов |
 | `hub.go` | `Hub` — владеет подписками `channelID → клиенты`, рассылает сообщения; всё состояние меняется из одной горутины (без блокировок) |
 | `client.go` | `Client` — одно соединение; `readPump` читает кадры, `writePump` — единственный писатель в сокет |
