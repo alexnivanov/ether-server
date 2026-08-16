@@ -114,7 +114,8 @@ func main() {
 	notify := NewNotifier(cfg.TelegramNotifyToken, cfg.TelegramNotifyChatID)
 	slog.Info("moderation notify", "enabled", notify != nil)
 
-	// еженедельная сводка в тот же канал (суббота 10:00) — см. stats.go. Без
+	// еженедельная сводка в тот же канал (суббота 7:00 UTC = 10:00 MSK) — см.
+	// stats.go. Без
 	// notify отправлять некуда, и горутину незачем держать.
 	if notify != nil {
 		go startWeeklyStats(store, notify)

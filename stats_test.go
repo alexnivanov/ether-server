@@ -20,8 +20,10 @@ func (f *failingTransport) RoundTrip(*http.Request) (*http.Response, error) {
 // TestLastScheduled — какой момент расписания считается «ближайшим прошедшим».
 // Ошибка здесь означает либо сводку не за ту неделю, либо две сводки подряд.
 func TestLastScheduled(t *testing.T) {
-	// 8 августа 2026 — суббота
-	sat := time.Date(2026, 8, 8, 10, 0, 0, 0, time.Local)
+	// 8 августа 2026 — суббота. Час берём из константы: расписание уже двигали
+	// (10:00 → 7:00, чтобы сводка приходила в 10 по Москве), и тест не должен
+	// разъезжаться с ним при следующем таком сдвиге.
+	sat := time.Date(2026, 8, 8, statsHour, 0, 0, 0, time.Local)
 
 	cases := []struct {
 		name string
@@ -30,7 +32,7 @@ func TestLastScheduled(t *testing.T) {
 	}{
 		{"ровно в момент расписания", sat, sat},
 		{"суббота, часом позже", sat.Add(time.Hour), sat},
-		{"суббота, но 10:00 ещё не наступило", sat.Add(-2 * time.Hour), sat.AddDate(0, 0, -7)},
+		{"суббота, но час расписания ещё не наступил", sat.Add(-2 * time.Hour), sat.AddDate(0, 0, -7)},
 		{"воскресенье", sat.AddDate(0, 0, 1), sat},
 		{"пятница — отчитываемся за прошлую субботу", sat.AddDate(0, 0, 6), sat},
 		{"ровно через неделю", sat.AddDate(0, 0, 7), sat.AddDate(0, 0, 7)},

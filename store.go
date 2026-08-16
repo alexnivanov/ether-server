@@ -239,7 +239,7 @@ CREATE TABLE IF NOT EXISTS app_access (
 CREATE INDEX IF NOT EXISTS app_access_ts  ON app_access(ts);
 CREATE INDEX IF NOT EXISTS app_access_uid ON app_access(uid, ts);
 -- Отметки об отправленных еженедельных сводках (см. stats.go). Одна строка на
--- момент расписания (суббота 10:00), за который сводка ушла в Telegram.
+-- момент расписания (суббота, statsHour), за который сводка ушла в Telegram.
 --
 -- Это не журнал, а ЗАЩЁЛКА, и она решает две задачи сразу. Сервер проверяет
 -- расписание раз в час, а не спит до нужной минуты: пропущенный из-за
