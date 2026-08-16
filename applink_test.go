@@ -191,6 +191,23 @@ func TestAppLinkTruncatesInput(t *testing.T) {
 	}
 }
 
+// TestAppLinkSkipsDeployCheck — проверка деплоя (ether-web/deploy.sh) дёргает
+// /app после каждой выкатки. Редирект она получить обязана, а вот в статистику
+// попадать не должна: это наш же curl, а не человек.
+func TestAppLinkSkipsDeployCheck(t *testing.T) {
+	srv, store := newTestServer(t)
+
+	resp := getAppLink(t, srv.URL, "/app?src="+srcDeployCheck, uaIPhone)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusFound {
+		t.Errorf("status = %d, want 302", resp.StatusCode)
+	}
+	if n := appAccessCount(t, store); n != 0 {
+		t.Errorf("app_access = %d строк, want 0", n)
+	}
+}
+
 // TestAppLinkRejectsPost — /app отвечает редиректом браузеру; остальные методы
 // сюда не ходят и в статистику попадать не должны.
 func TestAppLinkRejectsPost(t *testing.T) {

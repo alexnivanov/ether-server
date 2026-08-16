@@ -225,6 +225,13 @@ const (
 	maxLangLen = 64
 )
 
+// srcDeployCheck — метка нашей же проверки деплоя (ether-web/deploy.sh): она
+// дёргает /app после каждой выкатки, чтобы убедиться, что там редирект, а не
+// страница. Такие заходы в app_access не пишем: в недельной сводке это лишние
+// строки, и они задирают счётчик переходов. Проверке запись не нужна — она
+// смотрит на код 302.
+const srcDeployCheck = "deploy-check"
+
 // handleAppLink — GET /app?src=&uid= → 302 в App Store, Google Play или на
 // лендинг; попутно пишет строку в app_access.
 //
@@ -244,7 +251,8 @@ const (
 // Отдельная неточность, о которой стоит помнить при чтении цифр: превью ссылок в
 // мессенджерах (Telegram, WhatsApp) сами дёргают URL, и такие заходы тоже
 // попадают в таблицу. Узнать их можно по platform=unknown — у ботов нет
-// браузерного User-Agent.
+// браузерного User-Agent. Единственный заход, который в таблицу НЕ попадает, —
+// наша собственная проверка деплоя (см. srcDeployCheck).
 func handleAppLink(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// HEAD разрешён вместе с GET: им ходят те самые сборщики превью, и
@@ -270,16 +278,19 @@ func handleAppLink(store *Store) http.HandlerFunc {
 			}
 		}
 
-		if err := store.SaveAppAccess(AppAccess{
-			UID:      uid,
-			Src:      truncate(q.Get("src"), maxSrcLen),
-			Platform: platform,
-			Outcome:  outcome,
-			UA:       truncate(ua, maxUALen),
-			Lang:     truncate(r.Header.Get("Accept-Language"), maxLangLen),
-			IP:       clientIP(r),
-		}); err != nil {
-			slog.Error("app access", "err", err, "uid", uid)
+		src := truncate(q.Get("src"), maxSrcLen)
+		if src != srcDeployCheck {
+			if err := store.SaveAppAccess(AppAccess{
+				UID:      uid,
+				Src:      src,
+				Platform: platform,
+				Outcome:  outcome,
+				UA:       truncate(ua, maxUALen),
+				Lang:     truncate(r.Header.Get("Accept-Language"), maxLangLen),
+				IP:       clientIP(r),
+			}); err != nil {
+				slog.Error("app access", "err", err, "uid", uid)
+			}
 		}
 
 		// Редирект кэшировать нельзя: закэшированный переход не дойдёт до
