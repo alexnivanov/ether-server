@@ -186,6 +186,9 @@ func TestFormatWeeklyStatsTruncates(t *testing.T) {
 	if !strings.Contains(text, "Показаны первые") {
 		t.Error("список обрезан молча — в сводке нет отметки о срезке")
 	}
+	if !strings.Contains(text, "когда | источник | позвал | платформа→куда | клиент") {
+		t.Errorf("у списка переходов нет шапки: %q", text)
+	}
 }
 
 // TestFormatWeeklyStatsQuietWeek — за тихую неделю сводка всё равно приходит:

@@ -102,7 +102,10 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 		return b.String()
 	}
 
-	b.WriteString("\n<b>Переходы</b>\n<pre>")
+	// Шапка: без неё колонки читаются загадкой — прочерк в «позвал» ничем не
+	// отличается от прочерка в «источнике», а «android→play» выглядит как одно
+	// поле, хотя это платформа гостя и то, куда его увели.
+	b.WriteString("\n<b>Переходы</b>\n<pre>когда | источник | позвал | платформа→куда | клиент\n")
 	shown := 0
 	for _, r := range st.AccessRows {
 		if shown == maxStatsRows || b.Len() > maxStatsLen {
