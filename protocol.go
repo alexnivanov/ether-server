@@ -177,6 +177,29 @@ type UpdateData struct {
 	URL    string `json:"url,omitempty"`
 }
 
+// PublishRequest — тело POST /messages. То же, что кадр `publish` на WS, плюс
+// два поля, которых у кадра быть не может: токен сессии (у сокета личность
+// установлена при апгрейде) и ClientMsgID.
+//
+// ClientMsgID — id отправки, придуманный клиентом; повтор с тем же id не
+// публикует второе сообщение, а возвращает уже сохранённое. Ради этого отправка
+// и уезжает с WS: кадр уходил в буфер сокета без подтверждения, и повторить его
+// было нельзя (см. ether-meta/PLANS.md). Необязателен: без него запрос работает,
+// просто повтор создаст дубль.
+type PublishRequest struct {
+	Token       string `json:"token"`
+	Channel     string `json:"channel"`
+	Text        string `json:"text"`
+	ClientMsgID string `json:"client_msg_id,omitempty"`
+}
+
+// PublishedData — тело ответа POST /messages: опубликованное сообщение тем же
+// шейпом, что кадр `message` на WS. Автору оно придёт ещё и рассылкой — клиент
+// отсеет дубль по серверному id.
+type PublishedData struct {
+	Message MessageData `json:"message"`
+}
+
 // HistoryData — тело ответа REST GET /history (см. rest.go).
 type HistoryData struct {
 	Channel  string        `json:"channel"`

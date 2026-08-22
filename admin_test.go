@@ -24,7 +24,7 @@ func TestAdminCommands(t *testing.T) {
 	// команды модерации принимают ВНУТРЕННИЙ id (он же в посте жалобы);
 	// Telegram id модератор не видит вовсе
 	userID := mkTgUser(t, store, "9000042", "", "Нарушитель")
-	msgID, err := store.SaveMessage("RU", userID, "гадость", time.Now().UnixMilli())
+	msgID, _, err := store.SaveMessage("RU", userID, "гадость", time.Now().UnixMilli(), "")
 	if err != nil {
 		t.Fatalf("save message: %v", err)
 	}
@@ -117,7 +117,7 @@ func TestAdminPurge(t *testing.T) {
 	a, store := newAdminForTest(t)
 	userID := mkTgUser(t, store, "7", "", "Спамер")
 	for i := 0; i < 3; i++ {
-		if _, err := store.SaveMessage("RU", userID, "спам", time.Now().UnixMilli()); err != nil {
+		if _, _, err := store.SaveMessage("RU", userID, "спам", time.Now().UnixMilli(), ""); err != nil {
 			t.Fatalf("save: %v", err)
 		}
 	}
@@ -157,7 +157,7 @@ func TestAdminAnnouncesRemoval(t *testing.T) {
 	a.hub = hub
 
 	userID := mkTgUser(t, store, "77", "", "Спамер")
-	msgID, err := store.SaveMessage("RU", userID, "спам", time.Now().UnixMilli())
+	msgID, _, err := store.SaveMessage("RU", userID, "спам", time.Now().UnixMilli(), "")
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}

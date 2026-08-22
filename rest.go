@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,8 +15,9 @@ import (
 
 // REST — синхронный запрос-ответ без побочных эффектов на живом WS-соединении:
 // вход через провайдера (auth), resume, logout, удаление аккаунта,
-// accept_rules, жалобы, history. На WebSocket остались только locate и
-// publish/message — см. client.go и ether-meta/PROTOCOL.md.
+// accept_rules, жалобы, history, отправка сообщений. На WebSocket остались
+// locate (подписка) и message (рассылка); кадр publish устарел и живёт ради
+// старых сборок — см. client.go, publish.go и ether-meta/PROTOCOL.md.
 //
 // Идентификация здесь полностью стейтлесс: "аутентифицирован" значит "прислал
 // валидный токен сессии в этом запросе", без привязки к какому-либо Client —
@@ -35,16 +37,22 @@ import (
 // приложении как невнятное «Не удалось войти».
 // gate может быть nil — пороги версий не заданы; GET /version тогда всем
 // отвечает ok (см. version.go).
-func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate) {
+// pub — общий с WS путь публикации (см. publish.go); nil — POST /messages
+// отвечает 501, как незаданный провайдер входа.
+func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
 	mux.HandleFunc("/app", handleAppLink(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
 		mux.HandleFunc("/auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
 	}
 	mux.HandleFunc("/health", handleHealth(store))
+	// GET /history — прежнее имя чтения сообщений, оставлено ради сборок ≤1.3.0:
+	// они зовут его, и снимать его можно только вместе с кадром publish (см.
+	// ether-meta/PLANS.md).
 	mux.HandleFunc("/history", handleHistory(store))
 	mux.HandleFunc("/block", handleBlock(store, notify))
 	mux.HandleFunc("/blocked", handleBlocked(store))
+	mux.HandleFunc("/messages", handleMessages(store, pub))
 	mux.HandleFunc("/profile/name", handleSetName(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
 		mux.HandleFunc("/profile/link/"+provider,
@@ -226,6 +234,11 @@ const (
 	maxSrcLen  = 32
 	maxUALen   = 512
 	maxLangLen = 64
+	// client_msg_id придумывает клиент (у нас это 32 hex-символа), и он попадает
+	// в уникальный индекс. Слишком длинный ОТКЛОНЯЕМ, а не обрезаем: два разных
+	// id с общим префиксом схлопнулись бы в один ключ, и второе сообщение
+	// «успешно» потерялось бы, вернув 200 с чужим id.
+	maxClientMsgIDLen = 64
 )
 
 // srcDeployCheck — метка нашей же проверки деплоя (ether-web/deploy.sh): она
@@ -474,8 +487,10 @@ func handleHealth(store *Store) http.HandlerFunc {
 	}
 }
 
-// handleHistory — GET /history?channel=&before_id=&limit= → 200 {channel,
-// messages}; без авторизации (историю можно читать не входя, как и locate).
+// handleHistory — чтение сообщений канала: GET /messages?channel=&before_id=&limit=
+// → 200 {channel, messages}; без авторизации (читать можно не входя, как и
+// locate). Отвечает и по прежнему пути GET /history — он зарегистрирован
+// отдельно ради старых сборок.
 // channel — query-параметр, а не сегмент пути: ID канала сам может содержать
 // "/" (osm_type/osm_id, напр. "relation/2555133") и сломает роутинг по пути.
 func handleHistory(store *Store) http.HandlerFunc {
@@ -526,6 +541,92 @@ func handleHistory(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, HistoryData{Channel: channel, Messages: msgs})
+	}
+}
+
+// handleMessages — /messages: GET читает сообщения канала, POST отправляет.
+//
+// Один путь на чтение и запись, потому что это один ресурс — коллекция
+// сообщений. Прежнее имя чтения (GET /history) осталось псевдонимом: по нему
+// читают сборки, выпущенные до переименования.
+func handleMessages(store *Store, pub *publisher) http.HandlerFunc {
+	list, publish := handleHistory(store), handlePublish(store, pub)
+	return func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			list(w, r)
+		case http.MethodPost:
+			publish(w, r)
+		default:
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET or POST")
+		}
+	}
+}
+
+// handlePublish — POST /messages {token, channel, text, client_msg_id?} →
+// 200 {message} | 401 bad_session | 403 banned | 429 too_fast (+Retry-After) |
+// 400 bad_data — отправить сообщение в канал.
+//
+// Зачем REST, а не кадр `publish` на WS: у запроса есть ответ. Кадр уходил в
+// буфер сокета, и если соединение умирало между отправкой и сервером, сообщение
+// пропадало молча — а поле ввода клиент уже очистил. Здесь клиент знает, что
+// сообщение сохранено (и с каким id), а на повтор с тем же client_msg_id
+// получает то же сообщение вместо дубля (см. ether-meta/PLANS.md).
+//
+// Публикация — общая с WS функция (publish.go): проверки бана и частоты, запись,
+// рассылка и пуши одни и те же, чтобы через один транспорт не оказалось можно то,
+// что через другой нельзя.
+func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+			return
+		}
+		if pub == nil {
+			slog.Error("publish not wired")
+			writeRESTError(w, http.StatusNotImplemented, "not_implemented",
+				"Отправка сообщений не настроена на сервере")
+			return
+		}
+		var d PublishRequest
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+			return
+		}
+		u, err := store.UserBySession(d.Token)
+		if err != nil {
+			slog.Error("publish session lookup", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+			return
+		}
+		if u == nil {
+			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+			return
+		}
+		if len(d.ClientMsgID) > maxClientMsgIDLen {
+			writeRESTError(w, http.StatusBadRequest, "bad_data",
+				fmt.Sprintf("client_msg_id длиннее %d символов", maxClientMsgIDLen))
+			return
+		}
+		author := publishAuthor{
+			ID:         u.ID,
+			Name:       u.FullName,
+			Username:   u.TgUsername,
+			AvatarURL:  u.AvatarURL,
+			AccountAge: time.Since(u.CreatedAt),
+		}
+		m, perr := pub.publish(author, d.Channel, d.Text, d.ClientMsgID)
+		if perr != nil {
+			// Retry-After — стандартный способ сказать «повтори через N»: клиент
+			// показывает это человеком читаемым текстом из message, а заголовок
+			// остаётся для тех, кто разбирает ответ машинно.
+			if perr.Retry > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(int(perr.Retry.Seconds())+1))
+			}
+			writeRESTError(w, perr.Status, perr.Code, perr.Message)
+			return
+		}
+		writeJSON(w, http.StatusOK, PublishedData{Message: m})
 	}
 }
 

@@ -100,3 +100,70 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 			len(msgs), base.capacity)
 	}
 }
+
+// TestPublishRateLimitSharedAcrossTransports — бакет лимита ОДИН на аккаунт, а не
+// на транспорт. Иначе лимит обходился бы чередованием: исчерпал всплеск кадром
+// по WS — доотправил через POST /messages.
+//
+// Раньше это было невозможно случайно (REST-отправки не существовало), а теперь
+// достаточно создать лимитер в двух местах — и проверка станет вдвое мягче, чем
+// написано в ratelimit.go.
+func TestPublishRateLimitSharedAcrossTransports(t *testing.T) {
+	store, err := OpenStore(filepath.Join(t.TempDir(), "rl-shared.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	hub := NewHub()
+	go hub.Run()
+	limiter := NewRateLimiter() // один на оба транспорта, как в main.go
+	pub := &publisher{store: store, hub: hub, limiter: limiter}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, limiter))
+	mux.HandleFunc("/messages", handleMessages(store, pub))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	userID := mkTgUser(t, store, "56", "", "flooder")
+	token, err := store.NewSession(userID)
+	if err != nil {
+		t.Fatalf("seed session: %v", err)
+	}
+
+	// весь всплеск съедаем через REST
+	base := messageLimitFor(0, 0)
+	for i := 0; i < base.capacity; i++ {
+		resp, body := restPost(t, srv.URL+"/messages", PublishRequest{
+			Token: token, Channel: "RU", Text: "поток",
+		})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("REST-отправка %d: status %d (%v)", i+1, resp.StatusCode, body)
+		}
+	}
+
+	// и следом пробуем добить кадром по WS — тем же аккаунтом
+	ws, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(srv.URL, "http")+"/ws?token="+token, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "в обход"})); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	var env Envelope
+	if err := ws.ReadJSON(&env); err != nil {
+		t.Fatalf("ответ: %v", err)
+	}
+	if env.Type != TypeError {
+		t.Fatalf("WS после исчерпанного через REST лимита: got %q, want error", env.Type)
+	}
+	var e ErrorData
+	mustUnmarshal(t, env.Data, &e)
+	if e.Code != "too_fast" {
+		t.Fatalf("code = %q, want too_fast — бакеты разъехались по транспортам", e.Code)
+	}
+}

@@ -138,10 +138,16 @@ func main() {
 	}
 	slog.Info("client versions", "platforms", len(cfg.ClientVersions))
 
+	// Лимитер один на процесс и ОДИН на оба транспорта: частота считается на
+	// аккаунт, а не на соединение. Если бы REST получил свой экземпляр, на
+	// аккаунт стало бы два бакета и лимит обходился бы чередованием WS и REST.
+	limiter := NewRateLimiter()
+	// общий путь публикации для POST /messages и кадра publish (см. publish.go)
+	pub := &publisher{store: store, hub: hub, push: push, limiter: limiter}
+
 	mux := http.NewServeMux()
-	registerREST(mux, store, verifiers, notify, gate)
-	// лимитер один на процесс: частота считается на аккаунт, а не на соединение
-	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, NewRateLimiter()))
+	registerREST(mux, store, verifiers, notify, gate, pub)
+	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, limiter))
 
 	// Паники в хендлерах: net/http гасит их внутри соединения, и мы бы о них не
 	// узнали. sentryhttp перехватывает, отправляет со стектрейсом и не даёт

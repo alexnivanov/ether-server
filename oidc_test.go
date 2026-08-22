@@ -70,7 +70,7 @@ func newAuthTestEnv(t *testing.T) *authTestEnv {
 	verifiers[ProviderGoogle].jwksURL = jwks.URL
 
 	mux := http.NewServeMux()
-	registerREST(mux, store, verifiers, notify, nil)
+	registerREST(mux, store, verifiers, notify, nil, nil)
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &authTestEnv{srv: srv, store: store, key: key, notified: notified, t: t}
@@ -279,7 +279,7 @@ func TestAuthProviderNotConfigured(t *testing.T) {
 	mux := http.NewServeMux()
 	registerREST(mux, store, map[string]*Verifier{
 		ProviderTelegram: NewTelegramVerifier("x", "http://127.0.0.1:0/jwks"),
-	}, nil, nil)
+	}, nil, nil, nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -339,7 +339,7 @@ func TestAuthBannedIdentity(t *testing.T) {
 func TestSetName(t *testing.T) {
 	store := openTestStore(t)
 	mux := http.NewServeMux()
-	registerREST(mux, store, map[string]*Verifier{}, nil, nil)
+	registerREST(mux, store, map[string]*Verifier{}, nil, nil, nil)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 

@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -54,6 +53,13 @@ func (c *Client) author() (id int64, name, username, avatar string, authed bool)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.userID, c.fullName, c.username, c.avatarURL, c.authed
+}
+
+// publisher собирает общий путь публикации из того, что уже есть у соединения
+// (см. publish.go). Отдельного поля не держим: publisher — это склейка четырёх
+// зависимостей, а не состояние.
+func (c *Client) publisher() *publisher {
+	return &publisher{store: c.store, hub: c.hub, push: c.push, limiter: c.limiter}
 }
 
 // accountAge — сколько живёт аккаунт. Считается от сохранённой даты
@@ -136,6 +142,9 @@ func (c *Client) readPump() {
 			}
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
+		// Кадр `publish` живёт только ради сборок, которые не умеют
+		// POST /messages (см. ether-meta/PLANS.md, шаг 3). Сама публикация — общая
+		// с REST функция, здесь остаётся только разбор кадра и ответ ошибкой.
 		case TypePublish:
 			userID, name, username, avatar, authed := c.author()
 			if !authed {
@@ -143,57 +152,27 @@ func (c *Client) readPump() {
 				continue
 			}
 			var d PublishData
-			if err := json.Unmarshal(env.Data, &d); err != nil || d.Channel == "" {
+			if err := json.Unmarshal(env.Data, &d); err != nil {
 				c.sendError("bad_data", "invalid publish payload")
 				continue
 			}
-			if d.Text == "" || len(d.Text) > maxMessageLen {
-				c.sendError("bad_data", "text must be 1..4096 bytes")
+			author := publishAuthor{
+				ID:         userID,
+				Name:       name,
+				Username:   username,
+				AvatarURL:  avatar,
+				AccountAge: c.accountAge(),
+			}
+			// client_msg_id на WS не передаётся: кадр отправляется в буфер и
+			// подтверждения не имеет, поэтому повторить его клиент всё равно не
+			// может — идемпотентность защищать нечего (это и есть та причина, по
+			// которой отправка уезжает в REST).
+			// Сохранённое сообщение здесь не нужно: автор получит его рассылкой
+			// из publish, тем же кадром `message` и в том же порядке, что чужие.
+			if _, perr := c.publisher().publish(
+				author, d.Channel, d.Text, ""); perr != nil {
+				c.sendError(perr.Code, perr.Message)
 				continue
-			}
-			// Бан мог прилететь при уже открытом сокете (BanEscalate отзывает
-			// сессии, но живое соединение остаётся authed в памяти). Запрос на
-			// каждую публикацию — один SELECT к локальной SQLite; на нашем
-			// масштабе дешевле, чем индексировать соединения по пользователю.
-			if banned, until, permanent, reason, err := c.store.BanStatus(userID); err != nil {
-				slog.Error("ban check", "err", err, "user_id", userID)
-			} else if banned {
-				c.sendError("banned", BanMessage(until, permanent, reason))
-				continue
-			}
-			// Частота публикаций. rating пока всегда 0 (голосов нет) — работает
-			// базовый тир; когда появится рейтинг, сюда придёт его значение и
-			// лимит станет тирным без правок здесь (см. ratelimit.go).
-			if c.limiter != nil {
-				if ok, retry := c.limiter.Allow(userID, 0, c.accountAge()); !ok {
-					c.sendError("too_fast", fmt.Sprintf(
-						"Слишком часто — подожди %d с", int(retry.Seconds())+1))
-					continue
-				}
-			}
-			// в БД пишем только внутренний id автора; имя/аватар для live берём из
-			// соединения, для истории — JOIN из users (см. store.History)
-			m := MessageData{
-				Channel:   d.Channel,
-				SenderID:  userID,
-				Sender:    name,
-				Username:  username,
-				AvatarURL: avatar,
-				Text:      d.Text,
-				TS:        time.Now().UnixMilli(),
-			}
-			if id, err := c.store.SaveMessage(m.Channel, userID, m.Text, m.TS); err != nil {
-				slog.Error("save message", "err", err, "channel", m.Channel) // живая рассылка важнее истории
-			} else {
-				m.ID = id
-			}
-			c.hub.broadcast <- m
-
-			// пуш устройствам подписчиков канала, КРОМЕ автора (иначе человек
-			// получает уведомление о своём же сообщении). Асинхронно: HTTP к FCM
-			// не должен тормозить сокет.
-			if c.push != nil {
-				go c.push.Notify(m.Channel, userID, name, m.Text)
 			}
 
 		default:

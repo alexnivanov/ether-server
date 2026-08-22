@@ -210,13 +210,13 @@ func TestStoreMessages(t *testing.T) {
 
 	var ids []int64
 	for i, text := range []string{"один", "два", "три", "четыре", "пять"} {
-		id, err := s.SaveMessage("RU", author, text, int64(1000+i))
+		id, _, err := s.SaveMessage("RU", author, text, int64(1000+i), "")
 		if err != nil {
 			t.Fatalf("save %q: %v", text, err)
 		}
 		ids = append(ids, id)
 	}
-	if _, err := s.SaveMessage("DE", author, "hallo", 2000); err != nil {
+	if _, _, err := s.SaveMessage("DE", author, "hallo", 2000, ""); err != nil {
 		t.Fatalf("save DE: %v", err)
 	}
 
@@ -271,7 +271,7 @@ func TestStoreDeleteUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session 2: %v", err)
 	}
-	if _, err := s.SaveMessage("RU", id, "привет", 1000); err != nil {
+	if _, _, err := s.SaveMessage("RU", id, "привет", 1000, ""); err != nil {
 		t.Fatalf("save message: %v", err)
 	}
 
@@ -318,11 +318,11 @@ func TestStoreDeleteMessagesOlderThan(t *testing.T) {
 	ttl := 7 * 24 * time.Hour
 	now := time.Now()
 	// два сообщения по краям TTL: одно чуть старше границы, одно свежее
-	stale, err := s.SaveMessage("RU", author, "старое", now.Add(-ttl-time.Hour).UnixMilli())
+	stale, _, err := s.SaveMessage("RU", author, "старое", now.Add(-ttl-time.Hour).UnixMilli(), "")
 	if err != nil {
 		t.Fatalf("save stale: %v", err)
 	}
-	if _, err := s.SaveMessage("RU", author, "свежее", now.Add(-time.Hour).UnixMilli()); err != nil {
+	if _, _, err := s.SaveMessage("RU", author, "свежее", now.Add(-time.Hour).UnixMilli(), ""); err != nil {
 		t.Fatalf("save fresh: %v", err)
 	}
 
@@ -356,7 +356,7 @@ func TestStoreReportMessage(t *testing.T) {
 
 	author := mkTgUser(t, s, "1", "", "Author")
 	reporter := mkTgUser(t, s, "2", "", "Reporter")
-	msgID, err := s.SaveMessage("RU", author, "гадость", 1000)
+	msgID, _, err := s.SaveMessage("RU", author, "гадость", 1000, "")
 	if err != nil {
 		t.Fatalf("save message: %v", err)
 	}
@@ -529,7 +529,7 @@ func TestStoreBans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session: %v", err)
 	}
-	if _, err := s.SaveMessage("RU", id, "гадость", time.Now().UnixMilli()); err != nil {
+	if _, _, err := s.SaveMessage("RU", id, "гадость", time.Now().UnixMilli(), ""); err != nil {
 		t.Fatalf("save message: %v", err)
 	}
 
@@ -738,7 +738,7 @@ func TestStoreBlocks(t *testing.T) {
 		author int64
 		text   string
 	}{{me, "моё"}, {troll, "гадость"}, {other, "нормальное"}} {
-		if _, err := s.SaveMessage("RU", m.author, m.text, time.Now().UnixMilli()); err != nil {
+		if _, _, err := s.SaveMessage("RU", m.author, m.text, time.Now().UnixMilli(), ""); err != nil {
 			t.Fatalf("save %q: %v", m.text, err)
 		}
 	}

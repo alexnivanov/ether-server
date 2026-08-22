@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -113,11 +114,20 @@ CREATE TABLE IF NOT EXISTS messages (
 	-- стирает и его сообщения (при foreign_keys=ON).
 	user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 	text    TEXT NOT NULL,
-	ts      INTEGER NOT NULL                   -- unix-миллисекунды (контракт протокола)
+	ts      INTEGER NOT NULL,                  -- unix-миллисекунды (контракт протокола)
+	-- id отправки, придуманный клиентом: делает повтор запроса идемпотентным
+	-- (см. publisher.publish). Пусто — идемпотентности нет: так пишет WS-кадр,
+	-- старые сборки про это поле не знают.
+	client_msg_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
 -- под уборку старых сообщений по TTL (DeleteMessagesOlderThan)
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
+-- Идемпотентность повтора отправки. Индекс ЧАСТИЧНЫЙ: у старых строк и у всего,
+-- что пришло кадром по WS, client_msg_id пустой, и обычный UNIQUE развалился бы
+-- на второй такой строке.
+CREATE UNIQUE INDEX IF NOT EXISTS messages_client_msg_id
+	ON messages(user_id, client_msg_id) WHERE client_msg_id <> '';
 -- Жалобы на сообщения (модерация UGC — требование Apple 1.2). Храним копию
 -- текста и автора: сообщение живёт messageTTL (неделя) и удаляется, а жалоба
 -- должна остаться разбираемой, поэтому ссылку на messages не ставим — id
@@ -293,23 +303,146 @@ func OpenStore(path string) (*Store, error) {
 			return nil, fmt.Errorf("%s: %w", pragma, err)
 		}
 	}
+	// Пустая база или уже жившая — видно только ДО применения схемы: она создаёт
+	// объекты и стирает эту разницу. От неё зависит, гонять ли шаги (см. migrate).
+	fresh, err := isFreshDB(db)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	// ПОРЯДОК ВАЖЕН: сначала шаги, потом storeSchema.
+	//
+	// storeSchema описывает КОНЕЧНЫЙ вид схемы и потому может ссылаться на то,
+	// чего в дожившей базе ещё нет: индекс messages_client_msg_id построен по
+	// колонке, которую добавляет шаг версии 1. Применённый первым, он падает с
+	// «no such column: client_msg_id», и сервер не стартует вовсе.
+	//
+	// На чистой базе шагов нет (migrate только штампует версию), так что для неё
+	// порядок ни на что не влияет.
+	if err := migrate(db, fresh); err != nil {
+		db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(storeSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("schema: %w", err)
 	}
-	// Миграции. Приложение опубликовано в App Store и Google Play, в прод-базе
-	// живые аккаунты, сессии и сообщения — пересоздавать её с нуля больше нельзя
-	// (раньше было можно, и на этом выкатывали переход на несколько провайдеров
-	// входа). А CREATE TABLE IF NOT EXISTS выше существующую таблицу не трогает:
-	// новая колонка, дописанная в storeSchema, на живой базе просто не появится —
-	// сервер поднимется и начнёт падать на запросах.
-	//
-	// Поэтому любое изменение схемы = ДВА места: колонка в storeSchema (чтобы
-	// чистая база создавалась одним куском) и идемпотентный шаг здесь — ALTER
-	// TABLE, глотающий ошибку "duplicate column name", чтобы повторный запуск не
-	// падал. Шагов пока нет; первый понадобится под client_msg_id, см.
-	// ether-meta/PLANS.md.
 	return &Store{db: db}, nil
+}
+
+// Эволюция схемы — по НОМЕРАМ версий, как onUpgrade у Android. Номер лежит в
+// самой базе: PRAGMA user_version — поле в заголовке файла SQLite, поэтому своей
+// таблицы под учёт не нужно, а меняется оно в транзакции вместе с шагом.
+//
+// Раньше здесь были идемпотентные ALTER-ы с проглатыванием ошибки «duplicate
+// column name». Работало, но выражало ровно один вид изменений — добавление
+// колонки: «уже применено?» выводилось из самой схемы, а сравнивать приходилось
+// текст ошибки драйвера. По номерам каждый шаг выполняется РОВНО ОДИН РАЗ, и
+// потому выразимо остальное: заполнение данных, DROP COLUMN с пересозданием
+// индекса, перестройка таблицы.
+
+// schemaVersion — на какую версию схемы рассчитан этот бинарник. Поднимать
+// ВМЕСТЕ с добавлением шага в migrations, иначе шаг не выполнится.
+const schemaVersion = 1
+
+// migrations — шаги по версиям: индекс это версия, НА которую шаг переводит
+// базу. Ноль не используется: версия 0 — база, не знавшая миграций вовсе.
+//
+// Каждый шаг — список операторов, они идут по порядку и в одной транзакции. Шаги
+// не переписываем задним числом: на проде они уже применены, и правка изменит
+// поведение только на базах, которые до этой версии ещё не дошли.
+//
+// Изменение схемы = ДВА места: актуальный вид в storeSchema (чтобы чистая база
+// создавалась одним куском) и шаг здесь (чтобы дожившая база догналась).
+// Исключение — новые таблицы и индексы: CREATE ... IF NOT EXISTS в storeSchema
+// и так срабатывает на живой базе, шаг им не нужен.
+//
+// Оговорка к этому исключению: индекс по НОВОЙ колонке в storeSchema применяется
+// уже после шагов (см. порядок в OpenStore), поэтому колонку добавляет шаг, а
+// индекс остаётся схеме. Если понадобится наоборот — таблица, которую шаг сразу
+// правит, — создавать её надо в самом шаге, а не рассчитывать на storeSchema.
+var migrations = [][]string{
+	// client_msg_id — под POST /messages (см. publish.go): делает повтор отправки
+	// идемпотентным.
+	1: {
+		`ALTER TABLE messages ADD COLUMN client_msg_id TEXT NOT NULL DEFAULT ''`,
+	},
+}
+
+// migrate подтягивает базу до schemaVersion. fresh — база была пустой до
+// применения storeSchema: тогда схема уже актуальна, её надо только
+// проштамповать, иначе первый же шаг полез бы добавлять существующую колонку.
+func migrate(db *sql.DB, fresh bool) error {
+	if fresh {
+		return setUserVersion(db, schemaVersion)
+	}
+	var have int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&have); err != nil {
+		return fmt.Errorf("user_version: %w", err)
+	}
+	// База новее бинарника — это откат сервера на прошлую версию. Не отказываем:
+	// лишняя колонка старому коду обычно не мешает, а запрет на старт отнял бы
+	// единственный быстрый способ откатиться. Но говорим об этом громко.
+	if have > schemaVersion {
+		slog.Warn("база новее бинарника: миграции пропущены",
+			"db_version", have, "binary_version", schemaVersion)
+		return nil
+	}
+	for v := have + 1; v <= schemaVersion; v++ {
+		if err := applyMigration(db, v); err != nil {
+			return err
+		}
+		slog.Info("схема обновлена", "version", v)
+	}
+	return nil
+}
+
+// applyMigration применяет один шаг и повышает версию — одной транзакцией.
+// Упавший шаг не оставляет базу наполовину переехавшей: откатится и он, и номер
+// версии, поэтому следующий запуск начнёт его заново.
+func applyMigration(db *sql.DB, v int) error {
+	// Шага может не оказаться: подняли schemaVersion, а migrations не дописали.
+	// Без этой проверки был бы выход за границы среза — паника внутри OpenStore и
+	// краш-луп сервиса вместо внятной ошибки старта.
+	if v >= len(migrations) || migrations[v] == nil {
+		return fmt.Errorf("миграция %d: шаг не описан в migrations", v)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return fmt.Errorf("миграция %d: %w", v, err)
+	}
+	defer tx.Rollback()
+	for _, stmt := range migrations[v] {
+		if _, err := tx.Exec(stmt); err != nil {
+			return fmt.Errorf("миграция %d, %q: %w", v, stmt, err)
+		}
+	}
+	if _, err := tx.Exec(userVersionStmt(v)); err != nil {
+		return fmt.Errorf("миграция %d: user_version: %w", v, err)
+	}
+	return tx.Commit()
+}
+
+func setUserVersion(db *sql.DB, v int) error {
+	if _, err := db.Exec(userVersionStmt(v)); err != nil {
+		return fmt.Errorf("user_version = %d: %w", v, err)
+	}
+	return nil
+}
+
+// userVersionStmt — PRAGMA не принимает параметры, поэтому число подставляем
+// сами. Оно наше и приходит из константы, а не из запроса.
+func userVersionStmt(v int) string {
+	return fmt.Sprintf(`PRAGMA user_version = %d`, v)
+}
+
+// isFreshDB — в базе ещё нет ни одного объекта. Звать ДО применения storeSchema.
+func isFreshDB(db *sql.DB) (bool, error) {
+	var objects int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master`).Scan(&objects); err != nil {
+		return false, fmt.Errorf("sqlite_master: %w", err)
+	}
+	return objects == 0, nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }
@@ -665,13 +798,80 @@ func (s *Store) BlockedBy(userID int64) ([]int64, error) {
 // ─── сообщения ───
 
 // SaveMessage пишет сообщение в историю канала и возвращает его id.
-func (s *Store) SaveMessage(channel string, userID int64, text string, ts int64) (int64, error) {
-	res, err := s.db.Exec(`INSERT INTO messages (channel, user_id, text, ts) VALUES (?, ?, ?, ?)`,
-		channel, userID, text, ts)
-	if err != nil {
-		return 0, err
+// savedMessage — уже сохранённая копия той же отправки (см. SaveMessage и
+// MessageByClientMsgID). exists == false, если такой отправки в истории нет.
+//
+// Канал и текст здесь ИЗ БАЗЫ, а не из запроса: на повтор мы отвечаем тем, что
+// действительно сохранено и разослано. Иначе клиент, переиспользовавший id с
+// другим текстом, получил бы 200 про сообщение, которого не существует.
+type savedMessage struct {
+	exists  bool
+	id      int64
+	ts      int64
+	channel string
+	text    string
+}
+
+// SaveMessage пишет сообщение в историю. clientMsgID делает повтор
+// идемпотентным: если у этого автора такая отправка уже сохранена, второй раз
+// строка не появляется, а вернётся уже сохранённая (её id и ts — чтобы клиент
+// увидел в ленте ровно то, что лежит в истории и разослано подписчикам).
+//
+// Проверяем не «сначала SELECT, потом INSERT», а наоборот: два одинаковых
+// запроса, пришедших одновременно, оба не нашли бы строку и оба её вставили.
+// Уникальный индекс — единственное надёжное место для этой проверки, поэтому
+// сначала пробуем вставить и разбираем конфликт.
+func (s *Store) SaveMessage(
+	channel string, userID int64, text string, ts int64, clientMsgID string,
+) (int64, savedMessage, error) {
+	res, err := s.db.Exec(`
+		INSERT INTO messages (channel, user_id, text, ts, client_msg_id)
+		VALUES (?, ?, ?, ?, ?)`,
+		channel, userID, text, ts, clientMsgID)
+	if err == nil {
+		id, err := res.LastInsertId()
+		return id, savedMessage{}, err
 	}
-	return res.LastInsertId()
+	if clientMsgID == "" || !isUniqueViolation(err) {
+		return 0, savedMessage{}, err
+	}
+	dup, err := s.MessageByClientMsgID(userID, clientMsgID)
+	if err != nil {
+		return 0, savedMessage{}, err
+	}
+	return dup.id, dup, nil
+}
+
+// MessageByClientMsgID — сохранённая отправка этого автора с таким id. exists ==
+// false, если её нет (или id пустой — тогда искать нечего).
+//
+// Зовётся ДО проверок бана и частоты (см. publisher.publish): повтор запроса — не
+// новая публикация, а вопрос «дошло ли», и отвечать на него отказом нельзя.
+func (s *Store) MessageByClientMsgID(userID int64, clientMsgID string) (savedMessage, error) {
+	if clientMsgID == "" {
+		return savedMessage{}, nil
+	}
+	var m savedMessage
+	err := s.db.QueryRow(`
+		SELECT id, ts, channel, text FROM messages
+		WHERE user_id = ? AND client_msg_id = ?`,
+		userID, clientMsgID).Scan(&m.id, &m.ts, &m.channel, &m.text)
+	if errors.Is(err, sql.ErrNoRows) {
+		return savedMessage{}, nil
+	}
+	if err != nil {
+		return savedMessage{}, err
+	}
+	m.exists = true
+	return m, nil
+}
+
+// isUniqueViolation — сработал уникальный индекс. Кода ошибки драйвер не даёт,
+// поэтому сравниваем текст. Здесь это оправдано, в отличие от миграций: там
+// «уже применено» теперь известно по номеру версии, а тут речь о живой гонке
+// двух одинаковых отправок, и распознать её больше нечем.
+func isUniqueViolation(err error) bool {
+	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
 // DeleteMessagesOlderThan удаляет сообщения старше ttl и возвращает их число.
