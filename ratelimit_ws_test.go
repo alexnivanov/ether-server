@@ -26,7 +26,7 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 	go hub.Run()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, NewRateLimiter()))
-	mux.HandleFunc("/history", handleHistory(store))
+	mux.HandleFunc("GET /history", handleHistory(store))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -122,7 +122,7 @@ func TestPublishRateLimitSharedAcrossTransports(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, limiter))
-	mux.HandleFunc("/messages", handleMessages(store, pub))
+	mux.HandleFunc("POST /messages", handlePublish(store, pub))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

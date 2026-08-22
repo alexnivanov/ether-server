@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -26,6 +27,12 @@ import (
 // Порядок в файле: маршруты и хендлеры идут **по алфавиту пути** — так у нового
 // эндпоинта есть единственное очевидное место, а не «в конец». Общие хелперы
 // ответа — в конце файла.
+//
+// Метод указан в самом паттерне ("POST /messages"), поэтому проверок метода в
+// хендлерах нет: несовпадение ServeMux отбивает сам, кодом 405 и заголовком
+// Allow. Цена — ответ на неверный метод не наш JSON, а текстовый "Method Not
+// Allowed" от стандартной библиотеки; случается это только при ошибке клиента, и
+// JSON там был явно лишним. Паттерн "GET /path" ловит и HEAD.
 
 // notify может быть nil — служебные уведомления в Telegram выключены (см.
 // notify.go); на приём жалоб и регистрацию это не влияет.
@@ -40,34 +47,37 @@ import (
 // pub — общий с WS путь публикации (см. publish.go); nil — POST /messages
 // отвечает 501, как незаданный провайдер входа.
 func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher) {
-	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
-	mux.HandleFunc("/app", handleAppLink(store))
+	mux.HandleFunc("POST /account/delete", handleDeleteAccount(store))
+	// GET покрывает и HEAD — им ходят сборщики превью ссылок (см. handleAppLink)
+	mux.HandleFunc("GET /app", handleAppLink(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
-		mux.HandleFunc("/auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
+		mux.HandleFunc("POST /auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
 	}
-	mux.HandleFunc("/health", handleHealth(store))
+	mux.HandleFunc("GET /health", handleHealth(store))
 	// GET /history — прежнее имя чтения сообщений, оставлено ради сборок ≤1.3.0:
 	// они зовут его, и снимать его можно только вместе с кадром publish (см.
 	// ether-meta/PLANS.md).
-	mux.HandleFunc("/history", handleHistory(store))
-	mux.HandleFunc("/block", handleBlock(store, notify))
-	mux.HandleFunc("/blocked", handleBlocked(store))
-	mux.HandleFunc("/messages", handleMessages(store, pub))
-	mux.HandleFunc("/profile/name", handleSetName(store))
+	mux.HandleFunc("GET /history", handleHistory(store))
+	mux.HandleFunc("POST /block", handleBlock(store, notify))
+	mux.HandleFunc("GET /blocked", handleBlocked(store))
+	// /messages — один ресурс: читаем коллекцию и добавляем в неё
+	mux.HandleFunc("GET /messages", handleHistory(store))
+	mux.HandleFunc("POST /messages", handlePublish(store, pub))
+	mux.HandleFunc("POST /profile/name", handleSetName(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
-		mux.HandleFunc("/profile/link/"+provider,
+		mux.HandleFunc("POST /profile/link/"+provider,
 			handleLink(store, provider, verifiers[provider]))
 	}
-	mux.HandleFunc("/push/register", handlePushRegister(store))
-	mux.HandleFunc("/push/unregister", handlePushUnregister(store))
-	mux.HandleFunc("/report", handleReport(store, notify))
-	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
-	mux.HandleFunc("/session/logout", handleLogout(store))
-	mux.HandleFunc("/session/resume", handleResume(store))
-	mux.HandleFunc("/version", handleVersion(store, gate))
+	mux.HandleFunc("POST /push/register", handlePushRegister(store))
+	mux.HandleFunc("POST /push/unregister", handlePushUnregister(store))
+	mux.HandleFunc("POST /report", handleReport(store, notify))
+	mux.HandleFunc("POST /rules/accept", handleAcceptRules(store))
+	mux.HandleFunc("POST /session/logout", handleLogout(store))
+	mux.HandleFunc("POST /session/resume", handleResume(store))
+	mux.HandleFunc("GET /version", handleVersion(store, gate))
 }
 
-// handleBlock — POST /block {token, user_id, unblock?} → 200 {} | 401 bad_session
+// handleBlock — POST /block {user_id, unblock?} (токен — заголовком) → 200 {} | 401 bad_session
 // | 400 bad_data — заблокировать (или разблокировать) другого пользователя.
 //
 // Требование Apple 1.2: «mechanism for users to block abusive users», причём
@@ -81,23 +91,13 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 // игнорирует такой вызов.
 func handleBlock(store *Store, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		var d BlockData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.UserID <= 0 {
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.UserID <= 0 {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id пользователя")
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("block session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и id пользователя")
+		if !ok {
 			return
 		}
 		if d.Unblock {
@@ -126,32 +126,18 @@ func handleBlock(store *Store, notify *Notifier) http.HandlerFunc {
 	}
 }
 
-// handleBlocked — GET /blocked?token= → 200 {"users": [...]} | 401 bad_session —
+// handleBlocked — GET /blocked → 200 {"users": [...]} | 401 bad_session —
 // кого этот человек заблокировал, с именами и аватарами.
 //
 // Отдельный запрос, а не поле в authed: там нужны только id (по ним клиент
 // прячет живую ленту), профили же нужны ровно в одном месте — на экране
 // «Заблокированные», и тянуть их при каждом входе незачем. GET, потому что это
-// чтение без побочных эффектов; токен в query — как у /history.
+// чтение без побочных эффектов; токен — заголовком, как везде.
 func handleBlocked(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
-			return
-		}
-		token := r.URL.Query().Get("token")
-		if token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
-			return
-		}
-		u, err := store.UserBySession(token)
-		if err != nil {
-			slog.Error("blocked session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		// query-токен — прежнее место, для сборок ≤1.3.0; новые присылают заголовок
+		u, ok := sessionUser(w, r, store, r.URL.Query().Get("token"), "")
+		if !ok {
 			return
 		}
 		users, err := store.BlockedUsers(u.ID)
@@ -164,29 +150,18 @@ func handleBlocked(store *Store) http.HandlerFunc {
 	}
 }
 
-// handleDeleteAccount — POST /account/delete {token} → 200 {} — удаление
+// handleDeleteAccount — POST /account/delete (токен — заголовком) → 200 {} — удаление
 // аккаунта: сносит пользователя, все его сессии (все устройства) и все
 // сообщения (каскадом, см. Store.DeleteUser), необратимо. Требует валидную
 // сессию (401 bad_session иначе).
 func handleDeleteAccount(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		var d DeleteAccountData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+		if !decodeLegacyBody(w, r, &d) {
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("delete_account session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "")
+		if !ok {
 			return
 		}
 		if err := store.DeleteUser(u.ID); err != nil {
@@ -271,12 +246,6 @@ const srcDeployCheck = "deploy-check"
 // наша собственная проверка деплоя (см. srcDeployCheck).
 func handleAppLink(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// HEAD разрешён вместе с GET: им ходят те самые сборщики превью, и
-		// отвечать им ошибкой незачем.
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
-			return
-		}
 		q := r.URL.Query()
 		// uid кривой или отсутствует — не повод отказывать в переходе: человек
 		// пришёл ставить приложение, а приглашение просто останется неизвестным.
@@ -383,10 +352,6 @@ func truncate(s string, max int) string {
 // сломана настройка сервера, а не вход у человека.
 func handleAuth(store *Store, provider string, v *Verifier, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		if v == nil {
 			slog.Warn("auth provider not configured", "provider", provider)
 			writeRESTError(w, http.StatusNotImplemented, "provider_disabled",
@@ -468,10 +433,6 @@ var startedAt = time.Now()
 // поднимать тревогу из-за чужих сбоев. За ними — алерты в лог/канал.
 func handleHealth(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
-			return
-		}
 		data := HealthData{
 			OK:        true,
 			Version:   version,
@@ -495,10 +456,6 @@ func handleHealth(store *Store) http.HandlerFunc {
 // "/" (osm_type/osm_id, напр. "relation/2555133") и сломает роутинг по пути.
 func handleHistory(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
-			return
-		}
 		q := r.URL.Query()
 		channel := q.Get("channel")
 		if channel == "" {
@@ -527,7 +484,8 @@ func handleHistory(store *Store) http.HandlerFunc {
 		// из выборки уходят заблокированные этим человеком авторы — иначе
 		// заблокированный возвращался бы при каждой подгрузке истории.
 		var viewerID int64
-		if token := q.Get("token"); token != "" {
+		// заголовок главнее, query — прежнее место для сборок ≤1.3.0
+		if token := sessionToken(r, q.Get("token")); token != "" {
 			if u, err := store.UserBySession(token); err != nil {
 				slog.Error("history session lookup", "err", err)
 			} else if u != nil {
@@ -544,26 +502,7 @@ func handleHistory(store *Store) http.HandlerFunc {
 	}
 }
 
-// handleMessages — /messages: GET читает сообщения канала, POST отправляет.
-//
-// Один путь на чтение и запись, потому что это один ресурс — коллекция
-// сообщений. Прежнее имя чтения (GET /history) осталось псевдонимом: по нему
-// читают сборки, выпущенные до переименования.
-func handleMessages(store *Store, pub *publisher) http.HandlerFunc {
-	list, publish := handleHistory(store), handlePublish(store, pub)
-	return func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodGet:
-			list(w, r)
-		case http.MethodPost:
-			publish(w, r)
-		default:
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET or POST")
-		}
-	}
-}
-
-// handlePublish — POST /messages {token, channel, text, client_msg_id?} →
+// handlePublish — POST /messages {channel, text, client_msg_id?} (токен — заголовком) →
 // 200 {message} | 401 bad_session | 403 banned | 429 too_fast (+Retry-After) |
 // 400 bad_data — отправить сообщение в канал.
 //
@@ -578,10 +517,6 @@ func handleMessages(store *Store, pub *publisher) http.HandlerFunc {
 // что через другой нельзя.
 func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		if pub == nil {
 			slog.Error("publish not wired")
 			writeRESTError(w, http.StatusNotImplemented, "not_implemented",
@@ -589,18 +524,12 @@ func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 			return
 		}
 		var d PublishRequest
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Не удалось разобрать запрос")
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("publish session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "")
+		if !ok {
 			return
 		}
 		if len(d.ClientMsgID) > maxClientMsgIDLen {
@@ -630,7 +559,7 @@ func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 	}
 }
 
-// handleLink — POST /profile/link/{telegram|apple|google} {token, id_token, name?}
+// handleLink — POST /profile/link/{telegram|apple|google} {id_token, name?}
 // → 200 authed | 401 bad_session | 401 bad_auth | 403 banned | 409 identity_taken
 // | 501 provider_disabled — привязать к текущему аккаунту ещё один способ входа.
 //
@@ -649,28 +578,18 @@ func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 // аккаунт — вместо этого честно отказываем.
 func handleLink(store *Store, provider string, v *Verifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		if v == nil {
 			writeRESTError(w, http.StatusNotImplemented, "provider_disabled",
 				"Вход через "+provider+" не настроен на сервере")
 			return
 		}
 		var d LinkRequest
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.IDToken == "" {
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.IDToken == "" {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id_token")
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("link session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и id_token")
+		if !ok {
 			return
 		}
 		pu, err := v.Verify(d.IDToken, d.Name)
@@ -715,7 +634,7 @@ func handleLink(store *Store, provider string, v *Verifier) http.HandlerFunc {
 	}
 }
 
-// handleSetName — POST /profile/name {token, name} → 200 authed | 401 bad_session
+// handleSetName — POST /profile/name {name} (токен — заголовком) → 200 authed | 401 bad_session
 // | 400 bad_data (пустое имя) — задать отображаемое имя вручную.
 //
 // Нужен потому, что имя есть не у всех провайдеров: Apple отдаёт его только при
@@ -728,28 +647,18 @@ func handleLink(store *Store, provider string, v *Verifier) http.HandlerFunc {
 // итоговое (уже обрезанное) значение с сервера, а не додумывал своё.
 func handleSetName(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+		var d SetNameData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Не удалось разобрать запрос")
 			return
 		}
-		var d SetNameData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+		u, ok := sessionUser(w, r, store, d.Token, "")
+		if !ok {
 			return
 		}
 		name := cleanName(d.Name)
 		if name == "" {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Имя не может быть пустым")
-			return
-		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("set_name session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
 			return
 		}
 		if err := store.SetUserName(u.ID, name); err != nil {
@@ -766,30 +675,20 @@ func handleSetName(store *Store) http.HandlerFunc {
 	}
 }
 
-// handlePushRegister — POST /push/register {token, fcm_token, platform} → 200 {}
+// handlePushRegister — POST /push/register {fcm_token, platform} (токен — заголовком) → 200 {}
 // — привязывает токен устройства FCM к аккаунту, чтобы сервер мог адресно слать
 // пуши о новых сообщениях (и НЕ слать автору его же сообщение). Требует
 // валидную сессию. Идемпотентен: повторная регистрация того же токена только
 // обновляет привязку (в т.ч. переносит токен на другой аккаунт).
 func handlePushRegister(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		var d PushTokenData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.FCMToken == "" {
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.FCMToken == "" {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и токен устройства")
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("push_register session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и токен устройства")
+		if !ok {
 			return
 		}
 		if err := store.SaveDeviceToken(u.ID, d.FCMToken, d.Platform); err != nil {
@@ -807,10 +706,6 @@ func handlePushRegister(store *Store) http.HandlerFunc {
 // а знание самого fcm_token достаточно для того, чтобы отписать это устройство.
 func handlePushUnregister(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		var d PushTokenData
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.FCMToken == "" {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен устройства")
@@ -830,7 +725,7 @@ func handlePushUnregister(store *Store) http.HandlerFunc {
 // чтобы в БД не оседал мусор, но и старый клиент не ломался.
 var reportReasons = map[string]bool{"spam": true, "abuse": true, "illegal": true, "other": true}
 
-// handleReport — POST /report {token, message_id, reason} → 200 {} — жалоба на
+// handleReport — POST /report {message_id, reason} (токен — заголовком) → 200 {} — жалоба на
 // сообщение (модерация UGC, требование Apple 1.2). Требует валидную сессию;
 // текст и автора сервер берёт из самого сообщения. 404 not_found — сообщения
 // нет (удалено по TTL или неверный id). Повторная жалоба на то же сообщение —
@@ -840,27 +735,17 @@ var reportReasons = map[string]bool{"spam": true, "abuse": true, "illegal": true
 // клиенту не должен ждать Telegram, а жалоба к этому моменту уже в БД.
 func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+		var d ReportData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.MessageID <= 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id сообщения")
 			return
 		}
-		var d ReportData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" || d.MessageID <= 0 {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id сообщения")
+		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и id сообщения")
+		if !ok {
 			return
 		}
 		if !reportReasons[d.Reason] {
 			d.Reason = "other"
-		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("report session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
-			return
 		}
 		rep, err := store.ReportMessage(d.MessageID, u.ID, d.Reason)
 		if err != nil {
@@ -892,27 +777,22 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 	}
 }
 
-// handleAcceptRules — POST /rules/accept {token} → 200 authed
+// handleAcceptRules — POST /rules/accept (токен — заголовком) → 200 authed
 // {rules_accepted: true} | 401 bad_session | 400 not_authed (нет токена).
 func handleAcceptRules(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
+		var d AcceptRulesData
+		if !decodeLegacyBody(w, r, &d) {
 			return
 		}
-		var d AcceptRulesData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
+		// Код not_authed здесь, а не bad_data из sessionUser: он описан в
+		// PROTOCOL.md именно для этого эндпоинта, и менять его заодно нельзя.
+		if sessionToken(r, d.Token) == "" {
 			writeRESTError(w, http.StatusBadRequest, "not_authed", "Нужен токен сессии")
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("accept_rules session lookup", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "")
+		if !ok {
 			return
 		}
 		if err := store.AcceptRules(u.ID); err != nil {
@@ -927,21 +807,21 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 	}
 }
 
-// handleLogout — POST /session/logout {token} → 200 {} всегда (идемпотентно:
+// handleLogout — POST /session/logout (токен — заголовком) → 200 {} всегда (идемпотентно:
 // отзыв несуществующего токена — тоже успех, клиенту важно лишь «сессии больше
 // нет»). Отзывает только этот токен, другие устройства пользователя не трогает.
 func handleLogout(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		var d LogoutData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "invalid logout payload")
+		if !decodeLegacyBody(w, r, &d) {
 			return
 		}
-		if err := store.DeleteSession(d.Token); err != nil {
+		token := sessionToken(r, d.Token)
+		if token == "" {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
+			return
+		}
+		if err := store.DeleteSession(token); err != nil {
 			slog.Error("logout", "err", err)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "logout failed")
 			return
@@ -950,27 +830,16 @@ func handleLogout(store *Store) http.HandlerFunc {
 	}
 }
 
-// handleResume — POST /session/resume {token} → 200 authed (name/username/
+// handleResume — POST /session/resume (токен — заголовком) → 200 authed (name/username/
 // rules_accepted, без token — клиент его и так прислал) | 401 bad_session.
 func handleResume(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use POST")
-			return
-		}
 		var d ResumeData
-		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.Token == "" {
-			writeRESTError(w, http.StatusBadRequest, "bad_data", "invalid resume payload")
+		if !decodeLegacyBody(w, r, &d) {
 			return
 		}
-		u, err := store.UserBySession(d.Token)
-		if err != nil {
-			slog.Error("resume", "err", err)
-			writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
-			return
-		}
-		if u == nil {
-			writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		u, ok := sessionUser(w, r, store, d.Token, "")
+		if !ok {
 			return
 		}
 		writeJSON(w, http.StatusOK, AuthedData{
@@ -989,10 +858,6 @@ func handleResume(store *Store) http.HandlerFunc {
 // спрашивает, а знать его надо в том числе до входа.
 func handleVersion(store *Store, gate *versionGate) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
-			return
-		}
 		q := r.URL.Query()
 		platform, clientVersion := q.Get("platform"), q.Get("version")
 		// В телеметрию пишем только осмысленную пару «известная платформа +
@@ -1006,6 +871,79 @@ func handleVersion(store *Store, gate *versionGate) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, gate.verdict(platform, clientVersion, time.Now()))
 	}
+}
+
+// decodeLegacyBody разбирает тело у эндпоинтов, которым от него нужен только
+// legacy-токен (клиент с 1.4.0 присылает пустое тело и заголовок). Пустое тело —
+// норма, БИТОЕ — отказ: молча продолжать на нём нельзя. У /account/delete это
+// прямо опасно — запрос с испорченным телом и валидным токеном удалял бы аккаунт
+// вместо 400, а удаление необратимо.
+func decodeLegacyBody(w http.ResponseWriter, r *http.Request, d any) bool {
+	if err := json.NewDecoder(r.Body).Decode(d); err != nil && !errors.Is(err, io.EOF) {
+		writeRESTError(w, http.StatusBadRequest, "bad_data", "Не удалось разобрать запрос")
+		return false
+	}
+	return true
+}
+
+// ─── сессия ───
+
+// Токен сессии приезжает в заголовке `Authorization: Bearer <токен>`.
+//
+// Раньше он лежал в теле запроса (поле `token`) и в query у GET-эндпоинтов. Это
+// работало, но плохо тем, что токен попадал в URL — а значит и в любые
+// access-логи, которые кто-нибудь однажды включит, — и что единой точки проверки
+// не было: одиннадцать хендлеров повторяли один и тот же разбор.
+//
+// Прежние места сервер ПОКА принимает: сборки ≤1.3.0 присылают токен только так.
+// Уйдут они вместе с остальным легаси (см. ether-meta/PLANS.md).
+
+// bearerToken — токен из заголовка. Пусто, если заголовка нет или он не Bearer:
+// тогда вызывающий возьмёт токен из старого места.
+func bearerToken(r *http.Request) string {
+	const prefix = "Bearer "
+	h := r.Header.Get("Authorization")
+	if len(h) <= len(prefix) || !strings.EqualFold(h[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(h[len(prefix):])
+}
+
+// sessionToken — какой токен считать присланным: заголовок главнее, legacy —
+// значение из тела или query у старых сборок.
+func sessionToken(r *http.Request, legacy string) string {
+	if t := bearerToken(r); t != "" {
+		return t
+	}
+	return legacy
+}
+
+// sessionUser — единая проверка сессии: находит пользователя по токену и сам
+// отвечает на все три неудачи (нет токена → 400, ошибка чтения → 500, токен не
+// найден → 401). Второе значение false означает «ответ уже отправлен, выходим».
+//
+// what — что именно эндпоинту нужно, для текста ошибки при отсутствии токена
+// («токен сессии и id сообщения»); пусто → «токен сессии».
+func sessionUser(w http.ResponseWriter, r *http.Request, store *Store, legacy, what string) (*User, bool) {
+	token := sessionToken(r, legacy)
+	if token == "" {
+		if what == "" {
+			what = "токен сессии"
+		}
+		writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен "+what)
+		return nil, false
+	}
+	u, err := store.UserBySession(token)
+	if err != nil {
+		slog.Error("session lookup", "err", err, "path", r.URL.Path)
+		writeRESTError(w, http.StatusInternalServerError, "internal", "session lookup failed")
+		return nil, false
+	}
+	if u == nil {
+		writeRESTError(w, http.StatusUnauthorized, "bad_session", "Сессия не найдена — войди заново")
+		return nil, false
+	}
+	return u, true
 }
 
 // ─── общие хелперы ответа ───

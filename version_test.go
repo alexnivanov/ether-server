@@ -166,7 +166,7 @@ func TestVersionEndpoint(t *testing.T) {
 		platformIOS: without(func(r *ClientVersionRule) { r.LatestSince = "2020-01-01" }),
 	})
 	mux := http.NewServeMux()
-	mux.HandleFunc("/version", handleVersion(store, gate))
+	mux.HandleFunc("GET /version", handleVersion(store, gate))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -195,7 +195,7 @@ func TestVersionEndpoint(t *testing.T) {
 func TestVersionEndpointSkipsJunk(t *testing.T) {
 	store := openTestStore(t)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/version", handleVersion(store, testGate(t, nil)))
+	mux.HandleFunc("GET /version", handleVersion(store, testGate(t, nil)))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -220,11 +220,13 @@ func TestVersionEndpointSkipsJunk(t *testing.T) {
 	}
 }
 
-// TestVersionEndpointRejectsPost — это чтение, и метод должен быть GET.
+// TestVersionEndpointRejectsPost — это чтение, и метод должен быть GET. Отбивает
+// сам роутер (метод указан в паттерне), поэтому ответ — текстовый 405 от
+// стандартной библиотеки, а не наш JSON.
 func TestVersionEndpointRejectsPost(t *testing.T) {
 	store := openTestStore(t)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/version", handleVersion(store, testGate(t, nil)))
+	mux.HandleFunc("GET /version", handleVersion(store, testGate(t, nil)))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 

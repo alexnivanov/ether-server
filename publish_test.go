@@ -216,7 +216,7 @@ func TestPublishRESTTooFast(t *testing.T) {
 	mux := http.NewServeMux()
 	pub := &publisher{store: store, hub: NewHub(), limiter: NewRateLimiter()}
 	go pub.hub.Run()
-	mux.HandleFunc("/messages", handleMessages(store, pub))
+	mux.HandleFunc("POST /messages", handlePublish(store, pub))
 	limitedSrv := httptest.NewServer(mux)
 	defer limitedSrv.Close()
 	limited := limitedSrv.URL
@@ -248,7 +248,7 @@ func TestPublishRESTTooFast(t *testing.T) {
 func TestPublishRESTNotWired(t *testing.T) {
 	store := openTestStore(t)
 	mux := http.NewServeMux()
-	mux.HandleFunc("/messages", handleMessages(store, nil))
+	mux.HandleFunc("POST /messages", handlePublish(store, nil))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
@@ -347,6 +347,13 @@ func TestMessagesGetAndPost(t *testing.T) {
 	if del.StatusCode != http.StatusMethodNotAllowed {
 		t.Errorf("DELETE: status %d, want 405 — удаления пока нет", del.StatusCode)
 	}
+	// 405 отбивает роутер (метод указан в паттерне), и он же перечисляет
+	// разрешённые методы — по этому заголовку видно, что ресурс существует, но
+	// умеет не то, о чём спросили.
+	if allow := del.Header.Get("Allow"); !strings.Contains(allow, "POST") ||
+		!strings.Contains(allow, "GET") {
+		t.Errorf("Allow = %q, want GET и POST", allow)
+	}
 }
 
 // TestHistoryAliasStillWorks — прежний путь чтения обязан работать: по нему
@@ -409,7 +416,7 @@ func TestPublishRetryDoesNotSpendLimit(t *testing.T) {
 	hub := NewHub()
 	go hub.Run()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/messages", handleMessages(store,
+	mux.HandleFunc("POST /messages", handlePublish(store,
 		&publisher{store: store, hub: hub, limiter: NewRateLimiter()}))
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
