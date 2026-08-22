@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -187,6 +189,64 @@ const (
 	landingURL  = "/"
 )
 
+// appleProviderToken — параметр `pt` в campaign-ссылке App Store: идентификатор
+// нашего аккаунта-поставщика, один и тот же для всех кампаний. Не секрет (Apple
+// сам вставляет его в публичные ссылки, которые предлагает раздавать), поэтому
+// лежит константой рядом с адресами сторов, а не в конфиге. Берётся копированием
+// из ссылки, которую генерирует App Store Connect → App Analytics → Acquisition;
+// из bundle id он не выводится.
+//
+// Пусто → метку кампании к ссылке App Store НЕ добавляем: Apple засчитывает
+// переход, только когда в ссылке есть и `pt`, и `ct`, а `ct` в одиночку
+// игнорируется — то есть смысла в неполной ссылке нет. Та же страховка пустым
+// значением, что и у playURL выше.
+//
+// var, а не const, ровно ради тестов: иначе ветка полной ссылки не проверяется до
+// того дня, когда токен впишут, — а ошибку в такой ссылке Apple не показывает,
+// она просто перестаёт считаться. В рантайме значение не меняется.
+var appleProviderToken = ""
+
+// srcCampaign — какие метки src годятся в campaign-параметр стора. Whitelist, а
+// не экранирование: эндпоинт открытый, и src уезжает в заголовок Location, тогда
+// как все наши метки — ascii-слаги по построению (apli, apqr, st0). Не прошедший
+// проверку src всё равно попадёт в app_access как есть: теряется атрибуция в
+// сторе, а не строка статистики.
+//
+// Длина совпадает с maxSrcLen и укладывается в лимит `ct` у Apple (40 символов).
+var srcCampaign = regexp.MustCompile(`^[A-Za-z0-9_-]{1,32}$`)
+
+// appStoreLink и playLink — адрес стора с меткой кампании. Нужны, чтобы считать
+// не только переходы по ссылке (это и так делает app_access), но и УСТАНОВКИ в
+// разрезе источника: свои цифры кончаются на редиректе, дальше видит только стор.
+//
+// Метка едет тем же путём, что и человек, поэтому ссылка на стикере не меняется —
+// параметры дописывает сервер в момент редиректа.
+func appStoreLink(campaign string) string {
+	if campaign == "" || appleProviderToken == "" {
+		return appStoreURL
+	}
+	// mt=8 — тип медиа «приложения», legacy-параметр со времён iTunes; Apple
+	// держит его в генерируемых ссылках, поэтому держим и мы.
+	return appStoreURL + "?pt=" + appleProviderToken + "&ct=" + campaign + "&mt=8"
+}
+
+// playLink: Play принимает источник ОДНИМ параметром `referrer`, внутри которого
+// лежит utm-строка, и её нужно закодировать целиком (`=` → %3D, `&` → %26) —
+// иначе её части станут параметрами самой ссылки стора, а referrer приедет
+// обрезанным.
+//
+// utm_source = src: источник у нас одно измерение, и раскладывать его на
+// source/medium/campaign значило бы завести вторую систему имён поверх той, что
+// уже лежит в app_access.src. utm_medium постоянный — Play показывает свои
+// отчёты по паре source+medium, и без medium источник в них не появляется.
+func playLink(campaign string) string {
+	if campaign == "" {
+		return playURL
+	}
+	return playURL + "&referrer=" +
+		url.QueryEscape("utm_source="+campaign+"&utm_medium=applink")
+}
+
 // Значения app_access.outcome — куда фактически отправили.
 const (
 	outcomeAppStore = "appstore"
@@ -230,6 +290,12 @@ const srcDeployCheck = "deploy-check"
 // Единственный здесь незалогиненный хендлер, отвечающий редиректом, а не JSON, —
 // на той стороне обычный браузер, а не клиент Эфира.
 //
+// src едет дальше в стор campaign-параметром (см. appStoreLink и playLink): своя
+// статистика заканчивается на этом редиректе, а вопрос «сколько из них
+// установило» отвечает уже консоль стора. Ссылку у человека на руках это не
+// меняет — параметры дописываются здесь, поэтому напечатанный QR остаётся
+// валидным, что бы мы потом ни поменяли в разметке кампаний.
+//
 // Запись в лог не должна мешать переходу: ошибку вставки логируем, а человека
 // всё равно отправляем в стор. Статистика важнее пользы от неё не бывает.
 //
@@ -251,19 +317,26 @@ func handleAppLink(store *Store) http.HandlerFunc {
 		// пришёл ставить приложение, а приглашение просто останется неизвестным.
 		uid, _ := strconv.ParseInt(q.Get("uid"), 10, 64)
 		ua := r.Header.Get("User-Agent")
+		src := truncate(q.Get("src"), maxSrcLen)
+
+		// Метка кампании для стора — только у настоящих переходов: своя проверка
+		// деплоя не должна попадать ни в app_access, ни в отчёты сторов.
+		campaign := ""
+		if src != srcDeployCheck && srcCampaign.MatchString(src) {
+			campaign = src
+		}
 
 		platform := detectPlatform(ua)
 		target, outcome := landingURL, outcomeLanding
 		switch platform {
 		case platformIOS:
-			target, outcome = appStoreURL, outcomeAppStore
+			target, outcome = appStoreLink(campaign), outcomeAppStore
 		case platformAndroid:
 			if playURL != "" {
-				target, outcome = playURL, outcomePlay
+				target, outcome = playLink(campaign), outcomePlay
 			}
 		}
 
-		src := truncate(q.Get("src"), maxSrcLen)
 		if src != srcDeployCheck {
 			if err := store.SaveAppAccess(AppAccess{
 				UID:      uid,

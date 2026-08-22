@@ -3,6 +3,7 @@ package main
 import (
 	"database/sql"
 	"net/http"
+	"net/url"
 	"testing"
 )
 
@@ -53,6 +54,16 @@ func noRedirectClient() *http.Client {
 	}
 }
 
+// withAppleProviderToken подставляет `pt` на время теста. В проде это постоянное
+// значение аккаунта, но пока оно не вписано, без подмены не проверить ветку
+// полной campaign-ссылки — той самой, ошибку в которой Apple молча проглотит.
+func withAppleProviderToken(t *testing.T, token string) {
+	t.Helper()
+	prev := appleProviderToken
+	appleProviderToken = token
+	t.Cleanup(func() { appleProviderToken = prev })
+}
+
 // getAppLink дёргает /app с заданным User-Agent и возвращает ответ.
 func getAppLink(t *testing.T, srv, url, ua string) *http.Response {
 	t.Helper()
@@ -80,8 +91,8 @@ func TestAppLinkIOS(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("status = %d, want 302", resp.StatusCode)
 	}
-	if got := resp.Header.Get("Location"); got != appStoreURL {
-		t.Errorf("Location = %q, want %q", got, appStoreURL)
+	if got := resp.Header.Get("Location"); got != appStoreLink("apli") {
+		t.Errorf("Location = %q, want %q", got, appStoreLink("apli"))
 	}
 	// закэшированный редирект до сервера не дойдёт и не посчитается
 	if got := resp.Header.Get("Cache-Control"); got != "no-store" {
@@ -116,8 +127,8 @@ func TestAppLinkAndroidGoesToPlay(t *testing.T) {
 
 	resp := getAppLink(t, srv.URL, "/app?src=apqr&uid=7", uaAndroid)
 
-	if got := resp.Header.Get("Location"); got != playURL {
-		t.Errorf("Location = %q, want %q", got, playURL)
+	if got := resp.Header.Get("Location"); got != playLink("apqr") {
+		t.Errorf("Location = %q, want %q", got, playLink("apqr"))
 	}
 	row := lastAppAccess(t, store)
 	if row.Platform != platformAndroid {
@@ -128,6 +139,86 @@ func TestAppLinkAndroidGoesToPlay(t *testing.T) {
 	}
 	if row.Src != "apqr" {
 		t.Errorf("src = %q, want apqr", row.Src)
+	}
+}
+
+// TestAppStoreLinkCampaign — метка кампании клеится к ссылке App Store только
+// вместе с pt: Apple засчитывает переход лишь при обоих параметрах, а одинокий
+// ct игнорирует, поэтому неполную ссылку не собираем вовсе.
+func TestAppStoreLinkCampaign(t *testing.T) {
+	if got := appStoreLink(""); got != appStoreURL {
+		t.Errorf("без метки = %q, want %q", got, appStoreURL)
+	}
+	if got := appStoreLink("st0"); got != appStoreURL {
+		t.Errorf("pt не задан = %q, want %q (ct в одиночку бесполезен)", got, appStoreURL)
+	}
+
+	withAppleProviderToken(t, "123456")
+	want := appStoreURL + "?pt=123456&ct=st0&mt=8"
+	if got := appStoreLink("st0"); got != want {
+		t.Errorf("= %q, want %q", got, want)
+	}
+}
+
+// TestPlayLinkEncodesReferrer — utm-строка внутри referrer закодирована целиком.
+// Незакодированный `&` разорвал бы её: части стали бы параметрами самой ссылки
+// Play, referrer приехал бы обрезанным, и источник в отчётах не появился бы.
+func TestPlayLinkEncodesReferrer(t *testing.T) {
+	if got := playLink(""); got != playURL {
+		t.Errorf("без метки = %q, want %q", got, playURL)
+	}
+	want := playURL + "&referrer=utm_source%3Dst0%26utm_medium%3Dapplink"
+	if got := playLink("st0"); got != want {
+		t.Errorf("= %q, want %q", got, want)
+	}
+}
+
+// TestAppLinkStickerCampaign — сквозной путь печатной метки: со стикера человек
+// уезжает в стор вместе с меткой, и она же ложится в app_access. На стикере при
+// этом напечатан простой адрес (`/app?src=st0`, без uid — звал не человек, а
+// наклейка); campaign-параметры дописывает сервер.
+func TestAppLinkStickerCampaign(t *testing.T) {
+	withAppleProviderToken(t, "123456")
+	srv, store := newTestServer(t)
+
+	resp := getAppLink(t, srv.URL, "/app?src=st0", uaIPhone)
+	if got, want := resp.Header.Get("Location"), appStoreURL+"?pt=123456&ct=st0&mt=8"; got != want {
+		t.Errorf("Location = %q, want %q", got, want)
+	}
+
+	row := lastAppAccess(t, store)
+	if row.Src != "st0" {
+		t.Errorf("src = %q, want st0", row.Src)
+	}
+	if row.UID.Valid {
+		t.Errorf("uid = %v, want NULL", row.UID.Int64)
+	}
+}
+
+// TestAppLinkCampaignRejectsJunk — src приходит из открытого эндпоинта и уезжает
+// в заголовок Location, поэтому в стор попадают только ascii-слаги. Мусор метки
+// не получает, НО в статистику ложится как есть: терять строку из-за неудачной
+// атрибуции неправильно — переход-то был.
+//
+// Первый случай — тот, ради которого здесь whitelist: `&` в метке дописал бы к
+// ссылке стора чужие параметры.
+func TestAppLinkCampaignRejectsJunk(t *testing.T) {
+	withAppleProviderToken(t, "123456")
+	srv, store := newTestServer(t)
+
+	for _, src := range []string{"st0&ct=hijack", "st 0", "квартал", "st0#frag"} {
+		before := appAccessCount(t, store)
+		resp := getAppLink(t, srv.URL, "/app?src="+url.QueryEscape(src), uaIPhone)
+
+		if got := resp.Header.Get("Location"); got != appStoreURL {
+			t.Errorf("src=%q: Location = %q, want голый %q", src, got, appStoreURL)
+		}
+		if got := appAccessCount(t, store); got != before+1 {
+			t.Errorf("src=%q: строк %d, want %d — переход обязан посчитаться", src, got, before+1)
+		}
+		if got := lastAppAccess(t, store).Src; got != src {
+			t.Errorf("src = %q, want %q — в базу метка идёт как есть", got, src)
+		}
 	}
 }
 
@@ -195,6 +286,7 @@ func TestAppLinkTruncatesInput(t *testing.T) {
 // /app после каждой выкатки. Редирект она получить обязана, а вот в статистику
 // попадать не должна: это наш же curl, а не человек.
 func TestAppLinkSkipsDeployCheck(t *testing.T) {
+	withAppleProviderToken(t, "123456")
 	srv, store := newTestServer(t)
 
 	resp := getAppLink(t, srv.URL, "/app?src="+srcDeployCheck, uaIPhone)
@@ -205,6 +297,11 @@ func TestAppLinkSkipsDeployCheck(t *testing.T) {
 	}
 	if n := appAccessCount(t, store); n != 0 {
 		t.Errorf("app_access = %d строк, want 0", n)
+	}
+	// И в отчётах сторов её тоже быть не должно: метка ушла бы туда кампанией,
+	// хотя это наш собственный curl после выкатки.
+	if got := resp.Header.Get("Location"); got != appStoreURL {
+		t.Errorf("Location = %q, want голый %q", got, appStoreURL)
 	}
 }
 
