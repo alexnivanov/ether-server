@@ -33,7 +33,9 @@ import (
 // просто не регистрировался, и клиент получал текстовый `404 page not found` от
 // net/http — на нём падал разбор JSON, и любая настроечная ошибка выглядела в
 // приложении как невнятное «Не удалось войти».
-func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier) {
+// gate может быть nil — пороги версий не заданы; GET /version тогда всем
+// отвечает ok (см. version.go).
+func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate) {
 	mux.HandleFunc("/account/delete", handleDeleteAccount(store))
 	mux.HandleFunc("/app", handleAppLink(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
@@ -54,6 +56,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("/rules/accept", handleAcceptRules(store))
 	mux.HandleFunc("/session/logout", handleLogout(store))
 	mux.HandleFunc("/session/resume", handleResume(store))
+	mux.HandleFunc("/version", handleVersion(store, gate))
 }
 
 // handleBlock — POST /block {token, user_id, unblock?} → 200 {} | 401 bad_session
@@ -873,6 +876,34 @@ func handleResume(store *Store) http.HandlerFunc {
 			User:          authedUser(store, u),
 			RulesAccepted: u.RulesAccepted,
 		})
+	}
+}
+
+// handleVersion — GET /version?platform=&version= → 200 {status, latest, url}:
+// пора ли клиенту обновиться (см. version.go). Всегда 200, в том числе на мусор
+// в параметрах: вердикт «ok» — единственный безопасный ответ, когда о клиенте
+// ничего не понятно.
+//
+// Без авторизации, как /health и /history: вердикт не зависит от того, кто
+// спрашивает, а знать его надо в том числе до входа.
+func handleVersion(store *Store, gate *versionGate) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeRESTError(w, http.StatusMethodNotAllowed, "bad_method", "use GET")
+			return
+		}
+		q := r.URL.Query()
+		platform, clientVersion := q.Get("platform"), q.Get("version")
+		// В телеметрию пишем только осмысленную пару «известная платформа +
+		// разобранная версия». Эндпоинт открытый и без аутентификации, а по этой
+		// таблице мы решаем судьбу старых сборок — мусор в ней исказил бы ровно
+		// то решение, ради которого она и ведётся.
+		if _, ok := parseSemver(clientVersion); ok && storeURL(platform) != "" {
+			if err := store.SaveClientVersion(platform, clientVersion); err != nil {
+				slog.Error("client version", "err", err, "platform", platform)
+			}
+		}
+		writeJSON(w, http.StatusOK, gate.verdict(platform, clientVersion, time.Now()))
 	}
 }
 

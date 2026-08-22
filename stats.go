@@ -102,6 +102,9 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 	writeGroup(&b, "Источник", st.BySrc)
 	writeGroup(&b, "Платформа", st.ByPlatform)
 	writeGroup(&b, "Позвали", st.ByInviter)
+	// Версии — про запуски приложения, а не про переходы по ссылке, поэтому
+	// группа идёт последней, отдельно от трёх предыдущих.
+	writeGroup(&b, "Версии", st.ByClientVersion)
 
 	if len(st.AccessRows) == 0 {
 		return b.String()

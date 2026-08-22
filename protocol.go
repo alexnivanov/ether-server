@@ -165,6 +165,18 @@ type HealthData struct {
 	UptimeSec int64  `json:"uptime_sec"` // сколько живёт процесс
 }
 
+// UpdateData — тело ответа GET /version: вердикт о версии клиента (см.
+// version.go). Latest — что считать свежей версией, для показа человеку; URL —
+// куда ведёт кнопка «Обновить», заполняется только когда обновляться есть зачем.
+//
+// Имя не VersionData: version в этом сервере — его собственная версия сборки
+// (см. HealthData), и две «версии» с разным смыслом рядом путали бы.
+type UpdateData struct {
+	Status string `json:"status"` // ok | soft | required
+	Latest string `json:"latest,omitempty"`
+	URL    string `json:"url,omitempty"`
+}
+
 // HistoryData — тело ответа REST GET /history (см. rest.go).
 type HistoryData struct {
 	Channel  string        `json:"channel"`

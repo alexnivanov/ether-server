@@ -55,6 +55,9 @@ type Config struct {
 	// там же про приватность: в события попадает внутренний id пользователя, поэтому Sentry указан в
 	// privacy policy как сторонний сервис.
 	SentryDSN string `yaml:"sentry_dsn"`
+	// Пороги версий клиента по платформам (ключ — ios|android), см. version.go.
+	// Ключа нет → сервер про обновления молчит: GET /version всем отвечает ok.
+	ClientVersions map[string]ClientVersionRule `yaml:"client_versions"`
 }
 
 func LoadConfig(path string) (*Config, error) {

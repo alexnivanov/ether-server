@@ -128,8 +128,18 @@ func main() {
 		slog.Info("moderation commands", "enabled", true)
 	}
 
+	// пороги версий клиента (см. version.go). Неверный порог — ошибка старта, а
+	// не молчание: он либо тихо блокирует людей, либо тихо ничего не делает, и
+	// заметить это можно только по жалобам.
+	gate, err := newVersionGate(cfg.ClientVersions)
+	if err != nil {
+		slog.Error("client versions", "err", err)
+		os.Exit(1)
+	}
+	slog.Info("client versions", "platforms", len(cfg.ClientVersions))
+
 	mux := http.NewServeMux()
-	registerREST(mux, store, verifiers, notify)
+	registerREST(mux, store, verifiers, notify, gate)
 	// лимитер один на процесс: частота считается на аккаунт, а не на соединение
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, NewRateLimiter()))
 

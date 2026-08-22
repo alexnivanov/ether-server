@@ -254,6 +254,25 @@ CREATE TABLE IF NOT EXISTS weekly_stats (
 	scheduled_at INTEGER PRIMARY KEY, -- unix-мс момента расписания, за который сводка отправлена
 	sent_at      INTEGER NOT NULL     -- unix-мс фактической отправки
 );
+-- Отметки клиентов о своей версии (GET /version, см. version.go): по одной на
+-- запуск приложения. Нужны ради одного вопроса — какая доля живых сборок ещё
+-- старая, — от которого зависит, когда можно снимать поддержку старых способов
+-- работы (см. ether-meta/PLANS.md).
+--
+-- Не путать с client_versions в конфиге: там ПОРОГИ, которые мы назначаем, здесь
+-- НАБЛЮДЕНИЯ, которые присылают клиенты.
+--
+-- Ни пользователя, ни IP здесь нет намеренно: эндпоинт открытый и без входа, а
+-- для ответа на этот вопрос достаточно распределения версий. Строки не чистятся
+-- (как и app_access): один запуск = одна короткая строка, и на нашем масштабе
+-- таблица не растёт заметно.
+CREATE TABLE IF NOT EXISTS client_version (
+	id       INTEGER PRIMARY KEY AUTOINCREMENT,
+	ts       INTEGER NOT NULL,  -- unix-миллисекунды (как всюду в БД)
+	platform TEXT NOT NULL,     -- ios|android; иное в таблицу не попадает
+	version  TEXT NOT NULL      -- «1.2.0», уже разобранная как semver
+);
+CREATE INDEX IF NOT EXISTS client_version_ts ON client_version(ts);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -1154,6 +1173,18 @@ func (s *Store) SaveAppAccess(a AppAccess) error {
 	return err
 }
 
+// SaveClientVersion — отметка о версии клиента (см. client_version и
+// version.go). Вызывающий уже проверил, что платформа известна, а версия
+// разбирается: в таблицу не должно попадать то, по чему нельзя считать
+// распределение.
+func (s *Store) SaveClientVersion(platform, clientVersion string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO client_version (ts, platform, version)
+		VALUES (?, ?, ?)`,
+		time.Now().UnixMilli(), platform, clientVersion)
+	return err
+}
+
 // ─── еженедельная сводка ───
 
 // CountRow — «что-то и сколько его»: строка любой группировки в сводке.
@@ -1191,6 +1222,10 @@ type WeeklyStats struct {
 	ByPlatform []CountRow
 	ByInviter  []CountRow
 	AccessRows []AccessRow
+	// ByClientVersion — распределение версий по отметкам client_version. Считает
+	// ЗАПУСКИ приложения, а не людей: кто открыл Эфир десять раз, даст десять
+	// отметок. Для вопроса «остались ли живые старые сборки» этого достаточно.
+	ByClientVersion []CountRow
 }
 
 // WeeklyStats собирает сводку за [from, to). Границы полуоткрытые: соседние
@@ -1232,6 +1267,14 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 	if st.ByPlatform, err = s.countRows(`
 		SELECT platform, COUNT(*) n
 		FROM app_access WHERE ts >= ? AND ts < ?
+		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
+		return nil, err
+	}
+	// Версии клиентов: платформа и версия в одном ключе («ios 1.2.0») — читать
+	// сводку проще одной строкой, чем двумя группировками, которые надо сопоставлять.
+	if st.ByClientVersion, err = s.countRows(`
+		SELECT platform || ' ' || version, COUNT(*) n
+		FROM client_version WHERE ts >= ? AND ts < ?
 		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
 		return nil, err
 	}
