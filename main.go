@@ -70,7 +70,7 @@ func main() {
 		slog.Error("store", "err", err)
 		os.Exit(1)
 	}
-	go startMessageCleanup(store) // сообщения живут messageTTL, см. cleanup.go
+	go startCleanup(store) // сообщения и статистика геокодинга, см. cleanup.go
 
 	nominatim := NewNominatimGeocoder()
 	if cfg.NominatimURL != "" {
@@ -79,7 +79,17 @@ func main() {
 	// Кеш поверх геокодера: набор каналов для точки стабилен, а публичный
 	// Nominatim ограничен 1 req/s (см. geocache.go). Без него задержка упирается
 	// в потолок уже на десятках активных пользователей.
-	var geo Geocoder = newCachedGeocoder(nominatim, geocodeCacheTTL, geocodeCacheMax)
+	cached := newCachedGeocoder(nominatim, geocodeCacheTTL, geocodeCacheMax)
+	// Статистика геокодинга: строка на каждый вызов вместе с ожиданием. По ней в
+	// недельной сводке видно, держит ли кеш нагрузку, попадал ли кто-то в очередь
+	// и за какими странами мы ходим в Nominatim — то есть чей экстракт имеет смысл
+	// поднимать своим первым. Ошибка записи геокодинг не ломает.
+	cached.stat = func(r GeocodeRequest) {
+		if err := store.SaveGeocodeRequest(r); err != nil {
+			slog.Error("geocode stat", "err", err, "source", r.Source)
+		}
+	}
+	var geo Geocoder = cached
 
 	// Провайдеры входа: сервер проверяет ID-token по публичным ключам провайдера
 	// (JWKS тянется лениво при первом входе), поэтому старт не зависит от их

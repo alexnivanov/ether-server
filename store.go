@@ -256,6 +256,46 @@ CREATE TABLE IF NOT EXISTS app_access (
 );
 CREATE INDEX IF NOT EXISTS app_access_ts  ON app_access(ts);
 CREATE INDEX IF NOT EXISTS app_access_uid ON app_access(uid, ts);
+-- Геокодинг — СТРОКА НА ВЫЗОВ: и попадание в кеш, и обращение в сеть.
+--
+-- Вопрос, на который таблица отвечает: где узкое место. А узкое место у нас
+-- временнóе: getJSON держит мьютекс на весь запрос плюс паузу 1100 мс (лимит
+-- публичного сервера 1 req/s), один Channels делает два запроса, поэтому
+-- одновременные промахи кеша встают в очередь — третий человек ждёт ~6,6 с. В
+-- суточном агрегате это неотличимо от ровной нагрузки, поэтому здесь события:
+-- нужно знать КОГДА, а не только сколько. По той же причине попадания лежат
+-- строками рядом с запросами, а не счётчиком в стороне: всплеск вызовов — это
+-- контекст, из которого видно, откуда взялась очередь.
+--
+-- Растёт быстрее всех наших таблиц (вызов на каждый locate, включая авто-режим
+-- раз в минуту у каждого клиента), поэтому строки живут geocodeRequestTTL —
+-- уборщик в cleanup.go.
+CREATE TABLE IF NOT EXISTS geocode_request (
+	ts      INTEGER NOT NULL,  -- unix-мс завершения (как всюду в БД)
+	-- cache — отдали из памяти; net — сходили в Nominatim; joined — своего запроса
+	-- не было, ждали чужой (single-flight в geocache.go). joined считать в
+	-- «сколько раз мы сходили в сеть» нельзя, а его ожидание — вполне.
+	source  TEXT NOT NULL,
+	country TEXT NOT NULL,     -- ISO 3166-1 из ответа; '' — страна не определилась
+	-- NULL — получилось; иначе метка отказа: timeout, http_429, http_400, bad_json,
+	-- nominatim_error, bad_coords, network, other (см. geocodeErrLabel).
+	--
+	-- NULL, а не пустая строка, по той же причине, что и у wait_ms ниже:
+	-- «неприменимо» в этой таблице выражается NULL, и COUNT(error) тогда сам
+	-- считает только отказы. И метка, а не флаг «ок/не ок»: «отказов 12» не
+	-- подсказывает, что делать, а «11 из них http_429» прямо говорит, что мы
+	-- упёрлись в лимит публичного сервера. У joined метка копируется от чужого
+	-- запроса: не получил он — значит не получили и ждавшие.
+	error   TEXT,
+	-- Сколько ждал ВЫЗЫВАЮЩИЙ: очередь на мьютексе + пауза дросселя + сеть, то
+	-- есть время экрана «Определяем каналы…», а не время HTTP.
+	--
+	-- NULL, а не 0, у source='cache': ждать там было нечего. Ноль означал бы
+	-- «ждал нисколько» и утянул бы среднее вниз (попаданий больше всего), а NULL
+	-- AVG и MAX пропускают сами, без оговорок в каждом запросе.
+	wait_ms INTEGER
+);
+CREATE INDEX IF NOT EXISTS geocode_request_ts ON geocode_request(ts);
 -- Отметки об отправленных еженедельных сводках (см. stats.go). Одна строка на
 -- момент расписания (суббота, statsHour), за который сводка ушла в Telegram.
 --
@@ -1381,6 +1421,55 @@ func (s *Store) SaveAppAccess(a AppAccess) error {
 	return err
 }
 
+// Значения geocode_request.source (см. схему).
+const (
+	geocodeSourceCache  = "cache"
+	geocodeSourceNet    = "net"
+	geocodeSourceJoined = "joined"
+)
+
+// GeocodeRequest — один вызов геокодера со временем, которое за него заплатил
+// вызывающий. У попадания в кеш Wait не заполняется: в базу уйдёт NULL.
+type GeocodeRequest struct {
+	TS      int64
+	Source  string
+	Country string
+	Err     string // «» — получилось; иначе метка из geocodeErrLabel (в базе NULL)
+	Wait    time.Duration
+}
+
+// SaveGeocodeRequest пишет строку про вызов геокодера. Ошибка не должна ломать
+// геокодинг — вызывающий её только логирует, как и у SaveAppAccess: статистика
+// важнее пользы от неё не бывает.
+func (s *Store) SaveGeocodeRequest(r GeocodeRequest) error {
+	// Инварианты схемы держим здесь, а не у вызывающего: у кеша ожидания нет, а
+	// «получилось» — это отсутствие метки. Так строк «cache с ненулевым ожиданием»
+	// или «успех с пустой строкой вместо NULL» просто не бывает.
+	var wait, failure any
+	if r.Source != geocodeSourceCache {
+		wait = r.Wait.Milliseconds()
+	}
+	if r.Err != "" {
+		failure = r.Err
+	}
+	_, err := s.db.Exec(`
+		INSERT INTO geocode_request (ts, source, country, error, wait_ms)
+		VALUES (?, ?, ?, ?, ?)`,
+		r.TS, r.Source, r.Country, failure, wait)
+	return err
+}
+
+// DeleteGeocodeRequestsOlderThan убирает старые вызовы: таблица построчная и
+// растёт быстрее всех, без уборки она заняла бы базу целиком (см. cleanup.go).
+func (s *Store) DeleteGeocodeRequestsOlderThan(ttl time.Duration) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM geocode_request WHERE ts < ?`,
+		time.Now().Add(-ttl).UnixMilli())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // SaveClientVersion — отметка о версии клиента (см. client_version и
 // version.go). Вызывающий уже проверил, что платформа известна, а версия
 // разбирается: в таблицу не должно попадать то, по чему нельзя считать
@@ -1434,6 +1523,27 @@ type WeeklyStats struct {
 	// ЗАПУСКИ приложения, а не людей: кто открыл Эфир десять раз, даст десять
 	// отметок. Для вопроса «остались ли живые старые сборки» этого достаточно.
 	ByClientVersion []CountRow
+	// Геокодинг. Requests — походы в Nominatim (source=net), Errors — из них
+	// отказы, CacheHits — попадания. Hit rate считается по Requests+CacheHits,
+	// поэтому оба числа нужны рядом.
+	GeocodeRequests  int
+	GeocodeErrors    int
+	GeocodeCacheHits int
+	// Ожидание вызывающего: среднее, худшее и сколько раз перевалило за
+	// geocodeSlowWait. Попадания в кеш здесь не участвуют (у них wait_ms NULL), а
+	// ожидания чужого запроса — участвуют: человек на экране «Определяем каналы…»
+	// ждёт одинаково, свой это запрос или нет.
+	WaitAvgMs int
+	WaitMaxMs int
+	WaitSlowN int
+	// ByGeocodeCountry — страны, ради которых ходили в Nominatim (попадания в кеш
+	// не считаются: они никуда не ходили). Отвечает на вопрос «чей экстракт
+	// поднимать следующим».
+	ByGeocodeCountry []CountRow
+	// ByGeocodeError — причины отказов (http_429, timeout, …). Отвечает на вопрос
+	// «упёрлись мы в лимит или Nominatim просто медленный», а он требует разных
+	// решений.
+	ByGeocodeError []CountRow
 }
 
 // WeeklyStats собирает сводку за [from, to). Границы полуоткрытые: соседние
@@ -1486,6 +1596,39 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
 		return nil, err
 	}
+	// Геокодинг — всё из одной таблицы. Одним проходом: счётчики по источникам,
+	// отказы и ожидание. AVG и MAX сами пропускают NULL, то есть попадания в кеш,
+	// а COALESCE нужен на случай тихой недели, когда строк нет вовсе.
+	if err := s.db.QueryRow(`
+		SELECT COALESCE(SUM(source = ?), 0), COALESCE(SUM(source = ?), 0),
+		       COALESCE(SUM(source = ? AND error IS NOT NULL), 0),
+		       COALESCE(CAST(AVG(wait_ms) AS INTEGER), 0), COALESCE(MAX(wait_ms), 0),
+		       COALESCE(SUM(wait_ms >= ?), 0)
+		FROM geocode_request WHERE ts >= ? AND ts < ?`,
+		geocodeSourceCache, geocodeSourceNet, geocodeSourceNet,
+		geocodeSlowWait.Milliseconds(), from, to).
+		Scan(&st.GeocodeCacheHits, &st.GeocodeRequests, &st.GeocodeErrors,
+			&st.WaitAvgMs, &st.WaitMaxMs, &st.WaitSlowN); err != nil {
+		return nil, err
+	}
+	// Отказы — только по походам в сеть: у joined метка не своя, а скопированная,
+	// и в этой разбивке она удвоила бы чужой отказ.
+	if st.ByGeocodeError, err = s.countRows(`
+		SELECT error, COUNT(*) n FROM geocode_request
+		WHERE ts >= ? AND ts < ? AND source = ? AND error IS NOT NULL
+		GROUP BY 1 ORDER BY n DESC`, from, to, geocodeSourceNet); err != nil {
+		return nil, err
+	}
+	// Страны — только про походы в сеть: попадания и ожидания чужого запроса на
+	// вопрос «чей экстракт следующий» не отвечают. Пустая страна означает отказ
+	// Nominatim, в этом разрезе она только мешает.
+	if st.ByGeocodeCountry, err = s.countRows(`
+		SELECT country, COUNT(*) n FROM geocode_request
+		WHERE ts >= ? AND ts < ? AND source = ? AND country <> ''
+		GROUP BY 1 ORDER BY n DESC`, from, to, geocodeSourceNet); err != nil {
+		return nil, err
+	}
+
 	// Только заходы с приглашающим: строки без uid в «кто позвал» не отвечают.
 	// LEFT JOIN — аккаунт мог быть удалён уже после перехода.
 	if st.ByInviter, err = s.countRows(`

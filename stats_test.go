@@ -99,6 +99,134 @@ func TestWeeklyStatsRetriesAfterFailure(t *testing.T) {
 	}
 }
 
+// TestGeocodeStats — одна таблица на все вызовы: попадания, походы в сеть и
+// ожидания чужого запроса. Главное здесь — что попадания НЕ портят статистику
+// ожидания (у них NULL, а не ноль) и что видны ожидания дольше порога.
+func TestGeocodeStats(t *testing.T) {
+	store := openTestStore(t)
+	now := time.Now().UnixMilli()
+	dayStart := time.Now().UTC().Truncate(24 * time.Hour).UnixMilli()
+	from, to := dayStart, dayStart+24*3600*1000
+
+	req := func(source, country, failure string, wait time.Duration) {
+		t.Helper()
+		if err := store.SaveGeocodeRequest(GeocodeRequest{
+			TS: now, Source: source, Country: country, Err: failure, Wait: wait,
+		}); err != nil {
+			t.Fatalf("save geocode request: %v", err)
+		}
+	}
+	req(geocodeSourceNet, "RU", "", 2*time.Second)
+	req(geocodeSourceNet, "DE", "", 7*time.Second)               // очередь: дольше порога
+	req(geocodeSourceNet, "", geocodeErrTimeout, 15*time.Second) // не дождались
+	req(geocodeSourceNet, "", "http_429", time.Second)           // притормозили за лимит
+	req(geocodeSourceJoined, "RU", "", 6*time.Second)            // ждал чужой запрос
+	for i := 0; i < 4; i++ {
+		req(geocodeSourceCache, "RU", "", 0)
+	}
+
+	// Инвариант схемы: у попаданий ожидание NULL, иначе они утянули бы среднее.
+	var nulls int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM geocode_request WHERE wait_ms IS NULL`).Scan(&nulls); err != nil {
+		t.Fatalf("count nulls: %v", err)
+	}
+	if nulls != 4 {
+		t.Errorf("строк с NULL-ожиданием %d, want 4 (все попадания)", nulls)
+	}
+	// Второй инвариант: «получилось» — это NULL, а не пустая строка, иначе
+	// COUNT(error) считал бы успехи наравне с отказами.
+	var ok int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM geocode_request WHERE error IS NULL`).Scan(&ok); err != nil {
+		t.Fatalf("count ok: %v", err)
+	}
+	if ok != 7 {
+		t.Errorf("строк без метки отказа %d, want 7 (2 успешных похода + joined + 4 попадания)", ok)
+	}
+
+	st, err := store.WeeklyStats(from, to)
+	if err != nil {
+		t.Fatalf("weekly stats: %v", err)
+	}
+	// joined в «сколько раз сходили в сеть» не считается: сети там не было.
+	if st.GeocodeRequests != 4 || st.GeocodeErrors != 2 {
+		t.Errorf("запросов/отказов = %d/%d, want 4/2", st.GeocodeRequests, st.GeocodeErrors)
+	}
+	if st.GeocodeCacheHits != 4 {
+		t.Errorf("попаданий = %d, want 4", st.GeocodeCacheHits)
+	}
+	// Причины важнее их суммы: по ним видно, что в лимит мы упёрлись один раз, а
+	// не «отказов было два».
+	if got := groupCount(st.ByGeocodeError, "http_429"); got != 1 {
+		t.Errorf("ByGeocodeError[http_429] = %d, want 1", got)
+	}
+	if got := groupCount(st.ByGeocodeError, geocodeErrTimeout); got != 1 {
+		t.Errorf("ByGeocodeError[timeout] = %d, want 1", got)
+	}
+	// Успехи в разбивку причин попадать не должны: у них reason пустой.
+	if got := groupCount(st.ByGeocodeError, ""); got != 0 {
+		t.Errorf("ByGeocodeError[''] = %d, want 0", got)
+	}
+	// Ожидание — по пяти строкам с ожиданием (2+7+15+1+6 с); четыре попадания в
+	// среднее не попали, иначе оно было бы вдвое меньше.
+	if st.WaitMaxMs != 15000 {
+		t.Errorf("худшее ожидание = %d мс, want 15000", st.WaitMaxMs)
+	}
+	if st.WaitAvgMs != 6200 {
+		t.Errorf("среднее ожидание = %d мс, want 6200 (NULL не участвуют)", st.WaitAvgMs)
+	}
+	if st.WaitSlowN != 3 {
+		t.Errorf("дольше порога = %d, want 3 (7 с, 15 с и joined 6 с)", st.WaitSlowN)
+	}
+	// Страны — только про походы в сеть, и без пустой: она означает отказ.
+	if got := groupCount(st.ByGeocodeCountry, "RU"); got != 1 {
+		t.Errorf("ByGeocodeCountry[RU] = %d, want 1 (без joined и кеша)", got)
+	}
+	if got := groupCount(st.ByGeocodeCountry, ""); got != 0 {
+		t.Errorf("ByGeocodeCountry[''] = %d, want 0", got)
+	}
+
+	// Соседние сутки в окно не попадают: сводка недельная, но границы честные.
+	st, err = store.WeeklyStats(to, to+24*3600*1000)
+	if err != nil {
+		t.Fatalf("weekly stats (следующие сутки): %v", err)
+	}
+	if st.GeocodeRequests != 0 || st.GeocodeCacheHits != 0 || st.WaitMaxMs != 0 {
+		t.Errorf("следующие сутки не пусты: %+v", st)
+	}
+}
+
+// Уборщик обязан снимать старые строки: geocode_request растёт быстрее всех наших
+// таблиц (строка на каждый locate), и без TTL она заняла бы базу целиком.
+func TestGeocodeRequestCleanup(t *testing.T) {
+	store := openTestStore(t)
+	old := time.Now().Add(-2 * geocodeRequestTTL).UnixMilli()
+	fresh := time.Now().UnixMilli()
+
+	for _, ts := range []int64{old, fresh} {
+		if err := store.SaveGeocodeRequest(GeocodeRequest{
+			TS: ts, Source: geocodeSourceNet, Country: "RU",
+		}); err != nil {
+			t.Fatalf("save: %v", err)
+		}
+	}
+	n, err := store.DeleteGeocodeRequestsOlderThan(geocodeRequestTTL)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("удалено %d, want 1", n)
+	}
+	var left int64
+	if err := store.db.QueryRow(`SELECT ts FROM geocode_request`).Scan(&left); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if left != fresh {
+		t.Errorf("осталась строка ts=%d, want свежую %d", left, fresh)
+	}
+}
+
 // TestWeeklyStatsQuery — сами цифры: окно полуоткрытое, группировки считают то,
 // что нужно, и заход без приглашающего не пропадает из разбивки по источникам.
 func TestWeeklyStatsQuery(t *testing.T) {

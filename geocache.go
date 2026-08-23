@@ -36,6 +36,12 @@ const (
 	// как часто печатать статистику попаданий — по ней решается, нужен ли свой
 	// Nominatim или хватает публичного
 	geocodeStatsEvery = time.Hour
+	// geocodeSlowWait — с какого ожидания считаем, что человек попал в очередь, а
+	// не просто подождал сеть. Порог не про Nominatim, а про экран «Определяем
+	// каналы…»: один запрос стоит ~2,2 с сам по себе, поэтому 5 с — это уже
+	// «впереди кто-то есть». В сводке по нему считается WaitSlowN, в логе — WARN
+	// с координатами клетки, чтобы было видно не только сколько раз, но и когда.
+	geocodeSlowWait = 5 * time.Second
 )
 
 // cachedGeocoder — декоратор: отдаёт из кеша, при промахе спрашивает inner.
@@ -47,6 +53,15 @@ type cachedGeocoder struct {
 	ttl   time.Duration
 	max   int
 	now   func() time.Time // подменяется в тестах
+
+	// stat — строка в geocode_request на каждый вызов; nil в тестах и при запуске
+	// без хранилища. Считает именно декоратор: только он различает «отдали из
+	// памяти», «сходили в сеть» и «дождались чужого запроса», и только он видит,
+	// сколько вызывающий на это потратил.
+	//
+	// Зовётся ПОСЛЕ освобождения мьютекса: это запись в БД, и держать под ней
+	// общий замок кеша значило бы сериализовать все геокодинги на диске.
+	stat func(GeocodeRequest)
 
 	mu       sync.Mutex
 	entries  map[string]cacheEntry
@@ -89,6 +104,38 @@ func cacheKey(lat, lng float64) (key string, rlat, rlng float64) {
 	return fmt.Sprintf("%.3f,%.3f", rlat, rlng), rlat, rlng
 }
 
+// countryOf — ISO-код страны из набора каналов; «» если страны в наборе нет.
+// Ищем по уровню, а не по позиции: набор идёт broad→specific, но планета первая, а
+// пустые слоты опускаются — полагаться на индекс нельзя.
+func countryOf(channels []Channel) string {
+	for _, ch := range channels {
+		if ch.Level == "country" {
+			return ch.ID
+		}
+	}
+	return ""
+}
+
+// record — строка статистики про этот вызов. Долгое ожидание попутно уходит в
+// лог: таблица отвечает «сколько раз», лог — «когда и где», а для очереди важно
+// именно второе.
+func (c *cachedGeocoder) record(source, key string, wait time.Duration, channels []Channel, err error) {
+	if wait >= geocodeSlowWait {
+		slog.Warn("geocode ждал долго", "cell", key, "wait", wait.Round(time.Millisecond),
+			"source", source, "err", err)
+	}
+	if c.stat == nil {
+		return
+	}
+	c.stat(GeocodeRequest{
+		TS:      c.now().UnixMilli(),
+		Source:  source,
+		Country: countryOf(channels),
+		Err:     geocodeErrLabel(err), // «» при успехе
+		Wait:    wait,                 // у source=cache в базу уйдёт NULL
+	})
+}
+
 func (c *cachedGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 	key, rlat, rlng := cacheKey(lat, lng)
 
@@ -98,24 +145,36 @@ func (c *cachedGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 		out := append([]Channel(nil), e.channels...) // копия: кеш неизменяем для вызывающего
 		c.maybeLogStatsLocked()
 		c.mu.Unlock()
+		c.record(geocodeSourceCache, key, 0, out, nil)
 		return out, nil
 	}
 	// кто-то уже спрашивает эту клетку — ждём его результат
 	if call, ok := c.inflight[key]; ok {
-		c.hits++ // сетевого запроса не будет, для статистики это попадание
+		// hits — про экономию СЕТИ, её этот вызов действительно экономит. А вот в
+		// статистику ожидания он идёт как запрос (joined), а не как попадание.
+		c.hits++
 		c.mu.Unlock()
+		// Ожидание здесь настоящее (чужой запрос — те же ~2,2 с плюс его очередь),
+		// поэтому это НЕ попадание в кеш: время платит и этот вызывающий.
+		start := c.now()
 		<-call.done
+		out := append([]Channel(nil), call.channels...)
+		c.record(geocodeSourceJoined, key, c.now().Sub(start), out, call.err)
 		if call.err != nil {
 			return nil, call.err
 		}
-		return append([]Channel(nil), call.channels...), nil
+		return out, nil
 	}
 	c.misses++
 	call := &geocodeCall{done: make(chan struct{})}
 	c.inflight[key] = call
 	c.mu.Unlock()
 
+	// Замер вокруг inner: сюда попадает и очередь на мьютексе геокодера, и пауза
+	// дросселя 1100 мс, и сама сеть — то есть ровно то, что ждёт человек.
+	start := c.now()
 	call.channels, call.err = c.inner.Channels(rlat, rlng)
+	wait := c.now().Sub(start)
 
 	c.mu.Lock()
 	delete(c.inflight, key)
@@ -128,6 +187,8 @@ func (c *cachedGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 	c.mu.Unlock()
 
 	close(call.done)
+	// При отказе страна пустая не случайно: мы её так и не узнали.
+	c.record(geocodeSourceNet, key, wait, call.channels, call.err)
 	if call.err != nil {
 		return nil, call.err
 	}

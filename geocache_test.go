@@ -3,6 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -37,6 +39,135 @@ func (g *countingGeocoder) count() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.calls
+}
+
+// TestGeocodeCacheRecordsSource — на каждый вызов пишется строка, и источник в ней
+// различает поход в сеть, попадание и отказ. У попадания ожидания нет: ждать было
+// нечего, и в базу оттуда уходит NULL (см. SaveGeocodeRequest).
+func TestGeocodeCacheRecordsSource(t *testing.T) {
+	inner := &countingGeocoder{}
+	c := newCachedGeocoder(inner, time.Hour, 100)
+	// Часы двигаем сами: ожидание должно считаться, а не зависеть от машины.
+	at := time.Date(2026, 8, 23, 15, 30, 0, 0, time.UTC)
+	c.now = func() time.Time { at = at.Add(300 * time.Millisecond); return at }
+
+	var got []GeocodeRequest
+	c.stat = func(r GeocodeRequest) { got = append(got, r) }
+
+	if _, err := c.Channels(55.756, 37.617); err != nil { // промах → сеть
+		t.Fatal(err)
+	}
+	if _, err := c.Channels(55.756, 37.617); err != nil { // попадание
+		t.Fatal(err)
+	}
+	inner.err = errors.New("nominatim упал")
+	if _, err := c.Channels(10.0, 20.0); err == nil { // промах → отказ сети
+		t.Fatal("ожидалась ошибка")
+	}
+
+	if len(got) != 3 {
+		t.Fatalf("записей %d, want 3: %+v", len(got), got)
+	}
+	if got[0].Source != geocodeSourceNet || got[0].Err != "" || got[0].Country != "RU" {
+		t.Errorf("поход в сеть = %+v, want net/без причины/RU", got[0])
+	}
+	if got[0].Wait <= 0 {
+		t.Errorf("ожидание не измерено: %v", got[0].Wait)
+	}
+	if got[1].Source != geocodeSourceCache || got[1].Wait != 0 {
+		t.Errorf("попадание = %+v, want cache без ожидания", got[1])
+	}
+	// При отказе страну назвать нечем — её и не узнали. Причина у безымянной
+	// ошибки — other: разбирать текст мы намеренно не умеем.
+	if got[2].Source != geocodeSourceNet || got[2].Err != geocodeErrOther || got[2].Country != "" {
+		t.Errorf("отказ = %+v, want net/other/пустая страна", got[2])
+	}
+}
+
+// TestGeocodeErrLabel — метка причины берётся из ТИПА ошибки, а не из её текста:
+// текст можно поправить, не заметив, что сломалась статистика. Порядок проверок
+// тоже важен: таймаут http.Client приезжает тем же *url.Error, что и обрыв сети.
+func TestGeocodeErrLabel(t *testing.T) {
+	timeout := &url.Error{Op: "Get", Err: &net.DNSError{IsTimeout: true}}
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"успех", nil, ""},
+		{"лимит публичного сервера", nomHTTPError{429}, "http_429"},
+		{"мы спросили ерунду", nomHTTPError{400}, "http_400"},
+		{"таймаут важнее сетевой ветки", timeout, geocodeErrTimeout},
+		{"сеть не дошла", &url.Error{Op: "Get", Err: errors.New("connection refused")}, geocodeErrNetwork},
+		{"тело не разобралось", fmt.Errorf("%w: unexpected EOF", errNomBadJSON), geocodeErrBadJSON},
+		{"ошибка в ответе", fmt.Errorf("%w: %s", errNomPayload, "Unable to geocode"), geocodeErrNominatim},
+		{"координаты вне диапазона", fmt.Errorf("%w: lat=91", errBadCoords), geocodeErrBadCoords},
+		{"неизвестная ошибка", errors.New("что-то своё"), geocodeErrOther},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := geocodeErrLabel(c.err); got != c.want {
+				t.Errorf("geocodeErrLabel(%v) = %q, want %q", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// Присоединившийся к чужому запросу ЖДЁТ, поэтому он не попадание в кеш: его
+// ожидание обязано попасть в статистику, иначе очередь останется невидимой.
+func TestGeocodeCacheRecordsJoinedWait(t *testing.T) {
+	inner := &countingGeocoder{delay: 80 * time.Millisecond}
+	c := newCachedGeocoder(inner, time.Hour, 100)
+
+	var mu sync.Mutex
+	var reqs []GeocodeRequest
+	c.stat = func(r GeocodeRequest) {
+		mu.Lock()
+		defer mu.Unlock()
+		if r.Source == geocodeSourceCache {
+			t.Error("ожидание чужого запроса — не попадание в кеш")
+		}
+		reqs = append(reqs, r)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := c.Channels(55.756, 37.617); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(reqs) != 3 {
+		t.Fatalf("записей %d, want 3 (один запрос + два ожидания): %+v", len(reqs), reqs)
+	}
+	joined := 0
+	for _, r := range reqs {
+		if r.Source == geocodeSourceJoined {
+			joined++
+			if r.Wait <= 0 {
+				t.Errorf("ожидание чужого запроса не измерено: %v", r.Wait)
+			}
+		}
+	}
+	if joined != 2 {
+		t.Errorf("joined = %d, want 2", joined)
+	}
+}
+
+// Без счётчиков кеш обязан работать как раньше: nil — обычный режим тестов и
+// запуска без хранилища, а не «забыли настроить».
+func TestGeocodeCacheWorksWithoutStat(t *testing.T) {
+	c := newCachedGeocoder(&countingGeocoder{}, time.Hour, 100)
+	if _, err := c.Channels(55.756, 37.617); err != nil {
+		t.Fatalf("без статистики: %v", err)
+	}
 }
 
 func TestGeocodeCacheRoundsToCell(t *testing.T) {

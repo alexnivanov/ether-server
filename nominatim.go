@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -13,6 +15,63 @@ import (
 	"sync"
 	"time"
 )
+
+// Причины отказа — метки для статистики (geocode_request.error). Различать их
+// надо не из любви к деталям: HTTP 429 означает «нас притормозили за превышение
+// лимита» и лечится своим инстансом, таймаут — «Nominatim медленный», а 400 —
+// «мы спросили ерунду», и это правится у нас в коде. В одном счётчике «отказы»
+// эти три случая требуют совершенно разных решений и потому бесполезны.
+const (
+	geocodeErrTimeout   = "timeout"
+	geocodeErrNetwork   = "network"
+	geocodeErrBadJSON   = "bad_json"
+	geocodeErrNominatim = "nominatim_error"
+	geocodeErrBadCoords = "bad_coords"
+	geocodeErrOther     = "other"
+)
+
+// Сентинелы: по ним причина определяется через errors.Is, а не разбором текста
+// ошибки — текст можно поправить, не сломав статистику.
+var (
+	errNomBadJSON = errors.New("nominatim: тело не разобралось")
+	errNomPayload = errors.New("nominatim: ошибка в ответе")
+	errBadCoords  = errors.New("координаты вне диапазона")
+)
+
+// nomHTTPError — ответ не 200. Код хранится целиком: 429 и 400 значат разное.
+type nomHTTPError struct{ Status int }
+
+func (e nomHTTPError) Error() string { return fmt.Sprintf("nominatim: HTTP %d", e.Status) }
+
+// geocodeReason — метка причины для статистики; «» если ошибки не было.
+func geocodeErrLabel(err error) string {
+	if err == nil {
+		return ""
+	}
+	var httpErr nomHTTPError
+	if errors.As(err, &httpErr) {
+		return fmt.Sprintf("http_%d", httpErr.Status)
+	}
+	// Таймаут проверяем ДО сетевой ошибки: таймаут http.Client приходит тем же
+	// *url.Error, и общая ветка проглотила бы его первой.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return geocodeErrTimeout
+	}
+	switch {
+	case errors.Is(err, errNomBadJSON):
+		return geocodeErrBadJSON
+	case errors.Is(err, errNomPayload):
+		return geocodeErrNominatim
+	case errors.Is(err, errBadCoords):
+		return geocodeErrBadCoords
+	}
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return geocodeErrNetwork
+	}
+	return geocodeErrOther
+}
 
 // NominatimGeocoder — порт логики из ether-research/nominatim_hierarchy.js.
 // Подход: 1 reverse (находит самую локальную точку) + 1 /details (отдаёт всю
@@ -165,17 +224,17 @@ func (g *NominatimGeocoder) getJSON(rawURL string, out interface{ errRaw() json.
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("nominatim: HTTP %d", res.StatusCode)
+		return nomHTTPError{res.StatusCode}
 	}
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return err
 	}
 	if err := json.Unmarshal(body, out); err != nil {
-		return fmt.Errorf("nominatim: bad JSON: %w", err)
+		return fmt.Errorf("%w: %v", errNomBadJSON, err)
 	}
 	if raw := out.errRaw(); len(raw) > 0 && string(raw) != "null" {
-		return fmt.Errorf("nominatim: %s", raw)
+		return fmt.Errorf("%w: %s", errNomPayload, raw)
 	}
 	return nil
 }
@@ -220,10 +279,10 @@ var isoRegionKey = regexp.MustCompile(`^ISO3166-2-lvl(\d+)$`)
 
 func (g *NominatimGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 	if lat < -90 || lat > 90 {
-		return nil, fmt.Errorf("lat must be in [-90, 90], got %v", lat)
+		return nil, fmt.Errorf("%w: lat=%v, must be in [-90, 90]", errBadCoords, lat)
 	}
 	if lng < -180 || lng > 180 {
-		return nil, fmt.Errorf("lng must be in [-180, 180], got %v", lng)
+		return nil, fmt.Errorf("%w: lng=%v, must be in [-180, 180]", errBadCoords, lng)
 	}
 
 	rev, err := g.reverse(lat, lng)

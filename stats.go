@@ -105,6 +105,30 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 	// Версии — про запуски приложения, а не про переходы по ссылке, поэтому
 	// группа идёт последней, отдельно от трёх предыдущих.
 	writeGroup(&b, "Версии", st.ByClientVersion)
+	// Геокодинг — не про людей вовсе, а про нагрузку: держит ли кеш, упираемся ли
+	// в лимит публичного Nominatim и попадал ли кто-то в очередь.
+	total := st.GeocodeCacheHits + st.GeocodeRequests
+	if total > 0 {
+		fmt.Fprintf(&b, "\n\n🌍 <b>Геокодинг</b>\nКеш %d из %d (%d%%), запросов %d",
+			st.GeocodeCacheHits, total, st.GeocodeCacheHits*100/total, st.GeocodeRequests)
+		if st.GeocodeErrors > 0 {
+			fmt.Fprintf(&b, ", отказов %d", st.GeocodeErrors)
+		}
+		// Ожидание показываем только когда в сеть вообще ходили: у недели на одном
+		// кеше нули здесь означали бы «мгновенно», а не «не было запросов».
+		if st.WaitMaxMs > 0 {
+			fmt.Fprintf(&b, "\nОжидание: в среднем %.1f с, худшее %.1f с",
+				float64(st.WaitAvgMs)/1000, float64(st.WaitMaxMs)/1000)
+			if st.WaitSlowN > 0 {
+				fmt.Fprintf(&b, "\n⏳ Дольше %s ждали %d раз",
+					geocodeSlowWait, st.WaitSlowN)
+			}
+		}
+	}
+	// Причины отказов важнее их числа: http_429 — это «упёрлись в лимит», таймаут
+	// — «Nominatim медленный», и лечится это по-разному.
+	writeGroup(&b, "Отказы", st.ByGeocodeError)
+	writeGroup(&b, "Страны (в Nominatim)", st.ByGeocodeCountry)
 
 	if len(st.AccessRows) == 0 {
 		return b.String()
