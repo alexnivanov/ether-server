@@ -146,17 +146,34 @@ func TestAppLinkAndroidGoesToPlay(t *testing.T) {
 // вместе с pt: Apple засчитывает переход лишь при обоих параметрах, а одинокий
 // ct игнорирует, поэтому неполную ссылку не собираем вовсе.
 func TestAppStoreLinkCampaign(t *testing.T) {
+	// Без метки — обычный адрес приложения, не campaign-форма: она нужна только
+	// там, где есть что учитывать.
 	if got := appStoreLink(""); got != appStoreURL {
 		t.Errorf("без метки = %q, want %q", got, appStoreURL)
 	}
+
+	withAppleProviderToken(t, "")
 	if got := appStoreLink("st0"); got != appStoreURL {
 		t.Errorf("pt не задан = %q, want %q (ct в одиночку бесполезен)", got, appStoreURL)
 	}
 
 	withAppleProviderToken(t, "123456")
-	want := appStoreURL + "?pt=123456&ct=st0&mt=8"
+	want := appStoreCampaignURL + "?pt=123456&ct=st0&mt=8"
 	if got := appStoreLink("st0"); got != want {
 		t.Errorf("= %q, want %q", got, want)
+	}
+}
+
+// TestAppleProviderTokenSet — iOS-атрибуция включена: pt вписан. Тест намеренно
+// сторожит настроечное значение, а не логику — обнулить токен значит ослепить
+// половину отчёта, и такое решение должно приниматься вместе с правкой теста, а
+// не случайно уехать в прод.
+func TestAppleProviderTokenSet(t *testing.T) {
+	if appleProviderToken == "" {
+		t.Fatal("appleProviderToken пуст — переходы iOS не попадут в App Analytics")
+	}
+	if got := appStoreLink("st0"); got == appStoreURL {
+		t.Errorf("метка не доехала в ссылку: %q", got)
 	}
 }
 
@@ -182,7 +199,7 @@ func TestAppLinkStickerCampaign(t *testing.T) {
 	srv, store := newTestServer(t)
 
 	resp := getAppLink(t, srv.URL, "/app?src=st0", uaIPhone)
-	if got, want := resp.Header.Get("Location"), appStoreURL+"?pt=123456&ct=st0&mt=8"; got != want {
+	if got, want := resp.Header.Get("Location"), appStoreCampaignURL+"?pt=123456&ct=st0&mt=8"; got != want {
 		t.Errorf("Location = %q, want %q", got, want)
 	}
 

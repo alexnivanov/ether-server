@@ -184,9 +184,17 @@ func handleDeleteAccount(store *Store) http.HandlerFunc {
 // на лендинг»; проверка на пустоту в хендлере от тех времён и осталась — она
 // же страхует опечатку, при которой человек попадёт на лендинг, а не в никуда.
 const (
-	appStoreURL = "https://apps.apple.com/app/id6790150915"
-	playURL     = "https://play.google.com/store/apps/details?id=net.nous.ether"
-	landingURL  = "/"
+	appStoreID  = "id6790150915"
+	appStoreURL = "https://apps.apple.com/app/" + appStoreID
+	// appStoreCampaignURL — база для ссылки с меткой кампании. Отличается от
+	// appStoreURL сегментом /apple-store/: именно в такой форме App Store Connect
+	// генерирует campaign-ссылки. Обе ведут на страницу приложения, и считает
+	// Apple по pt/ct, а не по пути, — но расходиться с формой, которую Apple
+	// выдаёт сама, незачем: проверить, что она учла переход, мы можем только по
+	// её же отчёту, и лишняя разница в ссылке была бы первым подозреваемым.
+	appStoreCampaignURL = "https://apps.apple.com/app/apple-store/" + appStoreID
+	playURL             = "https://play.google.com/store/apps/details?id=net.nous.ether"
+	landingURL          = "/"
 )
 
 // appleProviderToken — параметр `pt` в campaign-ссылке App Store: идентификатор
@@ -201,10 +209,10 @@ const (
 // игнорируется — то есть смысла в неполной ссылке нет. Та же страховка пустым
 // значением, что и у playURL выше.
 //
-// var, а не const, ровно ради тестов: иначе ветка полной ссылки не проверяется до
-// того дня, когда токен впишут, — а ошибку в такой ссылке Apple не показывает,
-// она просто перестаёт считаться. В рантайме значение не меняется.
-var appleProviderToken = ""
+// var, а не const, ровно ради тестов: подменой значения проверяются обе ветки —
+// и со меткой, и без, — а ошибку в такой ссылке Apple не показывает, она просто
+// перестаёт считаться. В рантайме значение не меняется.
+var appleProviderToken = "118586292"
 
 // srcCampaign — какие метки src годятся в campaign-параметр стора. Whitelist, а
 // не экранирование: эндпоинт открытый, и src уезжает в заголовок Location, тогда
@@ -225,9 +233,9 @@ func appStoreLink(campaign string) string {
 	if campaign == "" || appleProviderToken == "" {
 		return appStoreURL
 	}
-	// mt=8 — тип медиа «приложения», legacy-параметр со времён iTunes; Apple
-	// держит его в генерируемых ссылках, поэтому держим и мы.
-	return appStoreURL + "?pt=" + appleProviderToken + "&ct=" + campaign + "&mt=8"
+	// Порядок параметров и mt=8 — как в ссылке, которую генерирует App Store
+	// Connect (mt=8 — тип медиа «приложения», legacy со времён iTunes).
+	return appStoreCampaignURL + "?pt=" + appleProviderToken + "&ct=" + campaign + "&mt=8"
 }
 
 // playLink: Play принимает источник ОДНИМ параметром `referrer`, внутри которого
