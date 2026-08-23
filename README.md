@@ -146,6 +146,76 @@ https://api.telegram.org/bot<токен>/sendMessage?chat_id=<chat_id>&text=Эф
 
 — тогда алерты приходят без участия нашего сервера, что и требуется, когда он лежит.
 
+### Автообновления ОС
+
+Хост — Debian 13 (trixie). Обновления ставит `unattended-upgrades`, сервисы с
+обновлёнными библиотеками перезапускает `needrestart`:
+
+```sh
+sudo apt install -y unattended-upgrades needrestart
+```
+
+Поверхность у нас маленькая: бинарник статический, SQLite чистая Go
+(`modernc.org/sqlite`, без cgo), TLS терминирует Caddy — тоже на Go. Системные
+библиотеки под приложением почти не участвуют, поэтому автообновления закрывают
+ядро, glibc, systemd, openssh и сам Caddy (он в Debian и приходит из
+`trixie-security`, то есть покрыт дефолтным `Origins-Pattern` без правок).
+`ether-server` в списки рестартов не попадает — проверено на живом обновлении.
+
+> **Образ VPS отключает автообновления в трёх местах, и все три молчат.**
+> Настроено 23.08.2026; на новом хосте проверять всё это заново:
+>
+> 1. **юниты замаскированы** симлинками на `/dev/null` — `systemctl enable`
+>    проходит, а `start` отказывает с «unit apt-daily.service to trigger not
+>    loaded»:
+>    `systemctl show apt-daily.service -p LoadState,FragmentPath` →
+>    `sudo systemctl unmask apt-daily.service apt-daily-upgrade.service`;
+> 2. **таймеры выключены**: `systemctl is-enabled apt-daily.timer
+>    apt-daily-upgrade.timer` → `sudo systemctl enable --now …`;
+> 3. **главный рубильник** `APT::Periodic::Enable "0"` в
+>    `/etc/apt/apt.conf.d/10periodic` — `apt.systemd.daily` смотрит на него
+>    первым и выходит, не глядя на остальные ключи. Переопределяется нашим
+>    `20auto-upgrades` (читается позже, лексический порядок в `apt.conf.d`):
+>    `Enable`, `Update-Package-Lists`, `Unattended-Upgrade` = 1,
+>    `AutocleanInterval` = 7. Проверка — `apt-config dump | grep -i periodic`.
+>
+> Побочный эффект третьего пункта: индексы пакетов не освежались с создания
+> хоста, из-за чего любая установка падала с 404 на файл, уже вычищенный из пула.
+> Плюс в `sources.list` стоял `httpredir.debian.org` — редиректор, выведенный из
+> эксплуатации в 2016-м; заменён на `https://deb.debian.org`.
+
+`needrestart` переведён в неинтерактивный режим — иначе ночной запуск упирается в
+приглашение «[Return]»: `/etc/needrestart/conf.d/50-auto.conf` со строкой
+`$nrconf{restart} = 'a';` (drop-in, чтобы не спорить с пакетным файлом при его
+обновлении). **Следствие:** ручной `apt upgrade` теперь тоже молча рестартует
+`ether-server` и `caddy`, если обновились их зависимости — делать это лучше не в
+час пик, WS-соединения оборвутся (клиенты переподключаются сами).
+
+Ядро needrestart не умеет по определению, тут нужен ребут. Автоматический
+включается в `50unattended-upgrades`:
+
+```
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "false";
+Unattended-Upgrade::Automatic-Reboot-Time "04:30";
+```
+
+**Но только после двух условий**, иначе ставка на «хост вернётся» ничем не
+подстрахована: `systemctl is-enabled ether-server caddy ether-backup.timer` —
+сервер поднимали руками, и юнит в состоянии `start` без `enable` превратит первый
+же ночной ребут в бессрочный простой; и внешний пингер (см. «Мониторинг») —
+без него неудачный ребут узнаётся от пользователей.
+
+Что оно вообще работает, видно только по логу, и не в день настройки, а через
+несколько суток:
+
+```sh
+sudo tail -20 /var/log/unattended-upgrades/unattended-upgrades.log
+```
+
+Пустой лог — признак, что сломан один из трёх пунктов выше, а не что обновлений
+не было.
+
 ### Бэкапы
 
 [`scripts/backup.sh`](./scripts/backup.sh) снимает копию базы и кладёт её в
