@@ -18,13 +18,66 @@ import (
 //
 // Состояние в памяти, не в БД: лимит — защита от потока «здесь и сейчас»,
 // переживать рестарт ему незачем, а запись в SQLite на каждое сообщение при
-// одном писателе только мешала бы.
+// одном писателе только мешала бы. Для часового тира Земли это значит, что
+// деплой выдаёт всем по одному дополнительному сообщению — принято осознанно:
+// деплои редкие, а точный вариант (считать последнее сообщение автора в EARTH
+// по истории, TTL там 7 дней) требует индекса по (user_id, channel), то есть
+// миграции ради погрешности в одно сообщение.
 
 // messageLimit — параметры тира.
 type messageLimit struct {
 	capacity int           // всплеск: сколько сообщений подряд без ожидания
 	refill   time.Duration // сколько ждать восстановления одного сообщения
 }
+
+// limitScope — по какому бакету считать сообщение. Скоупы делятся не по каналам,
+// а по **цене охвата**: Земля есть у всех, поэтому реплика туда стоит дороже
+// любой локальной, и считать их вместе нельзя — иначе одно сообщение на весь мир
+// на час затыкало бы человека в его же квартале.
+//
+// Уровень канала здесь не при чём, и не по лени: на публикации сервер знает
+// только строку канала, а по её виду различимы лишь верхние уровни (`EARTH`,
+// ISO 3166-1, ISO 3166-2) — город, район и квартал все выглядят как
+// `osm_type/osm_id`. Полная лестница «чем шире канал, тем строже» потребовала бы
+// хранить уровень канала на сервере (клиенту тут верить нельзя), см.
+// ether-meta/PLANS.md.
+// Уровень канала здесь не при чём, и не по лени: на публикации сервер знает
+// только строку канала, а по её виду различимы лишь верхние уровни — `EARTH`,
+// ISO 3166-1 и ISO 3166-2. Город, район и квартал все выглядят как
+// `osm_type/osm_id`, различить их нельзя.
+//
+// Область (ISO 3166-2) отличить можно, но лимита у неё НЕТ, и это решение, а не
+// пропуск: по числу людей область — примерно город, а город мы ограничить не
+// умеем. Ограничить область, оставив город свободным, значило бы наказать за
+// уровень, а не за охват. Поедут вместе, когда сервер начнёт знать полосу
+// канала (см. ether-meta/PLANS.md).
+type limitScope int
+
+const (
+	scopeLocal   limitScope = iota // всё, кроме Земли и страны — один бакет на аккаунт
+	scopePlanet                    // канал Земля
+	scopeCountry                   // канал страны
+)
+
+// planetLimit — тир Земли: одно сообщение в час, всплеска нет.
+//
+// От репутации и возраста аккаунта не зависит намеренно. Во-первых, 1/час строже
+// любого локального тира, так что выбирать не из чего. Во-вторых, разделение
+// обязанностей: лимит отвечает на вопрос «как часто», а на вопрос «кому вообще
+// можно писать в Землю» ответит гейт по рейтингу, когда появятся голоса.
+var planetLimit = messageLimit{capacity: 1, refill: time.Hour}
+
+// countryLimit — тир страны: всплеск 3, дальше одно сообщение в минуту.
+//
+// Мягче, чем просилось бы по охвату, и намеренно. Пользователей пока мало и
+// живут они почти все в одной стране, то есть канал страны сейчас — самая
+// населённая комната приложения; темп «раз в пять минут» убил бы там не поток, а
+// разговор. Всплеск 3 оставлен по той же причине, что и в базовом тире: человек
+// дописывает мысль в два-три сообщения, и спотыкаться на этом он не должен.
+//
+// От репутации и возраста аккаунта, как и Земля, не зависит: 1/мин строже любого
+// локального тира, включая узкий тир свежих аккаунтов (у того 6/мин).
+var countryLimit = messageLimit{capacity: 3, refill: time.Minute}
 
 // newAccountWindow — сколько аккаунт считается свежим. Полчаса: за это время
 // живой человек успевает освоиться, а спамеру приходится ждать столько же с
@@ -45,7 +98,13 @@ const newAccountWindow = 30 * time.Minute
 //
 // Возраст важнее репутации: заслуженный тир получает тот, кто уже пробыл в
 // Эфире, — иначе схема обходилась бы накруткой плюсов с тех же свежих аккаунтов.
-func messageLimitFor(rating int, accountAge time.Duration) messageLimit {
+func messageLimitFor(rating int, accountAge time.Duration, scope limitScope) messageLimit {
+	switch scope {
+	case scopePlanet:
+		return planetLimit
+	case scopeCountry:
+		return countryLimit
+	}
 	if accountAge < newAccountWindow {
 		return messageLimit{capacity: 3, refill: 10 * time.Second} // 6/мин
 	}
@@ -59,44 +118,53 @@ func messageLimitFor(rating int, accountAge time.Duration) messageLimit {
 	}
 }
 
-// bucketIdle — через сколько неактивности бакет можно забыть. Пользователь с
-// полным бакетом ничем не отличается от нового, поэтому хранить его нет смысла;
-// без уборки map рос бы вместе с числом когда-либо писавших.
-const bucketIdle = 10 * time.Minute
-
 type bucket struct {
 	tokens float64
 	last   time.Time
+	// fullAt — когда бакет дольётся до capacity, то есть с какого момента он
+	// неотличим от нового и его можно забыть (см. sweepLocked). Хранится
+	// посчитанным, а не выводится в уборке: тир зависит от репутации и возраста
+	// аккаунта, а их знает только Allow.
+	fullAt time.Time
 }
 
-// RateLimiter — потокобезопасные бакеты по внутреннему id пользователя. Дёргается из readPump каждого
+// RateLimiter — потокобезопасные бакеты по паре (пользователь, скоуп). Дёргается из readPump каждого
 // соединения, поэтому под мьютексом.
 type RateLimiter struct {
 	mu      sync.Mutex
-	buckets map[int64]*bucket
+	buckets map[bucketKey]*bucket
 	now     func() time.Time // подменяется в тестах
 }
 
+// bucketKey — у одного человека бакетов столько, сколько скоупов: локальный темп
+// и Земля тратятся из разных запасов.
+type bucketKey struct {
+	user  int64
+	scope limitScope
+}
+
 func NewRateLimiter() *RateLimiter {
-	return &RateLimiter{buckets: make(map[int64]*bucket), now: time.Now}
+	return &RateLimiter{buckets: make(map[bucketKey]*bucket), now: time.Now}
 }
 
 // Allow списывает одно сообщение у пользователя. Возвращает false и время до
 // следующей возможности, если лимит исчерпан. rating — репутация (пока всегда
-// 0), accountAge — сколько живёт аккаунт (свежим тир уже).
-func (r *RateLimiter) Allow(userID int64, rating int, accountAge time.Duration) (ok bool, retryAfter time.Duration) {
-	lim := messageLimitFor(rating, accountAge)
+// 0), accountAge — сколько живёт аккаунт (свежим тир уже), scope — Земля или всё
+// остальное.
+func (r *RateLimiter) Allow(userID int64, rating int, accountAge time.Duration, scope limitScope) (ok bool, retryAfter time.Duration) {
+	lim := messageLimitFor(rating, accountAge, scope)
 	now := r.now()
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	b := r.buckets[userID]
+	key := bucketKey{user: userID, scope: scope}
+	b := r.buckets[key]
 	if b == nil {
 		// новый пользователь начинает с полного бакета: первое сообщение не
 		// должно ждать
 		b = &bucket{tokens: float64(lim.capacity), last: now}
-		r.buckets[userID] = b
+		r.buckets[key] = b
 	} else {
 		// доливаем за прошедшее время; кэп — capacity текущего тира (репутация
 		// могла измениться между сообщениями)
@@ -108,25 +176,34 @@ func (r *RateLimiter) Allow(userID int64, rating int, accountAge time.Duration) 
 		b.last = now
 	}
 
-	if b.tokens < 1 {
+	if b.tokens >= 1 {
+		b.tokens--
+	} else {
 		// сколько ждать до одного целого токена
-		missing := 1 - b.tokens
-		return false, time.Duration(missing * float64(lim.refill))
+		retryAfter = time.Duration((1 - b.tokens) * float64(lim.refill))
 	}
-	b.tokens--
+	b.fullAt = now.Add(time.Duration((float64(lim.capacity) - b.tokens) * float64(lim.refill)))
 	r.sweepLocked(now)
-	return true, 0
+	return retryAfter == 0, retryAfter
 }
 
-// sweepLocked выбрасывает давно неактивные бакеты. Зовётся из Allow под
-// мьютексом — отдельная горутина-уборщик тут не нужна: проход дешёвый, а
-// map трогается только когда кто-то пишет.
+// sweepLocked выбрасывает бакеты, которые уже долились до capacity: такой бакет
+// ничем не отличается от нового, поэтому хранить его незачем, а без уборки map
+// рос бы вместе с числом когда-либо писавших. Зовётся из Allow под мьютексом —
+// отдельная горутина-уборщик тут не нужна: проход дешёвый, а map трогается
+// только когда кто-то пишет.
+//
+// Смотрим на fullAt, а не на «давно не писал»: при фиксированном простое
+// (было 10 минут) часовой лимит Земли превращался в лимит на этот простой —
+// пустой бакет удалялся, а новый создаётся ПОЛНЫМ, и следующее сообщение
+// проходило. С базовым тиром (refill 3 с) разницы не было, поэтому подмена и
+// выглядела безобидной: за 10 минут молчания бакет и так полон.
 func (r *RateLimiter) sweepLocked(now time.Time) {
 	if len(r.buckets) < 64 { // на малых объёмах не тратим время на обход
 		return
 	}
 	for id, b := range r.buckets {
-		if now.Sub(b.last) > bucketIdle {
+		if !now.Before(b.fullAt) {
 			delete(r.buckets, id)
 		}
 	}

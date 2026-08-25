@@ -56,9 +56,9 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 
 	// аккаунт только что создан — работает узкий тир для свежих (см.
 	// newAccountWindow): именно с ним и живёт настоящий новый пользователь
-	base := messageLimitFor(0, 0)
+	base := messageLimitFor(0, 0, scopeLocal)
 	for i := 0; i < base.capacity; i++ {
-		if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "поток"})); err != nil {
+		if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: localChannel, Text: "поток"})); err != nil {
 			t.Fatalf("publish %d: %v", i+1, err)
 		}
 		var env Envelope
@@ -71,7 +71,7 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 	}
 
 	// всплеск исчерпан — следующее отбивается
-	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "лишнее"})); err != nil {
+	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: localChannel, Text: "лишнее"})); err != nil {
 		t.Fatalf("publish over limit: %v", err)
 	}
 	var env Envelope
@@ -91,7 +91,7 @@ func TestPublishRateLimitOverWS(t *testing.T) {
 	}
 
 	// отбитое сообщение не сохранилось: лимит проверяется ДО записи в историю
-	msgs, err := store.History("RU", 0, 100, 0)
+	msgs, err := store.History(localChannel, 0, 100, 0)
 	if err != nil {
 		t.Fatalf("history: %v", err)
 	}
@@ -133,10 +133,10 @@ func TestPublishRateLimitSharedAcrossTransports(t *testing.T) {
 	}
 
 	// весь всплеск съедаем через REST
-	base := messageLimitFor(0, 0)
+	base := messageLimitFor(0, 0, scopeLocal)
 	for i := 0; i < base.capacity; i++ {
 		resp, body := restPost(t, srv.URL+"/messages", PublishRequest{
-			Token: token, Channel: "RU", Text: "поток",
+			Token: token, Channel: localChannel, Text: "поток",
 		})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("REST-отправка %d: status %d (%v)", i+1, resp.StatusCode, body)
@@ -151,7 +151,7 @@ func TestPublishRateLimitSharedAcrossTransports(t *testing.T) {
 	}
 	defer ws.Close()
 	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "в обход"})); err != nil {
+	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: localChannel, Text: "в обход"})); err != nil {
 		t.Fatalf("publish: %v", err)
 	}
 	var env Envelope

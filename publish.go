@@ -99,10 +99,11 @@ func (p *publisher) publish(
 	// тир; когда появится рейтинг, сюда придёт его значение и лимит станет тирным
 	// без правок здесь (см. ratelimit.go).
 	if p.limiter != nil {
-		if ok, retry := p.limiter.Allow(a.ID, 0, a.AccountAge); !ok {
+		scope := scopeForChannel(channel)
+		if ok, retry := p.limiter.Allow(a.ID, 0, a.AccountAge, scope); !ok {
 			return MessageData{}, &publishError{
 				Code:    "too_fast",
-				Message: fmt.Sprintf("Слишком часто — подожди %d с", int(retry.Seconds())+1),
+				Message: tooFastMessage(scope, retry),
 				Status:  429,
 				Retry:   retry,
 			}
@@ -140,6 +141,70 @@ func (p *publisher) publish(
 		go p.push.Notify(m.Channel, a.ID, a.Name, m.Text)
 	}
 	return m, nil
+}
+
+// scopeForChannel — из какого запаса брать сообщение. Знание про форму ID живёт
+// здесь, а не в ratelimit.go: там про каналы не знают, там арифметика бакетов.
+// Никакого геокодинга — только вид строки, по контракту ID каналов
+// (ether-meta/CLAUDE.md):
+//
+//	EARTH             — планета, зарезервированный литерал (см. PlanetChannel)
+//	RU                — страна, ISO 3166-1: ровно две заглавные буквы
+//	RU-MOW            — область, ISO 3166-2: с дефисом, лимита нет
+//	relation/2555133  — город/район/квартал: неразличимы, лимита нет
+//
+// Всё, что в эти формы не попало (мусорная строка от клиента, канал в неизвестном
+// формате), считается локальным — то есть ведёт себя как сегодня.
+func scopeForChannel(channel string) limitScope {
+	if channel == PlanetChannel.ID {
+		return scopePlanet
+	}
+	if isCountryCode(channel) {
+		return scopeCountry
+	}
+	return scopeLocal
+}
+
+// isCountryCode — ID страны по контракту: ровно две заглавные латинские буквы.
+// Регистр не нормализуем: геокодер отдаёт код уже в верхнем (strings.ToUpper над
+// country_code в nominatim.go), а «ru» с клиента — это не канал страны, а
+// мусорная строка, и поблажки ей не нужны.
+func isCountryCode(s string) bool {
+	if len(s) != 2 {
+		return false
+	}
+	return s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'A' && s[1] <= 'Z'
+}
+
+// tooFastMessage — текст отказа. Код остаётся too_fast для всех скоупов, менять
+// его нельзя: у сборок в сторах ветка «модальный диалог + вернуть текст в поле»
+// заведена на литералы too_fast и banned, а на незнакомом коде человек получит
+// снекбар и потеряет написанное (см. ether-meta/PLANS.md). Так что меняется
+// только формулировка — и меняется по делу: «подожди 3421 с» на часовом лимите
+// не читается, а причина отказа тут не «частишь», а «чем шире канал, тем реже в
+// нём пишут».
+func tooFastMessage(scope limitScope, retry time.Duration) string {
+	switch scope {
+	case scopePlanet:
+		return fmt.Sprintf("В Землю можно писать раз в час — следующее сообщение через %s", humanWait(retry))
+	case scopeCountry:
+		return fmt.Sprintf("В канале страны пишут реже — подожди %s", humanWait(retry))
+	default:
+		return fmt.Sprintf("Слишком часто — подожди %d с", int(retry.Seconds())+1)
+	}
+}
+
+// humanWait — ожидание словами. Округляем ВВЕРХ: по подсказке «через 46 мин»
+// человек вернётся ровно к сроку, и отказ второй раз он получить не должен.
+func humanWait(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%d с", int(d.Seconds())+1)
+	case d < time.Hour:
+		return fmt.Sprintf("%d мин", int((d+time.Minute-1)/time.Minute))
+	default:
+		return fmt.Sprintf("%d ч", int((d+time.Hour-1)/time.Hour))
+	}
 }
 
 // storedMessage — ответ на повтор: сообщение собирается из того, что лежит в

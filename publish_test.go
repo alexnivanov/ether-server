@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -228,7 +229,7 @@ func TestPublishRESTTooFast(t *testing.T) {
 	var resp *http.Response
 	for i := 0; i < 20; i++ {
 		resp, body = postMessage(t, limited, PublishRequest{
-			Token: token, Channel: "RU", Text: "спам",
+			Token: token, Channel: localChannel, Text: "спам",
 		})
 		if resp.StatusCode != http.StatusOK {
 			status = resp.StatusCode
@@ -426,11 +427,127 @@ func TestPublishRetryDoesNotSpendLimit(t *testing.T) {
 		t.Fatalf("первая отправка: %d (%v)", resp.StatusCode, body)
 	}
 	// повторяем заведомо больше, чем позволяет всплеск лимитера
-	for i := 0; i < messageLimitFor(0, 0).capacity+5; i++ {
+	for i := 0; i < messageLimitFor(0, 0, scopeLocal).capacity+5; i++ {
 		resp, body := postMessage(t, srv.URL, req)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("повтор %d: status %d (%v), want 200", i+1, resp.StatusCode, body)
 		}
+	}
+}
+
+// TestScopeForChannel — скоуп читается из ФОРМЫ ID канала, без геокодинга.
+// Область отличима от страны и от города, но своего тира у неё нет намеренно:
+// по числу людей это примерно город, а город по ID неотличим от района, значит
+// ограничить их можно только вместе.
+func TestScopeForChannel(t *testing.T) {
+	cases := []struct {
+		channel string
+		want    limitScope
+	}{
+		{"EARTH", scopePlanet},
+		{"RU", scopeCountry},
+		{"DE", scopeCountry},
+		{"RU-MOW", scopeLocal},           // область: ISO 3166-2, тира нет
+		{"relation/2555133", scopeLocal}, // город
+		{"relation/1320555", scopeLocal}, // район
+		{"node/143564891", scopeLocal},
+		{"ru", scopeLocal}, // не канал страны, а мусор: геокодер отдаёт верхний регистр
+		{"R1", scopeLocal}, // две позиции, но не буквы
+		{"", scopeLocal},
+		{"EARTHLING", scopeLocal},
+	}
+	for _, c := range cases {
+		if got := scopeForChannel(c.channel); got != c.want {
+			t.Errorf("scopeForChannel(%q) = %d, want %d", c.channel, got, c.want)
+		}
+	}
+}
+
+// TestPublishCountryLimit — канал страны: всплеск проходит, следующее сообщение
+// отбивается, а Земля и локальный канал не задеты (у каждого свой бакет).
+func TestPublishCountryLimit(t *testing.T) {
+	_, store := newTestServer(t)
+	_, token := publishSession(t, store)
+	hub := NewHub()
+	go hub.Run()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /messages", handlePublish(store,
+		&publisher{store: store, hub: hub, limiter: NewRateLimiter()}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	for i := 0; i < countryLimit.capacity; i++ {
+		if resp, body := postMessage(t, srv.URL, PublishRequest{
+			Token: token, Channel: "RU", Text: "всей стране", ClientMsgID: fmt.Sprintf("c-%d", i),
+		}); resp.StatusCode != http.StatusOK {
+			t.Fatalf("сообщение в страну %d: %d (%v)", i+1, resp.StatusCode, body)
+		}
+	}
+	resp, body := postMessage(t, srv.URL, PublishRequest{
+		Token: token, Channel: "RU", Text: "ещё", ClientMsgID: "c-over",
+	})
+	if resp.StatusCode != http.StatusTooManyRequests || body["code"] != "too_fast" {
+		t.Fatalf("после всплеска: %d/%v, want 429/too_fast", resp.StatusCode, body["code"])
+	}
+	if msg, _ := body["message"].(string); !strings.Contains(msg, "канале страны") {
+		t.Errorf("текст отказа = %q, ожидали объяснение про канал страны", msg)
+	}
+	// соседние скоупы не задеты
+	if resp, body := postMessage(t, srv.URL, PublishRequest{
+		Token: token, Channel: PlanetChannel.ID, Text: "всей планете",
+	}); resp.StatusCode != http.StatusOK {
+		t.Errorf("исчерпанная страна закрыла Землю: %d (%v)", resp.StatusCode, body)
+	}
+	if resp, body := postMessage(t, srv.URL, PublishRequest{
+		Token: token, Channel: localChannel, Text: "соседям",
+	}); resp.StatusCode != http.StatusOK {
+		t.Errorf("исчерпанная страна закрыла район: %d (%v)", resp.StatusCode, body)
+	}
+}
+
+// TestPublishPlanetLimit — сквозная проверка цены охвата: в Землю пускают раз в
+// час, отказ приходит кодом too_fast (его старые сборки умеют — возвращают текст
+// в поле ввода) и текстом про Землю, а локальный канал остаётся доступен —
+// запасы раздельные.
+func TestPublishPlanetLimit(t *testing.T) {
+	_, store := newTestServer(t)
+	_, token := publishSession(t, store)
+	hub := NewHub()
+	go hub.Run()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /messages", handlePublish(store,
+		&publisher{store: store, hub: hub, limiter: NewRateLimiter()}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	earth := PublishRequest{Token: token, Channel: PlanetChannel.ID, Text: "всем привет"}
+	if resp, body := postMessage(t, srv.URL, earth); resp.StatusCode != http.StatusOK {
+		t.Fatalf("первое сообщение в Землю: %d (%v)", resp.StatusCode, body)
+	}
+	// второе подряд — отказ, и он объясняет причину, а не «частишь»
+	resp, body := postMessage(t, srv.URL, earth)
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("второе сообщение в Землю: status %d, want 429 (%v)", resp.StatusCode, body)
+	}
+	if body["code"] != "too_fast" {
+		t.Errorf("code = %v, want too_fast — на другом коде старые сборки потеряют написанное", body["code"])
+	}
+	msg, _ := body["message"].(string)
+	if !strings.Contains(msg, "раз в час") {
+		t.Errorf("текст отказа = %q, ожидали объяснение про Землю", msg)
+	}
+	if strings.Contains(msg, " с") && !strings.Contains(msg, "мин") && !strings.Contains(msg, " ч") {
+		t.Errorf("ожидание в секундах на часовом лимите: %q", msg)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra == "" || ra == "0" {
+		t.Errorf("Retry-After = %q", ra)
+	}
+
+	// локальный канал не задет: у Земли свой бакет
+	if resp, body := postMessage(t, srv.URL, PublishRequest{
+		Token: token, Channel: "RU-MOW", Text: "а тут можно",
+	}); resp.StatusCode != http.StatusOK {
+		t.Fatalf("локальная отправка после Земли: %d (%v)", resp.StatusCode, body)
 	}
 }
 
