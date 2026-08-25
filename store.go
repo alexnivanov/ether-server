@@ -1331,9 +1331,25 @@ func (s *Store) SetUserChannels(userID int64, channels []string) error {
 	return tx.Commit()
 }
 
+// subscriberWindow — какой давности привязка ещё считается живым человеком.
+//
+// Без отсечки счётчик показывал бы архив: строка в user_channels живёт, пока
+// человек не сделал locate в другом месте или не удалил аккаунт, поэтому тот, кто
+// заходил год назад и больше не появлялся, продолжал попадать в «326 человек».
+// Месяц — потому что locate уходит на каждый запуск приложения (и на каждую смену
+// места), так что окно означает простое «открывал Эфир за последний месяц».
+//
+// Строки при этом НЕ удаляются: те же строки адресуют пуши (PushTargets), а пуш —
+// единственный способ позвать назад того, кто перестал заходить. Отсечка живёт в
+// счётчике, а не в уборке.
+const subscriberWindow = 30 * 24 * time.Hour
+
 // ChannelSubscribers — сколько пользователей привязано к каждому из каналов
 // (по user_channels, которые обновляются на каждый locate). Один запрос на весь
 // набор, а не по каналу: locate отдаёт 5–6 каналов, и N+1 здесь ни к чему.
+//
+// Считаются только привязки не старше subscriberWindow: число в клиенте обещает
+// живую аудиторию канала, а не всех, кто здесь когда-либо был.
 //
 // В карте могут отсутствовать каналы без подписчиков — вызывающий трактует
 // отсутствие как 0.
@@ -1342,11 +1358,12 @@ func (s *Store) ChannelSubscribers(channels []string) (map[string]int, error) {
 		return map[string]int{}, nil
 	}
 	q := `SELECT channel, COUNT(*) FROM user_channels WHERE channel IN (?` +
-		strings.Repeat(`, ?`, len(channels)-1) + `) GROUP BY channel`
-	args := make([]any, len(channels))
-	for i, ch := range channels {
-		args[i] = ch
+		strings.Repeat(`, ?`, len(channels)-1) + `) AND updated_at > ? GROUP BY channel`
+	args := make([]any, 0, len(channels)+1)
+	for _, ch := range channels {
+		args = append(args, ch)
 	}
+	args = append(args, time.Now().Add(-subscriberWindow).UnixMilli())
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err

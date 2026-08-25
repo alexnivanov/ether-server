@@ -723,6 +723,58 @@ func TestStoreChannelSubscribers(t *testing.T) {
 	}
 }
 
+// Счётчик обещает живую аудиторию, а не архив: привязка человека, который
+// перестал открывать Эфир, из числа выпадает. Строку при этом не удаляем — по ней
+// продолжают адресоваться пуши (см. subscriberWindow), поэтому проверяем именно
+// счётчик, а не наличие строки.
+func TestStoreChannelSubscribersWindow(t *testing.T) {
+	s := openTestStore(t)
+
+	live := mkTgUser(t, s, "10", "", "live")
+	gone := mkTgUser(t, s, "11", "", "gone")
+	for _, u := range []int64{live, gone} {
+		if err := s.SetUserChannels(u, []string{"RU", "relation/1"}); err != nil {
+			t.Fatalf("channels %d: %v", u, err)
+		}
+	}
+	// «ушедший» последний раз локейтил давнее окна — правим время привязки прямо
+	// в базе: SetUserChannels ставит now, а часы стора не подменяемы
+	stale := time.Now().Add(-subscriberWindow - time.Hour).UnixMilli()
+	if _, err := s.db.Exec(
+		`UPDATE user_channels SET updated_at = ? WHERE user_id = ?`, stale, gone); err != nil {
+		t.Fatalf("состарить привязку: %v", err)
+	}
+
+	got, err := s.ChannelSubscribers([]string{"RU", "relation/1"})
+	if err != nil {
+		t.Fatalf("subscribers: %v", err)
+	}
+	for ch, want := range map[string]int{"RU": 1, "relation/1": 1} {
+		if got[ch] != want {
+			t.Fatalf("%s: %d, want %d — старая привязка попала в живую аудиторию", ch, got[ch], want)
+		}
+	}
+
+	// строка на месте: пуш ушедшему по-прежнему адресуется, иначе позвать его
+	// назад было бы нечем
+	var n int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM user_channels WHERE user_id = ?`, gone).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("привязок у ушедшего %d, want 2 — счётчик не должен их удалять", n)
+	}
+
+	// вернулся и открыл приложение — снова в счётчике
+	if err := s.SetUserChannels(gone, []string{"RU", "relation/1"}); err != nil {
+		t.Fatalf("возврат: %v", err)
+	}
+	if m, err := s.ChannelSubscribers([]string{"RU"}); err != nil || m["RU"] != 2 {
+		t.Fatalf("после возврата RU=%d err=%v, want 2", m["RU"], err)
+	}
+}
+
 // Блокировка пользователя пользователем (Apple 1.2). Односторонняя: блокирующий
 // перестаёт видеть сообщения в истории, обратная сторона ничего не теряет. Плюс
 // заблокировавший не получает пушей от заблокированного — иначе обещание «я его
