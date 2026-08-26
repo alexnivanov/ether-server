@@ -169,6 +169,23 @@ CREATE TABLE IF NOT EXISTS user_channels (
 	PRIMARY KEY (user_id, channel)
 );
 CREATE INDEX IF NOT EXISTS user_channels_channel ON user_channels(channel);
+-- Справочник каналов: ID → что о нём известно для показа. Нужен там, где
+-- геокодера рядом нет, а в сообщении лежит только ID: текст пуша собирает
+-- сервер (push.go), и без имени в уведомлении не написать, откуда сообщение.
+--
+-- Наполняется на locate — геокодер имя и уровень уже вернул, отдельных запросов
+-- к Nominatim это не добавляет. Первый попавший в район наполняет справочник
+-- для всех, и к моменту первого сообщения имя уже есть: автор делает locate
+-- прежде, чем что-то написать.
+--
+-- Перезапись по ID, а не INSERT OR IGNORE: объекты в OSM переименовывают, и
+-- последнее увиденное имя честнее первого.
+CREATE TABLE IF NOT EXISTS channels (
+	id         TEXT PRIMARY KEY, -- ID канала (контракт ether-meta)
+	name       TEXT NOT NULL,    -- отображаемое имя: «Тверской»
+	level      TEXT NOT NULL,    -- planet|country|region|city|district|quarter
+	updated_at INTEGER NOT NULL  -- unix-миллисекунды
+);
 -- Блокировка пользователя пользователем (Apple 1.2: «mechanism for users to
 -- block abusive users»). Односторонняя: блокирующий перестаёт видеть сообщения
 -- заблокированного (в истории — фильтром на сервере, в живой ленте — на
@@ -1329,6 +1346,51 @@ func (s *Store) SetUserChannels(userID int64, channels []string) error {
 		}
 	}
 	return tx.Commit()
+}
+
+// SaveChannels запоминает имена и уровни каналов (вызывается на locate, рядом с
+// SetUserChannels). Каналы без имени пропускаются: пустое имя в справочнике
+// ничем не лучше отсутствующей строки, а затереть им уже известное — хуже.
+//
+// Справочник общий, не пользовательский: строки не удаляются при переезде
+// человека и при удалении аккаунта. Канал, из которого все ушли, остаётся
+// известным — на него ещё сошлётся история сообщений.
+func (s *Store) SaveChannels(channels []Channel) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := time.Now().UnixMilli()
+	for _, ch := range channels {
+		if ch.ID == "" || ch.Name == "" {
+			continue
+		}
+		if _, err := tx.Exec(`
+			INSERT INTO channels (id, name, level, updated_at) VALUES (?, ?, ?, ?)
+			ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+				level = excluded.level, updated_at = excluded.updated_at`,
+			ch.ID, ch.Name, ch.Level, now); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ChannelName — отображаемое имя канала по его ID. Пустая строка (без ошибки) —
+// канал в справочнике не встречался: так бывает у баз, живших до появления
+// таблицы, и до первого locate в этом месте. Вызывающий обязан это пережить, а
+// не считать сбоем (см. pushText в push.go).
+func (s *Store) ChannelName(id string) (string, error) {
+	var name string
+	err := s.db.QueryRow(`SELECT name FROM channels WHERE id = ?`, id).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
 }
 
 // subscriberWindow — какой давности привязка ещё считается живым человеком.

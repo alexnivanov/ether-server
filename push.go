@@ -75,11 +75,19 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 		slog.Error("fcm token", "err", err)
 		return
 	}
+	// Имя канала — из справочника (заполняется на locate, см. Store.SaveChannels):
+	// в сообщении лежит только ID, а человеку нужно понять, откуда оно пришло.
+	// Ошибка и пустое имя равносильны: уведомление уйдёт без названия канала.
+	name, err := p.store.ChannelName(channelID)
+	if err != nil {
+		slog.Error("channel name", "err", err, "channel", channelID)
+	}
+	title, body := pushText(name, sender, text)
 
 	var sent int
 	var stale []string
 	for _, device := range tokens {
-		switch p.sendTo(tok.AccessToken, device, sender, text) {
+		switch p.sendTo(tok.AccessToken, device, title, body) {
 		case sendOK:
 			sent++
 		case sendStale:
@@ -96,6 +104,20 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 		"targets", len(tokens), "stale", len(stale))
 }
 
+// pushText — что человек увидит в уведомлении. Заголовок — КАНАЛ, а не автор:
+// так же устроены групповые чаты, и ОС группирует уведомления по заголовку —
+// значит по каналу, а не по случайному соседу.
+//
+// Имя канала пустое (справочник ещё не знает этот ID, база жила до его
+// появления) — остаётся прежний вид, автор в заголовке: уведомление без
+// названия лучше, чем уведомление с пустой первой строкой.
+func pushText(channel, sender, text string) (title, body string) {
+	if channel == "" {
+		return sender, text
+	}
+	return channel, sender + ": " + text
+}
+
 type sendResult int
 
 const (
@@ -104,14 +126,15 @@ const (
 	sendStale // токен больше не существует — удалить из БД
 )
 
-// sendTo отправляет одно уведомление на один токен устройства.
-func (p *Pusher) sendTo(accessToken, device, sender, text string) sendResult {
+// sendTo отправляет одно уведомление на один токен устройства. title/body уже
+// готовы (см. pushText) — здесь только транспорт.
+func (p *Pusher) sendTo(accessToken, device, title, body string) sendResult {
 	payload, _ := json.Marshal(map[string]any{
 		"message": map[string]any{
 			"token": device,
 			"notification": map[string]any{
-				"title": sender,
-				"body":  text,
+				"title": title,
+				"body":  body,
 			},
 		},
 	})
@@ -129,13 +152,13 @@ func (p *Pusher) sendTo(accessToken, device, sender, text string) sendResult {
 		return sendOK
 	}
 	b, _ := io.ReadAll(resp.Body)
-	body := string(b)
+	reason := string(b)
 	// 404 UNREGISTERED / 400 с невалидным токеном — устройство больше не наше
-	if resp.StatusCode == http.StatusNotFound || strings.Contains(body, "UNREGISTERED") ||
-		strings.Contains(body, "INVALID_ARGUMENT") {
+	if resp.StatusCode == http.StatusNotFound || strings.Contains(reason, "UNREGISTERED") ||
+		strings.Contains(reason, "INVALID_ARGUMENT") {
 		slog.Info("fcm token stale", "status", resp.Status)
 		return sendStale
 	}
-	slog.Warn("fcm send rejected", "status", resp.Status, "body", body)
+	slog.Warn("fcm send rejected", "status", resp.Status, "body", reason)
 	return sendFailed
 }

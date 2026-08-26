@@ -681,6 +681,50 @@ func TestStoreBanExpires(t *testing.T) {
 	}
 }
 
+// Справочник каналов: имя нужно тексту пуша, где на руках только ID канала.
+func TestStoreSaveChannels(t *testing.T) {
+	s := openTestStore(t)
+
+	if err := s.SaveChannels([]Channel{
+		PlanetChannel,
+		{ID: "RU", Level: "country", Name: "Россия"},
+		{ID: "relation/1", Level: "district", Name: "Тверской"},
+		// без имени — в справочник не попадает: пустая строка ничем не лучше
+		// отсутствующей, а показать её в уведомлении нельзя
+		{ID: "relation/2", Level: "quarter"},
+	}); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	for id, want := range map[string]string{
+		"EARTH": "Земля", "RU": "Россия", "relation/1": "Тверской",
+		"relation/2": "", // без имени
+		"relation/9": "", // ни разу не встречался
+	} {
+		got, err := s.ChannelName(id)
+		if err != nil {
+			t.Fatalf("%s: %v", id, err)
+		}
+		if got != want {
+			t.Fatalf("%s: %q, want %q", id, got, want)
+		}
+	}
+
+	// переименование в OSM: последнее увиденное имя вытесняет прежнее
+	if err := s.SaveChannels([]Channel{
+		{ID: "relation/1", Level: "district", Name: "Тверской район"},
+	}); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	if got, err := s.ChannelName("relation/1"); err != nil || got != "Тверской район" {
+		t.Fatalf("после переименования %q err=%v, want «Тверской район»", got, err)
+	}
+
+	// пустой список — не паника и не пустая транзакция с ошибкой
+	if err := s.SaveChannels(nil); err != nil {
+		t.Fatalf("пустой список: %v", err)
+	}
+}
+
 func TestStoreChannelSubscribers(t *testing.T) {
 	s := openTestStore(t)
 
