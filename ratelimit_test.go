@@ -64,25 +64,25 @@ func TestRateLimiterBurstAndRefill(t *testing.T) {
 	}
 }
 
-// Тиры поощряющие: плюсы поднимают лимит выше базового, минусы возвращают к
-// узкому дну, но не затыкают совсем (иначе минусы становятся оружием).
+// Внизу лестницы минус тормозит, а плюс НЕ разгоняет: разницу между 20/мин и
+// 40/мин живой человек не выбирает даже намеренно, зато это ровно та награда,
+// ради которой имеет смысл накручивать. Плюс покупает темп только в широких
+// полосах (см. TestMessageLimitPlanetTier).
 func TestMessageLimitTiers(t *testing.T) {
 	low := messageLimitFor(-3, old, scopeLocal)
 	base := messageLimitFor(0, old, scopeLocal)
 	high := messageLimitFor(10, old, scopeLocal)
 
-	if !(low.capacity < base.capacity && base.capacity < high.capacity) {
-		t.Fatalf("capacity не растёт с репутацией: %d / %d / %d",
-			low.capacity, base.capacity, high.capacity)
-	}
-	if !(low.refill > base.refill && base.refill > high.refill) {
-		t.Fatalf("темп не растёт с репутацией: %v / %v / %v",
-			low.refill, base.refill, high.refill)
+	if !(low.capacity < base.capacity && low.refill > base.refill) {
+		t.Fatalf("минус не тормозит: дно %+v, база %+v", low, base)
 	}
 	if low.capacity < 1 {
 		t.Fatal("на дне нельзя писать вообще — минусы не должны затыкать полностью")
 	}
-	// нулевая репутация — это и есть плоский лимит: пока голосов нет, все здесь
+	if high != base {
+		t.Fatalf("плюс разгоняет локальный тир: %+v вместо базы %+v", high, base)
+	}
+	// нулевая репутация — это и есть плоский лимит
 	if base != messageLimitFor(4, old, scopeLocal) {
 		t.Fatal("база должна покрывать диапазон 0..4")
 	}
@@ -155,9 +155,10 @@ func TestHumanWait(t *testing.T) {
 	}
 }
 
-// Земля стоит дороже любого локального канала: одно сообщение в час, и никакая
-// репутация с возрастом аккаунта этого не меняют (кого пускать в Землю — вопрос
-// гейта по рейтингу, а не темпа).
+// Земля стоит дороже любого локального канала: одно сообщение в час на нулевой
+// репутации. Возраст аккаунта здесь не при чём (1/час строже любого локального
+// тира), а рейтинг двигает темп — но в узких пределах, см.
+// TestMessageLimitPlanetRating.
 func TestMessageLimitPlanetTier(t *testing.T) {
 	planet := messageLimitFor(0, old, scopePlanet)
 	if planet != planetLimit {
@@ -175,8 +176,52 @@ func TestMessageLimitPlanetTier(t *testing.T) {
 			t.Fatalf("Земля не строже локального тира %+v: %+v", tier, planet)
 		}
 	}
-	if messageLimitFor(100, time.Hour*10000, scopePlanet) != planetLimit {
-		t.Fatal("репутация или возраст изменили тир Земли")
+	if messageLimitFor(0, time.Minute, scopePlanet) != planetLimit {
+		t.Fatal("возраст аккаунта изменил тир Земли")
+	}
+}
+
+// Рейтинг в Земле двигает темп, но не открывает дверь: плюсы разгоняют до трёх
+// сообщений в час, минусы тормозят вдвое против базы. Потолок разгона здесь
+// несущий — при общем запасе голосов второй аккаунт может слить весь запас на
+// подельника, и невыгодной такую ферму делает именно мелкость приза.
+func TestMessageLimitPlanetRating(t *testing.T) {
+	base := messageLimitFor(0, old, scopePlanet)
+	good := messageLimitFor(goodRating, old, scopePlanet)
+	bad := messageLimitFor(-1, old, scopePlanet)
+
+	if good.refill >= base.refill {
+		t.Fatalf("плюс не разгоняет Землю: %+v против базы %+v", good, base)
+	}
+	if bad.refill <= base.refill {
+		t.Fatalf("минус не тормозит Землю: %+v против базы %+v", bad, base)
+	}
+	// разгон ограничен: даже огромный рейтинг не выводит Землю на локальный темп
+	if top := messageLimitFor(1000, old, scopePlanet); top != good {
+		t.Fatalf("разгон Земли не упёрся в потолок: %+v", top)
+	}
+	if good.refill < 15*time.Minute {
+		t.Fatalf("Земля разогналась слишком сильно: %+v", good)
+	}
+}
+
+// Область и город — своя полоса между страной и локальным: устойчивый темп как у
+// страны, всплеск меньше, а минус тормозит и здесь.
+func TestMessageLimitCityTier(t *testing.T) {
+	city := messageLimitFor(0, old, scopeCity)
+	if city != cityLimit {
+		t.Fatalf("тир города = %+v, want %+v", city, cityLimit)
+	}
+	country := messageLimitFor(0, old, scopeCountry)
+	if city.capacity >= country.capacity {
+		t.Fatalf("всплеск города не меньше страны: %+v против %+v", city, country)
+	}
+	local := messageLimitFor(0, old, scopeLocal)
+	if city.refill <= local.refill {
+		t.Fatalf("город не строже локального: %+v против %+v", city, local)
+	}
+	if bad := messageLimitFor(-1, old, scopeCity); bad.refill <= city.refill {
+		t.Fatalf("минус не тормозит город: %+v против %+v", bad, city)
 	}
 }
 

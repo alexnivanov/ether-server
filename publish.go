@@ -95,12 +95,17 @@ func (p *publisher) publish(
 			Code: "banned", Message: BanMessage(until, permanent, reason), Status: 403,
 		}
 	}
-	// Частота публикаций. rating пока всегда 0 (голосов нет) — работает базовый
-	// тир; когда появится рейтинг, сюда придёт его значение и лимит станет тирным
-	// без правок здесь (см. ratelimit.go).
+	// Частота публикаций. Рейтинг — сумма голосов за сообщения автора за
+	// последнюю неделю (голоса уезжают вместе с сообщениями), ещё один SELECT по
+	// индексу рядом с проверкой бана. Ошибку не считаем отказом: без рейтинга
+	// работает базовый тир, и это лучше, чем не дать написать из-за сбоя чтения.
 	if p.limiter != nil {
-		scope := scopeForChannel(channel)
-		if ok, retry := p.limiter.Allow(a.ID, 0, a.AccountAge, scope); !ok {
+		rating, err := p.store.AuthorRating(a.ID)
+		if err != nil {
+			slog.Error("author rating", "err", err, "user_id", a.ID)
+		}
+		scope := p.scopeFor(channel)
+		if ok, retry := p.limiter.Allow(a.ID, rating, a.AccountAge, scope); !ok {
 			return MessageData{}, &publishError{
 				Code:    "too_fast",
 				Message: tooFastMessage(scope, retry),
@@ -143,18 +148,57 @@ func (p *publisher) publish(
 	return m, nil
 }
 
-// scopeForChannel — из какого запаса брать сообщение. Знание про форму ID живёт
-// здесь, а не в ratelimit.go: там про каналы не знают, там арифметика бакетов.
-// Никакого геокодинга — только вид строки, по контракту ID каналов
+// scopeFor — из какого запаса брать сообщение. Полосу канала берём из
+// справочника (channels.level, заполняется на каждый locate нашим же
+// геокодером): по форме ID город неотличим от района и квартала, а уровню от
+// клиента верить нельзя — пришлёт `quarter` и получит квартальный темп в
+// городском канале.
+//
+// Справочник может молчать: строки нет у баз, живших до появления таблицы, и до
+// первого locate в этом месте. Тогда падаем на разбор формы ID
+// (scopeForChannel) — он различает верхние полосы, а остальное считает локальным.
+// Отказывать в публикации из-за отсутствия справочной строки нельзя: сообщение
+// потерялось бы на пустом месте.
+func (p *publisher) scopeFor(channel string) limitScope {
+	level, err := p.store.ChannelLevel(channel)
+	if err != nil {
+		slog.Error("channel level", "err", err, "channel", channel)
+	}
+	if scope, ok := scopeForLevel(level); ok {
+		return scope
+	}
+	return scopeForChannel(channel)
+}
+
+// scopeForLevel — полоса по уровню из справочника. Значения — те, что пишет
+// геокодер (см. Channel.Level): planet | country | region | city | district |
+// quarter. Неизвестное или пустое — false, вызывающий решает сам.
+func scopeForLevel(level string) (limitScope, bool) {
+	switch level {
+	case "planet":
+		return scopePlanet, true
+	case "country":
+		return scopeCountry, true
+	case "region", "city":
+		return scopeCity, true
+	case "district", "quarter":
+		return scopeLocal, true
+	}
+	return scopeLocal, false
+}
+
+// scopeForChannel — запасной разбор по ВИДУ строки, когда справочник про канал
+// молчит. Никакого геокодинга, только форма ID по контракту
 // (ether-meta/CLAUDE.md):
 //
 //	EARTH             — планета, зарезервированный литерал (см. PlanetChannel)
 //	RU                — страна, ISO 3166-1: ровно две заглавные буквы
-//	RU-MOW            — область, ISO 3166-2: с дефисом, лимита нет
-//	relation/2555133  — город/район/квартал: неразличимы, лимита нет
+//	RU-MOW            — область, ISO 3166-2: две буквы, дефис, код субъекта
+//	relation/2555133  — город/район/квартал: по форме неразличимы, считаем
+//	                    локальным (город без справочника опознать нельзя)
 //
 // Всё, что в эти формы не попало (мусорная строка от клиента, канал в неизвестном
-// формате), считается локальным — то есть ведёт себя как сегодня.
+// формате), тоже локальное — то есть ведёт себя как самая мягкая полоса.
 func scopeForChannel(channel string) limitScope {
 	if channel == PlanetChannel.ID {
 		return scopePlanet
@@ -162,7 +206,31 @@ func scopeForChannel(channel string) limitScope {
 	if isCountryCode(channel) {
 		return scopeCountry
 	}
+	if isRegionCode(channel) {
+		return scopeCity
+	}
 	return scopeLocal
+}
+
+// isRegionCode — ID области по контракту: ISO 3166-2, то есть код страны, дефис
+// и код субъекта («RU-MOW», «DE-HE»). Регистр, как и у страны, не нормализуем:
+// геокодер отдаёт значение из OSM как есть, а самодельная строка каналом не
+// является.
+func isRegionCode(s string) bool {
+	if len(s) < 4 || s[2] != '-' {
+		return false
+	}
+	if !isCountryCode(s[:2]) {
+		return false
+	}
+	for i := 3; i < len(s); i++ {
+		c := s[i]
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // isCountryCode — ID страны по контракту: ровно две заглавные латинские буквы.
@@ -189,6 +257,8 @@ func tooFastMessage(scope limitScope, retry time.Duration) string {
 		return fmt.Sprintf("В Землю можно писать раз в час — следующее сообщение через %s", humanWait(retry))
 	case scopeCountry:
 		return fmt.Sprintf("В канале страны пишут реже — подожди %s", humanWait(retry))
+	case scopeCity:
+		return fmt.Sprintf("В городском канале пишут реже — подожди %s", humanWait(retry))
 	default:
 		return fmt.Sprintf("Слишком часто — подожди %d с", int(retry.Seconds())+1)
 	}

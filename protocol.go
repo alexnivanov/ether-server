@@ -141,6 +141,34 @@ type MessageData struct {
 	AvatarURL string `json:"avatar_url,omitempty"`
 	Text      string `json:"text"`
 	TS        int64  `json:"ts"`
+	// Rating — сумма голосов под сообщением (плюс и минус стоят одинаково).
+	// omitempty намеренно: нуля клиент не показывает, а «нет голосов» и «плюс с
+	// минусом погасились» для читателя одно и то же — информации в нуле нет.
+	Rating int `json:"rating,omitempty"`
+	// MyVote — как проголосовал тот, кто запросил историю: +1 | -1 | 0. Нужен
+	// отдельно от Rating: свой плюс мог быть погашен чужим минусом, но кнопка у
+	// человека всё равно должна выглядеть нажатой. В live-рассылке всегда 0 —
+	// новое сообщение ещё никто не отметил.
+	MyVote int `json:"my_vote,omitempty"`
+}
+
+// VoteData — тело POST /vote: за какое сообщение и как. Value: +1 | -1 | 0, где
+// 0 — снять свой голос (обратная операция тем же эндпоинтом, как Unblock в
+// BlockData). Автора сервер берёт из самого сообщения: клиент присылает только
+// message_id.
+type VoteData struct {
+	MessageID int64 `json:"message_id"`
+	Value     int   `json:"value"`
+}
+
+// VoteResultData — тело ответа POST /vote: новое состояние сообщения и остаток
+// запаса. Остаток здесь, а не отдельным запросом: он меняется этим же действием,
+// и клиенту нужно обновить подпись у кнопки сразу.
+type VoteResultData struct {
+	MessageID int64 `json:"message_id"`
+	Rating    int   `json:"rating"`
+	MyVote    int   `json:"my_vote"`
+	VotesLeft int   `json:"votes_left"`
 }
 
 // RemovedData — контент убран модератором: либо одно сообщение (MessageID),
@@ -222,6 +250,12 @@ type AuthedUser struct {
 	// сервер фильтрует сам, а живую ленту прячет клиент, и для этого ему нужен
 	// список. Уходит только владельцу аккаунта: AuthedUser другим не показывается.
 	Blocked []int64 `json:"blocked,omitempty"`
+	// VotesLeft — сколько голосов у человека осталось из voteBudget. Приезжает со
+	// входом и с resume, дальше клиент обновляет его по ответам POST /vote.
+	// Единственное число про голоса, которое человек видит: это его собственный
+	// ресурс, а не оценка — накопленный рейтинг не показывается никому, включая
+	// владельца (ether-meta/PLANS.md).
+	VotesLeft int `json:"votes_left"`
 }
 
 // AuthedData — общий шейп REST-ответов про личность: POST /auth/{provider},

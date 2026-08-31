@@ -437,8 +437,8 @@ func TestPublishRetryDoesNotSpendLimit(t *testing.T) {
 
 // TestScopeForChannel — скоуп читается из ФОРМЫ ID канала, без геокодинга.
 // Область отличима от страны и от города, но своего тира у неё нет намеренно:
-// по числу людей это примерно город, а город по ID неотличим от района, значит
-// ограничить их можно только вместе.
+// по числу людей это примерно город, поэтому они едут одной полосой; сам город
+// по форме ID неотличим от района, и без справочника каналов считается локальным.
 func TestScopeForChannel(t *testing.T) {
 	cases := []struct {
 		channel string
@@ -447,9 +447,13 @@ func TestScopeForChannel(t *testing.T) {
 		{"EARTH", scopePlanet},
 		{"RU", scopeCountry},
 		{"DE", scopeCountry},
-		{"RU-MOW", scopeLocal},           // область: ISO 3166-2, тира нет
-		{"relation/2555133", scopeLocal}, // город
+		{"RU-MOW", scopeCity},            // область: по форме различима
+		{"DE-HE", scopeCity},             // ISO 3166-2 без цифр в коде субъекта
+		{"UA-30", scopeCity},             // и с цифрами
+		{"relation/2555133", scopeLocal}, // город: по форме неотличим от района
 		{"relation/1320555", scopeLocal}, // район
+		{"RU-", scopeLocal},              // дефис есть, кода субъекта нет
+		{"ru-mow", scopeLocal},           // строчное — не канал, а мусор
 		{"node/143564891", scopeLocal},
 		{"ru", scopeLocal}, // не канал страны, а мусор: геокодер отдаёт верхний регистр
 		{"R1", scopeLocal}, // две позиции, но не буквы

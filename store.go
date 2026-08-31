@@ -146,6 +146,44 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS reports_created_at ON reports(created_at);
 CREATE INDEX IF NOT EXISTS reports_author ON reports(author_user_id);
+-- Голоса за сообщения (см. ether-meta/PLANS.md, «Цена охвата»). Ограничено само
+-- голосование, а не рейтинг: у человека voteBudget голосов на всех авторов, и
+-- строка держит один голос, пока жива.
+--
+-- ON DELETE CASCADE от messages здесь несущий, а не защитный: голос живёт ровно
+-- столько, сколько отмеченное сообщение, поэтому уборка по TTL
+-- (DeleteMessagesOlderThan) сама возвращает людям их голоса — без таймеров,
+-- счётчиков и отдельного поля под запас. По той же причине копии текста здесь
+-- НЕТ, в отличие от reports: жалоба обязана пережить сообщение, голос — наоборот.
+--
+-- author_user_id денормализован намеренно: его можно было бы брать JOIN'ом по
+-- messages, но рейтинг читается на КАЖДОЙ публикации. Замер на базе 50k
+-- сообщений и 20k голосов: эта колонка — 21 µs, join без индекса — 2,9 ms
+-- (перебор messages, то есть время растёт вместе с историей), join с новым
+-- индексом messages(user_id) — 96 µs. Цена нормализации, таким образом, не ноль,
+-- а индекс на самой горячей таблице на вставку плюс пятикратное чтение — за то,
+-- чтобы не дублировать 8 байт неизменяемого значения.
+--
+-- Разъехаться копия не может by design: автор сообщения не меняется никогда, а
+-- голос не переживает сообщение (каскад ниже). Обычной беды денормализации —
+-- устаревшей копии, о которой никто не узнал — здесь нет.
+CREATE TABLE IF NOT EXISTS votes (
+	voter_user_id  INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	message_id     INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+	author_user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+	value          INTEGER NOT NULL, -- +1 | -1; плюс и минус стоят одинаково
+	created_at     INTEGER NOT NULL, -- unix-миллисекунды
+	-- один голос на пару (голосующий, сообщение): повторное нажатие идемпотентно,
+	-- как повторная жалоба в reports
+	PRIMARY KEY (voter_user_id, message_id)
+);
+-- Рейтинг автора: SUM(value) по одному индексу, без соединений. Индекс
+-- ПОКРЫВАЮЩИЙ (value в ключе, хотя по нему не ищут) — иначе на каждую строку
+-- идёт доп. обращение в таблицу за value, и на замере это разница в разы.
+CREATE INDEX IF NOT EXISTS votes_author ON votes(author_user_id, value);
+-- Сумма под сообщением в выборке истории — тоже покрывающий, по той же причине.
+-- Свой голос смотрящего идёт прямым попаданием в первичный ключ.
+CREATE INDEX IF NOT EXISTS votes_message ON votes(message_id, value);
 -- Адресная доставка пушей (см. push.go). Топики FCM не годятся: в топик нельзя
 -- НЕ отправить конкретному подписчику, из-за чего автор получал уведомление о
 -- своём же сообщении. Поэтому сервер держит токены устройств и каналы каждого
@@ -963,10 +1001,17 @@ func (s *Store) History(channel string, beforeID int64, limit int, viewerID int6
 	// нет). LEFT JOIN — защитно: при удалении аккаунта сообщения удаляются
 	// каскадом вместе с автором (см. DeleteUser), поэтому «висячих» строк без
 	// users быть не должно, но JOIN не должен ронять выборку, если что.
-	q := `SELECT m.id, m.channel, m.user_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts
+	//
+	// Голоса — двумя скалярными подзапросами по votes_message: сумма под
+	// сообщением и свой голос смотрящего (0 у не вошедшего — viewerID тогда 0 и
+	// не совпадёт ни с кем). Подзапросы, а не GROUP BY по всей таблице: строк тут
+	// не больше maxHistoryLimit, и каждая идёт по индексу.
+	q := `SELECT m.id, m.channel, m.user_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts,
+			(SELECT COALESCE(SUM(value), 0) FROM votes WHERE message_id = m.id),
+			COALESCE((SELECT value FROM votes WHERE message_id = m.id AND voter_user_id = ?), 0)
 		FROM messages m LEFT JOIN users u ON u.id = m.user_id
 		WHERE m.channel = ?`
-	args := []any{channel}
+	args := []any{viewerID, channel}
 	if viewerID > 0 {
 		q += ` AND m.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?)`
 		args = append(args, viewerID)
@@ -989,7 +1034,7 @@ func (s *Store) History(channel string, beforeID int64, limit int, viewerID int6
 		var m MessageData
 		if err := rows.Scan(
 			&m.ID, &m.Channel, &m.SenderID, &m.Sender, &m.Username,
-			&m.AvatarURL, &m.Text, &m.TS,
+			&m.AvatarURL, &m.Text, &m.TS, &m.Rating, &m.MyVote,
 		); err != nil {
 			return nil, err
 		}
@@ -1025,6 +1070,185 @@ func (s *Store) DeleteUserMessages(userID int64) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// ─── голоса за сообщения ───
+
+// voteBudget — сколько голосов у человека на ВСЕХ авторов сразу. Ограничено
+// именно голосование, а не рейтинг: отдал — запас уменьшился, и отказ приходит в
+// момент нажатия. Ограничение, которое человек видит, честнее того, которое
+// молча обесценивает нажатие; заодно общий запас делает голос обдуманным —
+// отдать пять голосов одному это реальная трата (ether-meta/PLANS.md).
+//
+// Десять на недельном TTL сообщений — полтора голоса в день у активного
+// человека: отметка остаётся жестом, а не рефлексом. Число подбирается на живой
+// статистике, поэтому лежит одной константой.
+const voteBudget = 10
+
+// Отказы голосования — в терминах причины, а не HTTP: код статуса выбирает
+// обработчик (rest.go).
+var (
+	// ErrMessageGone — сообщения нет: удалено модератором или уехало по TTL.
+	ErrMessageGone = errors.New("сообщения нет")
+	// ErrSelfVote — голос за собственное сообщение. Запрещён: иначе рейтинг
+	// набирается в одиночку, без всякой фермы.
+	ErrSelfVote = errors.New("голос за своё сообщение")
+	// ErrNoVotesLeft — запас исчерпан. Восстановится, когда отмеченные сообщения
+	// уедут по TTL и каскад унесёт голоса.
+	ErrNoVotesLeft = errors.New("голоса кончились")
+)
+
+// VoteState — то, что клиент показывает после голоса: сумма под сообщением, свой
+// голос и остаток запаса.
+type VoteState struct {
+	Rating    int // сумма голосов под сообщением
+	MyVote    int // +1 | -1 | 0 — как проголосовал этот человек
+	VotesLeft int // сколько голосов у него осталось
+}
+
+// rowQuerier — общее у *sql.DB и *sql.Tx: состояние голоса читается и внутри
+// транзакции Vote, и снаружи.
+type rowQuerier interface {
+	QueryRow(query string, args ...any) *sql.Row
+}
+
+// Vote ставит, меняет или снимает голос: value +1 / -1 / 0 (снять).
+//
+// Запас тратит только НОВЫЙ голос. Смена знака идёт по уже занятому слоту и
+// потому бесплатна, снятие слот освобождает сразу: случайное нажатие не должно
+// наказывать на неделю. Повторное нажатие тем же знаком — не ошибка, а тот же
+// результат (идемпотентность по первичному ключу).
+//
+// Всё одной транзакцией: между проверкой запаса и вставкой не должно влезть
+// второе нажатие с другого устройства.
+func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return VoteState{}, err
+	}
+	defer tx.Rollback()
+
+	var authorID int64
+	err = tx.QueryRow(`SELECT user_id FROM messages WHERE id = ?`, messageID).Scan(&authorID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return VoteState{}, ErrMessageGone
+	}
+	if err != nil {
+		return VoteState{}, err
+	}
+	if authorID == voterID {
+		return VoteState{}, ErrSelfVote
+	}
+
+	// have остаётся нулём, если строки нет: сохранённый голос нулевым не бывает,
+	// поэтому have != 0 и означает «слот уже занят».
+	var have int
+	err = tx.QueryRow(`SELECT value FROM votes WHERE voter_user_id = ? AND message_id = ?`,
+		voterID, messageID).Scan(&have)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return VoteState{}, err
+	}
+
+	now := time.Now().UnixMilli()
+	switch {
+	case value == 0:
+		if _, err := tx.Exec(
+			`DELETE FROM votes WHERE voter_user_id = ? AND message_id = ?`,
+			voterID, messageID); err != nil {
+			return VoteState{}, err
+		}
+	case have != 0:
+		if _, err := tx.Exec(
+			`UPDATE votes SET value = ?, created_at = ?
+				WHERE voter_user_id = ? AND message_id = ?`,
+			value, now, voterID, messageID); err != nil {
+			return VoteState{}, err
+		}
+	default:
+		var spent int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM votes WHERE voter_user_id = ?`, voterID).Scan(&spent); err != nil {
+			return VoteState{}, err
+		}
+		if spent >= voteBudget {
+			return VoteState{}, ErrNoVotesLeft
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO votes (voter_user_id, message_id, author_user_id, value, created_at)
+				VALUES (?, ?, ?, ?, ?)`,
+			voterID, messageID, authorID, value, now); err != nil {
+			return VoteState{}, err
+		}
+	}
+
+	st, err := voteState(tx, voterID, messageID)
+	if err != nil {
+		return VoteState{}, err
+	}
+	return st, tx.Commit()
+}
+
+func voteState(q rowQuerier, voterID, messageID int64) (VoteState, error) {
+	var st VoteState
+	if err := q.QueryRow(
+		`SELECT COALESCE(SUM(value), 0) FROM votes WHERE message_id = ?`,
+		messageID).Scan(&st.Rating); err != nil {
+		return st, err
+	}
+	if err := q.QueryRow(
+		`SELECT COALESCE((SELECT value FROM votes WHERE voter_user_id = ? AND message_id = ?), 0)`,
+		voterID, messageID).Scan(&st.MyVote); err != nil {
+		return st, err
+	}
+	var spent int
+	if err := q.QueryRow(
+		`SELECT COUNT(*) FROM votes WHERE voter_user_id = ?`, voterID).Scan(&spent); err != nil {
+		return st, err
+	}
+	st.VotesLeft = max(voteBudget-spent, 0)
+	return st, nil
+}
+
+// AuthorRating — рейтинг автора: сумма голосов по всем его сообщениям. Никаких
+// зажимов и пересчётов, каждый голос стоит ровно 1 — потолок на пару
+// «голосующий → автор» разобран и снят, его роль играет дефицит голосов
+// (см. ether-meta/PLANS.md).
+//
+// Читается на каждой публикации, поэтому запрос идёт по покрывающему
+// votes_author. Голоса уезжают вместе с сообщениями, так что это «сколько
+// собрано за последнюю неделю», а не за всё время: минусовой тир самозаживает, а
+// накрутка требует непрерывного расхода.
+//
+// Считать сумму на чтении, а не держать её колонкой, безопасно потому, что
+// **объём ограничен самой механикой**: строк в таблице не больше
+// voteBudget × активных пользователей, а у одного автора — не больше
+// voteBudget × числа людей, отметивших его за неделю. Замер (временная база,
+// ноутбук): 50 голосов у автора — 14 µs, 500 — 61 µs, 5000 — 525 µs; последнее
+// это 500 человек, потративших весь недельный запас на одного, то есть потолок
+// конструкции, а не «пока пользователей мало». Для сравнения, геокодинг держит
+// мьютекс 1100 мс на запрос к публичному Nominatim — разница в четыре порядка.
+//
+// Триггер, при котором это перестанет быть верным, ровно один: если ограниченность
+// пропадёт — уберут запас голосов или решат, что голоса не уезжают с сообщениями.
+// Тогда сумму надо денормализовать в колонку у пользователя, обновляя её в той же
+// транзакции, что Vote; API от этого не меняется.
+func (s *Store) AuthorRating(userID int64) (int, error) {
+	var rating int
+	err := s.db.QueryRow(
+		`SELECT COALESCE(SUM(value), 0) FROM votes WHERE author_user_id = ?`,
+		userID).Scan(&rating)
+	return rating, err
+}
+
+// VotesLeft — остаток запаса. Отдельного счётчика нет: таблица голосов и есть
+// учёт, потому что строка живёт ровно пока занят голос.
+func (s *Store) VotesLeft(userID int64) (int, error) {
+	var spent int
+	if err := s.db.QueryRow(
+		`SELECT COUNT(*) FROM votes WHERE voter_user_id = ?`, userID).Scan(&spent); err != nil {
+		return 0, err
+	}
+	return max(voteBudget-spent, 0), nil
 }
 
 // ─── жалобы ───
@@ -1391,6 +1615,31 @@ func (s *Store) ChannelName(id string) (string, error) {
 		return "", err
 	}
 	return name, nil
+}
+
+// ChannelLevel — полоса канала по справочнику: planet | country | region | city
+// district | quarter. Пустая строка без ошибки — канала в справочнике нет
+// (locate в этом месте ещё не делали); вызывающий обязан это пережить, см.
+// publisher.scopeFor.
+//
+// ВАЖНО: поштучно верить можно только верхним значениям. Пара district/quarter —
+// метка ОТНОСИТЕЛЬНАЯ (две мельчайшие подгородские единицы точки, мельчайшая →
+// quarter, см. nominatim.go), поэтому у трёхслойной цепочки средняя единица для
+// одной точки quarter, а для соседней district; строка справочника
+// перезаписывается последним locate, так что значение меняется и во времени. Для
+// planet/country/region/city это настоящее свойство канала: они берутся из
+// фиксированных полос рангов, а ранг единицы от точки не зависит. Отсюда и лимит
+// склеивает district с quarter в одну полосу.
+func (s *Store) ChannelLevel(id string) (string, error) {
+	var level string
+	err := s.db.QueryRow(`SELECT level FROM channels WHERE id = ?`, id).Scan(&level)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return level, nil
 }
 
 // subscriberWindow — какой давности привязка ещё считается живым человеком.

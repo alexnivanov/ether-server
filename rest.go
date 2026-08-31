@@ -74,6 +74,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("POST /push/unregister", handlePushUnregister(store))
 	mux.HandleFunc("POST /report", handleReport(store, notify))
 	mux.HandleFunc("POST /rules/accept", handleAcceptRules(store))
+	mux.HandleFunc("POST /vote", handleVote(store))
 	mux.HandleFunc("POST /session/logout", handleLogout(store))
 	mux.HandleFunc("POST /session/resume", handleResume(store))
 	mux.HandleFunc("GET /version", handleVersion(store, gate))
@@ -858,6 +859,61 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 	}
 }
 
+// handleVote — POST /vote {message_id, value} (токен — заголовком) →
+// 200 {message_id, rating, my_vote, votes_left} | 401 bad_session |
+// 403 forbidden (голос за своё сообщение) | 404 not_found | 429 no_votes |
+// 400 bad_data — отметить сообщение плюсом или минусом.
+//
+// value: +1 | -1 | 0, где 0 снимает свой голос и возвращает его в запас.
+// Повторное нажатие тем же знаком — успех с тем же состоянием: клиент мог не
+// получить первый ответ, и наказывать его за повтор не за что.
+//
+// Отказ 429 здесь не про частоту, а про исчерпанный запас: голоса возвращаются
+// не по таймеру, а когда отмеченные сообщения уедут по TTL, поэтому Retry-After
+// не выставляем — обещать точный срок нечем.
+func handleVote(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var d VoteData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.MessageID <= 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен id сообщения")
+			return
+		}
+		if d.Value != 1 && d.Value != -1 && d.Value != 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Голос — это +1, -1 или 0")
+			return
+		}
+		u, ok := sessionUser(w, r, store, "", "токен сессии и id сообщения")
+		if !ok {
+			return
+		}
+		st, err := store.Vote(u.ID, d.MessageID, d.Value)
+		switch {
+		case errors.Is(err, ErrMessageGone):
+			writeRESTError(w, http.StatusNotFound, "not_found",
+				"Сообщение не найдено — возможно, оно уже удалено")
+			return
+		case errors.Is(err, ErrSelfVote):
+			writeRESTError(w, http.StatusForbidden, "forbidden",
+				"За свои сообщения голосовать нельзя")
+			return
+		case errors.Is(err, ErrNoVotesLeft):
+			writeRESTError(w, http.StatusTooManyRequests, "no_votes",
+				"Голоса кончились. Они вернутся, когда отмеченные сообщения устареют")
+			return
+		case err != nil:
+			slog.Error("vote", "err", err, "message_id", d.MessageID, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось учесть голос")
+			return
+		}
+		writeJSON(w, http.StatusOK, VoteResultData{
+			MessageID: d.MessageID,
+			Rating:    st.Rating,
+			MyVote:    st.MyVote,
+			VotesLeft: st.VotesLeft,
+		})
+	}
+}
+
 // handleAcceptRules — POST /rules/accept (токен — заголовком) → 200 authed
 // {rules_accepted: true} | 401 bad_session | 400 not_authed (нет токена).
 func handleAcceptRules(store *Store) http.HandlerFunc {
@@ -1047,6 +1103,12 @@ func authedUser(store *Store, u *User) AuthedUser {
 	if err != nil {
 		slog.Error("blocked by", "err", err, "user_id", u.ID)
 	}
+	// остаток голосов: ошибку не роняем наружу — вход важнее подписи у кнопки,
+	// а следующий же POST /vote вернёт актуальное число
+	votesLeft, err := store.VotesLeft(u.ID)
+	if err != nil {
+		slog.Error("votes left", "err", err, "user_id", u.ID)
+	}
 	return AuthedUser{
 		ID:        u.ID,
 		Username:  u.TgUsername,
@@ -1054,6 +1116,7 @@ func authedUser(store *Store, u *User) AuthedUser {
 		AvatarURL: u.AvatarURL,
 		Providers: providers,
 		Blocked:   blocked,
+		VotesLeft: votesLeft,
 	}
 }
 
