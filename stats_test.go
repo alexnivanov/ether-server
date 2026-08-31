@@ -286,6 +286,69 @@ func TestWeeklyStatsQuery(t *testing.T) {
 	}
 }
 
+// TestWeeklyStatsSkipsPreviews — превью ссылки в мессенджере дёргает URL само,
+// иногда по разу на участника беседы. В сводке такие заходы не должны считаться
+// ни переходами, ни чужими приглашениями: иначе одна ссылка в групповом чате
+// выглядит как десяток пришедших людей. В app_access они при этом остаются.
+func TestWeeklyStatsSkipsPreviews(t *testing.T) {
+	store := openTestStore(t)
+	alex := mkTgUser(t, store, "1", "alex", "Алексей")
+
+	now := time.Now().UnixMilli()
+	from, to := now-1000, now+1000
+
+	must := func(a AppAccess) {
+		t.Helper()
+		if err := store.SaveAppAccess(a); err != nil {
+			t.Fatalf("save app access: %v", err)
+		}
+	}
+	must(AppAccess{UID: alex, Src: "apli", Platform: platformIOS, Outcome: outcomeAppStore, UA: uaIPhone})
+	must(AppAccess{UID: alex, Src: "apli", Platform: platformUnknown, Outcome: outcomeLanding,
+		UA: "TelegramBot (like TwitterBot)"})
+	must(AppAccess{UID: alex, Src: "apli", Platform: platformUnknown, Outcome: outcomeLanding,
+		UA: "WhatsApp/2.23.20.0 A"})
+	// мобильный Googlebot представляется Android'ом — по platform его не поймать
+	must(AppAccess{UID: alex, Src: "apli", Platform: platformAndroid, Outcome: outcomePlay,
+		UA: "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X) Chrome/126.0 Mobile Safari/537.36 " +
+			"(compatible; Googlebot/2.1; +http://www.google.com/bot.html)"})
+	// заход без User-Agent — не бот, а неизвестный клиент: NULL в ua не должен
+	// выкидывать строку из сводки
+	must(AppAccess{Src: "apqr", Platform: platformUnknown, Outcome: outcomeLanding})
+
+	st, err := store.WeeklyStats(from, to)
+	if err != nil {
+		t.Fatalf("weekly stats: %v", err)
+	}
+
+	if st.Accesses != 2 {
+		t.Errorf("Accesses = %d, want 2 (человек и заход без UA)", st.Accesses)
+	}
+	if st.Previews != 3 {
+		t.Errorf("Previews = %d, want 3", st.Previews)
+	}
+	if got := groupCount(st.BySrc, "apli"); got != 1 {
+		t.Errorf("BySrc[apli] = %d, want 1 — превью в источники не идут", got)
+	}
+	if got := groupCount(st.ByPlatform, platformAndroid); got != 0 {
+		t.Errorf("ByPlatform[android] = %d, want 0 — Googlebot прикинулся телефоном", got)
+	}
+	if len(st.ByInviter) != 1 || st.ByInviter[0].Count != 1 {
+		t.Errorf("ByInviter = %+v, want [{Алексей 1}] — превью приглашениями не считаются", st.ByInviter)
+	}
+	if len(st.AccessRows) != 2 {
+		t.Errorf("AccessRows = %d, want 2", len(st.AccessRows))
+	}
+	// в самой таблице боты остаются: разбор UA можно переиграть задним числом
+	if n := appAccessCount(t, store); n != 5 {
+		t.Errorf("app_access = %d строк, want 5 — из таблицы ничего не удаляем", n)
+	}
+	// счётчик просел не молча
+	if text := formatWeeklyStats(st, time.Now().AddDate(0, 0, -7), time.Now()); !strings.Contains(text, "не в счёт 3 превью") {
+		t.Errorf("в сводке нет отметки об отфильтрованных превью: %q", text)
+	}
+}
+
 func groupCount(rows []CountRow, key string) int {
 	for _, r := range rows {
 		if r.Key == key {

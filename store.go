@@ -1592,8 +1592,13 @@ type WeeklyStats struct {
 	// Названий каналов сервер не хранит (в messages лежит ID вида
 	// relation/2555133, а имена живут только в памяти геокодера), поэтому топ
 	// каналов в сводке не выводим: список сырых ID нечитаем.
-	Channels   int
+	Channels int
+	// Accesses — заходы по ссылке установки, БЕЗ сборщиков превью; Previews —
+	// сколько таких сборщиков отфильтровано (см. previewUAMarkers и humanUAExpr).
+	// Второе число нужно рядом с первым: иначе просевший счётчик читается как
+	// «людей стало меньше».
 	Accesses   int
+	Previews   int
 	BySrc      []CountRow
 	ByPlatform []CountRow
 	ByInviter  []CountRow
@@ -1625,6 +1630,27 @@ type WeeklyStats struct {
 	ByGeocodeError []CountRow
 }
 
+// humanUAExpr — SQL-условие «заход сделал человек, а не сборщик превью». Ставится
+// во ВСЕ запросы сводки по app_access: в самой таблице боты лежат вместе с людьми
+// (там сырьё), а фильтруются на чтении — так решение «кто из них бот» можно
+// переиграть задним числом, не потеряв данные.
+//
+// Собирается из previewUAMarkers, чтобы список маркеров жил в одном месте.
+// Колонка названа без алиаса — в запросах со сводкой JOIN идёт только с users,
+// а ua там нет, так что двусмысленности не возникает.
+var humanUAExpr = buildHumanUAExpr()
+
+// buildHumanUAExpr склеивает условие из маркеров. COALESCE обязателен: ua
+// nullable, а `NULL NOT LIKE …` — это NULL, и заход без User-Agent молча выпал бы
+// из сводки вместе с ботами.
+func buildHumanUAExpr() string {
+	parts := make([]string, len(previewUAMarkers))
+	for i, m := range previewUAMarkers {
+		parts[i] = "COALESCE(ua, '') NOT LIKE '%" + m + "%'"
+	}
+	return "(" + strings.Join(parts, " AND ") + ")"
+}
+
 // WeeklyStats собирает сводку за [from, to). Границы полуоткрытые: соседние
 // недели не пересекаются и ни одна строка не попадает в две сводки сразу.
 func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
@@ -1646,9 +1672,12 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 		from, to).Scan(&st.Messages, &st.Channels); err != nil {
 		return nil, err
 	}
-	if err := s.db.QueryRow(
-		`SELECT COUNT(*) FROM app_access WHERE ts >= ? AND ts < ?`,
-		from, to).Scan(&st.Accesses); err != nil {
+	// Люди и сборщики превью — одним проходом: SUM по условию, а не два запроса
+	// с противоположными WHERE, которые пришлось бы держать согласованными.
+	if err := s.db.QueryRow(`
+		SELECT COALESCE(SUM(`+humanUAExpr+`), 0), COALESCE(SUM(NOT (`+humanUAExpr+`)), 0)
+		FROM app_access WHERE ts >= ? AND ts < ?`,
+		from, to).Scan(&st.Accesses, &st.Previews); err != nil {
 		return nil, err
 	}
 
@@ -1657,13 +1686,13 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 	// быть видимой строкой, а не пропасть из группировки.
 	if st.BySrc, err = s.countRows(`
 		SELECT COALESCE(NULLIF(src, ''), 'без источника'), COUNT(*) n
-		FROM app_access WHERE ts >= ? AND ts < ?
+		FROM app_access WHERE ts >= ? AND ts < ? AND `+humanUAExpr+`
 		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
 		return nil, err
 	}
 	if st.ByPlatform, err = s.countRows(`
 		SELECT platform, COUNT(*) n
-		FROM app_access WHERE ts >= ? AND ts < ?
+		FROM app_access WHERE ts >= ? AND ts < ? AND `+humanUAExpr+`
 		GROUP BY 1 ORDER BY n DESC`, from, to); err != nil {
 		return nil, err
 	}
@@ -1713,7 +1742,7 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 	if st.ByInviter, err = s.countRows(`
 		SELECT COALESCE(NULLIF(u.full_name, ''), 'id ' || a.uid), COUNT(*) n
 		FROM app_access a LEFT JOIN users u ON u.id = a.uid
-		WHERE a.ts >= ? AND a.ts < ? AND a.uid IS NOT NULL
+		WHERE a.ts >= ? AND a.ts < ? AND a.uid IS NOT NULL AND `+humanUAExpr+`
 		GROUP BY a.uid ORDER BY n DESC`, from, to); err != nil {
 		return nil, err
 	}
@@ -1723,7 +1752,7 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 		       COALESCE(a.src, ''), a.platform, a.outcome,
 		       COALESCE(a.lang, ''), COALESCE(a.ua, '')
 		FROM app_access a LEFT JOIN users u ON u.id = a.uid
-		WHERE a.ts >= ? AND a.ts < ?
+		WHERE a.ts >= ? AND a.ts < ? AND `+humanUAExpr+`
 		ORDER BY a.ts`, from, to)
 	if err != nil {
 		return nil, err
