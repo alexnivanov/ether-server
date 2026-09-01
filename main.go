@@ -156,7 +156,7 @@ func main() {
 	pub := &publisher{store: store, hub: hub, push: push, limiter: limiter}
 
 	mux := http.NewServeMux()
-	registerREST(mux, store, verifiers, notify, gate, pub)
+	registerREST(mux, store, verifiers, notify, gate, pub, hub)
 	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, limiter))
 
 	// Паники в хендлерах: net/http гасит их внутри соединения, и мы бы о них не

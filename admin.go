@@ -51,13 +51,10 @@ func NewAdminBot(notify *Notifier, store *Store, hub *Hub) *AdminBot {
 	return &AdminBot{notify: notify, store: store, hub: hub}
 }
 
-// announceRemoved говорит подключённым клиентам убрать контент из ленты. Без
-// этого модерация выглядит для них так, будто ничего не произошло.
+// announceRemoved говорит подключённым клиентам убрать контент из ленты.
+// Кадр тот же, что у автора, удаляющего своё сообщение, — см. Hub.AnnounceRemoved.
 func (a *AdminBot) announceRemoved(d RemovedData) {
-	if a.hub == nil {
-		return
-	}
-	a.hub.announce <- envelope(TypeRemoved, d)
+	a.hub.AnnounceRemoved(d)
 }
 
 // Run в бесконечном цикле забирает обновления бота (long-poll) и исполняет

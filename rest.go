@@ -48,7 +48,10 @@ import (
 // отвечает ok (см. version.go).
 // pub — общий с WS путь публикации (см. publish.go); nil — POST /messages
 // отвечает 501, как незаданный провайдер входа.
-func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher) {
+// hub передаётся отдельно от pub, хотя pub его и содержит: удаление своего
+// сообщения не должно отключаться заодно с публикацией. nil-хаб просто не
+// рассылает кадр (см. Hub.AnnounceRemoved).
+func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher, hub *Hub) {
 	mux.HandleFunc("POST /account/delete", handleDeleteAccount(store))
 	// GET покрывает и HEAD — им ходят сборщики превью ссылок (см. handleAppLink)
 	mux.HandleFunc("GET /app", handleAppLink(store))
@@ -63,6 +66,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("POST /block", handleBlock(store, notify))
 	mux.HandleFunc("GET /blocked", handleBlocked(store))
 	// /messages — один ресурс: читаем коллекцию и добавляем в неё
+	mux.HandleFunc("DELETE /messages/{id}", handleDeleteMessage(store, hub))
 	mux.HandleFunc("GET /messages", handleHistory(store))
 	mux.HandleFunc("POST /messages", handlePublish(store, pub))
 	mux.HandleFunc("POST /profile/name", handleSetName(store))
@@ -871,6 +875,47 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 // Отказ 429 здесь не про частоту, а про исчерпанный запас: голоса возвращаются
 // не по таймеру, а когда отмеченные сообщения уедут по TTL, поэтому Retry-After
 // не выставляем — обещать точный срок нечем.
+// handleDeleteMessage — автор удаляет своё сообщение.
+//
+// id в пути, а не в теле: у DELETE тела нет, а токен приезжает заголовком
+// Authorization. Метод выбран не для красоты — HTTP определяет DELETE
+// идемпотентным, и это ровно то поведение, которое нужно: повтор после обрыва
+// сети обязан отвечать успехом, а не «не найдено».
+//
+// Удалять чужое нельзя (403). Модерация ходит своим путём (admin.go) и этой
+// проверкой не ограничена.
+func handleDeleteMessage(store *Store, hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil || id <= 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен id сообщения")
+			return
+		}
+		u, ok := sessionUser(w, r, store, "", "токен сессии")
+		if !ok {
+			return
+		}
+		removed, err := store.DeleteOwnMessage(u.ID, id)
+		switch {
+		case errors.Is(err, ErrNotAuthor):
+			writeRESTError(w, http.StatusForbidden, "forbidden",
+				"Удалить можно только своё сообщение")
+			return
+		case err != nil:
+			slog.Error("delete message", "err", err, "message_id", id, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal",
+				"Не удалось удалить сообщение")
+			return
+		}
+		// Кадр шлём только когда реально удалили: на повторе удалять из лент
+		// уже нечего, а лишний кадр разослался бы всем подключённым.
+		if removed {
+			hub.AnnounceRemoved(RemovedData{MessageID: id})
+		}
+		writeJSON(w, http.StatusOK, struct{}{})
+	}
+}
+
 func handleVote(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var d VoteData

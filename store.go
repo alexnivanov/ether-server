@@ -1062,6 +1062,52 @@ func (s *Store) DeleteMessage(id int64) (bool, error) {
 	return n > 0, err
 }
 
+// ErrNotAuthor — попытка удалить чужое сообщение. Отдельная ошибка, а не общий
+// «нет доступа»: обработчику надо отличить её от «сообщения уже нет», у них
+// разные коды (403 против идемпотентного 200).
+var ErrNotAuthor = errors.New("сообщение чужое")
+
+// DeleteOwnMessage удаляет сообщение автора. Возвращает false без ошибки, если
+// строки уже нет: сообщение могло уехать по TTL, быть снятым модератором или
+// удалённым этим же запросом, повторённым после обрыва сети. Для DELETE это
+// нормальный исход — метод идемпотентен по определению, и обработчик отвечает
+// 200.
+//
+// Чужое сообщение — ErrNotAuthor.
+//
+// Порядок запросов важен: сначала удаляем с условием по автору, и только если
+// не удалилось ничего — выясняем, чего не хватило. Обратный порядок (сначала
+// прочитать автора, потом удалить) — это TOCTOU: между двумя запросами строку
+// может унести уборка по TTL. Здесь же 0 удалённых строк при существующей
+// строке означает ровно одно — автор другой, потому что своя строка условию бы
+// удовлетворяла.
+//
+// Голоса за это сообщение уносит каскад (см. votes), и проголосовавшие получают
+// свои голоса обратно — тем же путём, что при уборке по TTL. Жалобы, наоборот,
+// остаются: в них лежит копия текста (см. ReportMessage), иначе автор стирал бы
+// улику против себя удалением.
+func (s *Store) DeleteOwnMessage(authorID, messageID int64) (bool, error) {
+	res, err := s.db.Exec(`DELETE FROM messages WHERE id = ? AND user_id = ?`, messageID, authorID)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return true, nil
+	}
+	var exists int
+	switch err := s.db.QueryRow(`SELECT 1 FROM messages WHERE id = ?`, messageID).Scan(&exists); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, nil // сообщения нет — идемпотентный успех
+	case err != nil:
+		return false, err
+	}
+	return false, ErrNotAuthor
+}
+
 // DeleteUserMessages удаляет все сообщения пользователя и возвращает их число —
 // когда одного сообщения мало (спамер засыпал канал).
 func (s *Store) DeleteUserMessages(userID int64) (int64, error) {
