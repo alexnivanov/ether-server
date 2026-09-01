@@ -12,6 +12,29 @@ import (
 const (
 	maxMessageLen   = 4096 // байт текста в publish
 	maxHistoryLimit = 200  // сообщений в одном ответе history
+
+	// Keepalive сокета. В нашем протоколе тишина — норма: человек читает и
+	// ничего не пишет, сервер молчит, пока в каналах нет сообщений. А оператор
+	// или NAT роняет простаивающий TCP через ~30–120 с, и без пингов этого не
+	// замечает НИ ОДНА сторона: соединение становится зомби — сообщения не
+	// идут, ошибки нет, подписка в хабе жива и рассылка уходит в никуда.
+	//
+	// Поэтому сервер сам пингует каждое соединение и требует pong в срок. Это
+	// и держит канал живым (трафик не даёт NAT его забыть), и превращает
+	// мёртвое соединение в честный обрыв — на него у клиента есть ответ
+	// (переподключение через resume). Пинг ловит и обратный случай: клиент
+	// исчез вместе с сетью, а его соединение осталось бы в хабе навсегда.
+	//
+	// Важное свойство: чинит и УЖЕ ВЫПУЩЕННЫЕ сборки. На ping отвечает сам
+	// WebSocket (dart:io, браузер), клиентского кода это не требует.
+	writeWait = 10 * time.Second // на саму запись кадра в сокет
+)
+
+// Периоды keepalive (см. writeWait выше). Не const, потому что тест иначе
+// пришлось бы держать минуту: он подменяет их на миллисекунды и возвращает.
+var (
+	pongWait   = 60 * time.Second // ждём pong (и любой кадр) не дольше
+	pingPeriod = 50 * time.Second // пингуем с запасом до pongWait
 )
 
 // Client — одно WebSocket-соединение. readPump читает кадры из сокета и дёргает
@@ -91,9 +114,24 @@ func (c *Client) readPump() {
 		c.conn.Close()
 	}()
 
+	// Половина keepalive, которая ловит мёртвого клиента: не ответил pong (или
+	// вообще замолчал) — чтение падает по дедлайну, и соединение уходит из
+	// хаба, вместо того чтобы висеть в подписках.
+	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return
+	}
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
 	for {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
+			return
+		}
+		// Свой кадр — тоже доказательство живости, не хуже pong: сдвигаем
+		// дедлайн, чтобы активный клиент не отвалился, если pong потерялся.
+		if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
 			return
 		}
 		var env Envelope
@@ -190,9 +228,39 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	for env := range c.send {
-		if err := c.conn.WriteJSON(env); err != nil {
-			return
+	ping := time.NewTicker(pingPeriod)
+	defer func() {
+		ping.Stop()
+		// Закрываем сокет и здесь: если писатель ушёл (не прошёл пинг или
+		// запись), читатель иначе висел бы на ReadMessage до самого дедлайна.
+		c.conn.Close()
+	}()
+
+	for {
+		select {
+		case env, ok := <-c.send:
+			if !ok {
+				// Хаб отцепил клиента и закрыл очередь — прощаемся кадром
+				// close, чтобы на той стороне это был штатный обрыв, а не
+				// оборванный без объяснений сокет.
+				_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				_ = c.conn.WriteMessage(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+				return
+			}
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				return
+			}
+			if err := c.conn.WriteJSON(env); err != nil {
+				return
+			}
+		case <-ping.C:
+			if err := c.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }
