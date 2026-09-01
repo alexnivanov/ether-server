@@ -87,7 +87,7 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 	var sent int
 	var stale []string
 	for _, device := range tokens {
-		switch p.sendTo(tok.AccessToken, device, title, body) {
+		switch p.sendTo(tok.AccessToken, device, title, body, channelID, name) {
 		case sendOK:
 			sent++
 		case sendStale:
@@ -126,9 +126,29 @@ const (
 	sendStale // токен больше не существует — удалить из БД
 )
 
-// sendTo отправляет одно уведомление на один токен устройства. title/body уже
-// готовы (см. pushText) — здесь только транспорт.
-func (p *Pusher) sendTo(accessToken, device, title, body string) sendResult {
+// pushPayload — тело запроса к FCM HTTP v1 для одного устройства.
+//
+// Кроме notification (то, что человек читает в шторке) кладём data — то, что
+// читает приложение по тапу: в какой канал открывать. Без него тап приводил
+// человека просто «в приложение», и найти сообщение, о котором его позвали, он
+// должен был сам.
+//
+// Имя канала едет рядом с ID, хотя ID достаточно, чтобы открыть комнату: пуш
+// мог догнать человека там, где он в этом канале уже не состоит, — и назвать
+// зону, в которую он не попадёт, клиенту больше нечем (в его наборе такого
+// канала нет). Значения в data у FCM всегда строки, отсюда и `channel_name`
+// строкой, а не объектом.
+//
+// Отдельная функция ради теста: собранный payload — это контракт с клиентом
+// (см. ether-meta/PROTOCOL.md), и проверять его надо на JSON, а не на живом
+// HTTP к Google.
+func pushPayload(device, title, body, channelID, channelName string) []byte {
+	data := map[string]any{"channel": channelID}
+	// Пустое имя в data не кладём: клиенту пустая строка и отсутствие поля
+	// означают одно и то же, а в контракте лишнее поле пришлось бы объяснять.
+	if channelName != "" {
+		data["channel_name"] = channelName
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"message": map[string]any{
 			"token": device,
@@ -136,8 +156,16 @@ func (p *Pusher) sendTo(accessToken, device, title, body string) sendResult {
 				"title": title,
 				"body":  body,
 			},
+			"data": data,
 		},
 	})
+	return payload
+}
+
+// sendTo отправляет одно уведомление на один токен устройства. title/body уже
+// готовы (см. pushText), тело — pushPayload; здесь только транспорт.
+func (p *Pusher) sendTo(accessToken, device, title, body, channelID, channelName string) sendResult {
+	payload := pushPayload(device, title, body, channelID, channelName)
 	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", p.projectID)
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	req.Header.Set("Authorization", "Bearer "+accessToken)

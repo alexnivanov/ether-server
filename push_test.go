@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 // Текст уведомления: канал в заголовке, автор — перед сообщением. Заголовок
 // важен не только читаемостью: по нему ОС группирует уведомления, поэтому в
@@ -41,4 +44,61 @@ func TestPushText(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Тело запроса к FCM — контракт с клиентом (ether-meta/PROTOCOL.md): по
+// `data.channel` приложение открывает нужную комнату, а по `data.channel_name`
+// называет зону, если человека в ней уже нет. Проверяем на JSON: собранное тело
+// и есть то, что увидит клиент.
+func TestPushPayload(t *testing.T) {
+	var got struct {
+		Message struct {
+			Token        string            `json:"token"`
+			Notification map[string]string `json:"notification"`
+			Data         map[string]string `json:"data"`
+		} `json:"message"`
+	}
+	decode := func(t *testing.T, b []byte) {
+		t.Helper()
+		got = struct {
+			Message struct {
+				Token        string            `json:"token"`
+				Notification map[string]string `json:"notification"`
+				Data         map[string]string `json:"data"`
+			} `json:"message"`
+		}{}
+		if err := json.Unmarshal(b, &got); err != nil {
+			t.Fatalf("payload не разбирается: %v", err)
+		}
+	}
+
+	t.Run("канал и его имя едут в data", func(t *testing.T) {
+		decode(t, pushPayload("dev-token", "Тверской", "Ваня: привет",
+			"relation/2555133", "Тверской"))
+		if got.Message.Token != "dev-token" {
+			t.Fatalf("token = %q", got.Message.Token)
+		}
+		if got.Message.Notification["title"] != "Тверской" ||
+			got.Message.Notification["body"] != "Ваня: привет" {
+			t.Fatalf("notification = %v", got.Message.Notification)
+		}
+		if got.Message.Data["channel"] != "relation/2555133" {
+			t.Fatalf("data.channel = %q", got.Message.Data["channel"])
+		}
+		if got.Message.Data["channel_name"] != "Тверской" {
+			t.Fatalf("data.channel_name = %q", got.Message.Data["channel_name"])
+		}
+	})
+
+	// Справочник ещё не знает канал — имени нет. Пустую строку не шлём:
+	// клиенту «поля нет» и «поле пустое» означают одно и то же.
+	t.Run("без имени канала поля нет вовсе", func(t *testing.T) {
+		decode(t, pushPayload("dev-token", "Ваня", "привет", "RU-MOW", ""))
+		if got.Message.Data["channel"] != "RU-MOW" {
+			t.Fatalf("data.channel = %q", got.Message.Data["channel"])
+		}
+		if _, ok := got.Message.Data["channel_name"]; ok {
+			t.Fatalf("channel_name не должен присутствовать: %v", got.Message.Data)
+		}
+	})
 }
