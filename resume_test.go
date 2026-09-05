@@ -47,7 +47,7 @@ func newTestServer(t *testing.T) (*httptest.Server, *Store) {
 	// публикуют подряд
 	pub := &publisher{store: store, hub: hub}
 	registerREST(mux, store, verifiers, nil, nil, pub, hub)
-	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, nil))
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store))
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -70,9 +70,9 @@ func restPost(t *testing.T, url string, body any) (*http.Response, map[string]an
 }
 
 // Сквозная проверка REST-эндпоинтов, вынесенных из WS (resume/accept_rules/
-// history): мусорный токен — 401 bad_session, настоящий — данные аккаунта,
-// принятие правил персистентно и видно в следующем resume, история отдаёт
-// то, что было опубликовано по WS.
+// чтение сообщений): мусорный токен — 401 bad_session, настоящий — данные
+// аккаунта, принятие правил персистентно и видно в следующем resume, чтение
+// отдаёт опубликованное.
 func TestRESTSessionFlow(t *testing.T) {
 	srv, store := newTestServer(t)
 
@@ -83,13 +83,13 @@ func TestRESTSessionFlow(t *testing.T) {
 	}
 
 	// мусорный токен не пускает
-	resp, body := restPost(t, srv.URL+"/session/resume", ResumeData{Token: "garbage"})
+	resp, body := restPostAuth(t, srv.URL+"/session/resume", "garbage", struct{}{})
 	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
 		t.Fatalf("resume(garbage) = %d %v, want 401 bad_session", resp.StatusCode, body)
 	}
 
 	// настоящий токен отдаёт личность аккаунта
-	resp, body = restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
+	resp, body = restPostAuth(t, srv.URL+"/session/resume", token, struct{}{})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("resume(token) = %d %v, want 200", resp.StatusCode, body)
 	}
@@ -104,23 +104,23 @@ func TestRESTSessionFlow(t *testing.T) {
 	}
 
 	// без токена accept_rules недоступен
-	resp, body = restPost(t, srv.URL+"/rules/accept", AcceptRulesData{})
+	resp, body = restPostAuth(t, srv.URL+"/rules/accept", "", struct{}{})
 	if resp.StatusCode != http.StatusBadRequest || body["code"] != "not_authed" {
 		t.Fatalf("accept_rules() = %d %v, want 400 not_authed", resp.StatusCode, body)
 	}
 
 	// принятие правил персистентно и видно в следующем resume (аккаунт, не устройство)
-	resp, body = restPost(t, srv.URL+"/rules/accept", AcceptRulesData{Token: token})
+	resp, body = restPostAuth(t, srv.URL+"/rules/accept", token, struct{}{})
 	if resp.StatusCode != http.StatusOK || body["rules_accepted"] != true {
 		t.Fatalf("accept_rules(token) = %d %v, want 200 rules_accepted=true", resp.StatusCode, body)
 	}
-	_, body = restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
+	_, body = restPostAuth(t, srv.URL+"/session/resume", token, struct{}{})
 	if body["rules_accepted"] != true {
 		t.Fatalf("resume после accept_rules: %v, want rules_accepted=true", body)
 	}
 
 	// история пуста, пока никто не публиковал
-	histResp, err := http.Get(srv.URL + "/history?channel=RU")
+	histResp, err := http.Get(srv.URL + "/messages?channel=RU")
 	if err != nil {
 		t.Fatalf("GET history: %v", err)
 	}
@@ -133,31 +133,14 @@ func TestRESTSessionFlow(t *testing.T) {
 		t.Fatalf("history пустого канала: %+v", h)
 	}
 
-	// публикуем через WS (с тем же токеном — см. TestWebSocketTokenAuth) и
-	// проверяем, что REST history видит результат
-	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http") + "/ws?token=" + token
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	if err != nil {
-		t.Fatalf("dial ws: %v", err)
-	}
-	defer ws.Close()
-	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if err := ws.WriteJSON(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})); err != nil {
-		t.Fatalf("write locate: %v", err)
-	}
-	var located Envelope
-	if err := ws.ReadJSON(&located); err != nil {
-		t.Fatalf("read located: %v", err)
-	}
-	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "привет"})); err != nil {
-		t.Fatalf("write publish: %v", err)
-	}
-	var msgEnv Envelope
-	if err := ws.ReadJSON(&msgEnv); err != nil {
-		t.Fatalf("read message: %v", err)
+	// публикуем запросом и проверяем, что чтение видит результат
+	if pubResp, pubBody := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "привет",
+	}); pubResp.StatusCode != http.StatusOK {
+		t.Fatalf("отправка: status %d (%v)", pubResp.StatusCode, pubBody)
 	}
 
-	histResp2, err := http.Get(srv.URL + "/history?channel=RU")
+	histResp2, err := http.Get(srv.URL + "/messages?channel=RU")
 	if err != nil {
 		t.Fatalf("GET history 2: %v", err)
 	}
@@ -171,16 +154,16 @@ func TestRESTSessionFlow(t *testing.T) {
 	}
 
 	// logout отзывает сессию: тот же токен после него в resume — bad_session
-	resp, body = restPost(t, srv.URL+"/session/logout", LogoutData{Token: token})
+	resp, body = restPostAuth(t, srv.URL+"/session/logout", token, struct{}{})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("logout(token) = %d %v, want 200", resp.StatusCode, body)
 	}
-	resp, body = restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
+	resp, body = restPostAuth(t, srv.URL+"/session/resume", token, struct{}{})
 	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
 		t.Fatalf("resume после logout = %d %v, want 401 bad_session", resp.StatusCode, body)
 	}
 	// повторный logout того же токена — тоже 200 (идемпотентность)
-	resp, _ = restPost(t, srv.URL+"/session/logout", LogoutData{Token: token})
+	resp, _ = restPostAuth(t, srv.URL+"/session/logout", token, struct{}{})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("повторный logout = %d, want 200 (идемпотентно)", resp.StatusCode)
 	}
@@ -188,8 +171,11 @@ func TestRESTSessionFlow(t *testing.T) {
 
 // Проверяет аутентификацию WS в момент апгрейда через ?token=: мусорный токен
 // отбивается ещё до открытия сокета (401, апгрейд не происходит), настоящий —
-// сокет сразу authed без единого кадра, анонимное подключение (без токена)
-// может locate, но не publish.
+// сокет сразу authed без единого кадра входа. Кадров «только для authed» на WS
+// больше нет (отправка уехала в REST), поэтому личность соединения видна по
+// побочному эффекту locate: каналы вошедшего запоминаются в user_channels — по
+// ним потом считаются получатели пушей. У анонимного locate работает, но
+// запоминать его каналы не за кем.
 func TestWebSocketTokenAuth(t *testing.T) {
 	srv, store := newTestServer(t)
 
@@ -209,7 +195,7 @@ func TestWebSocketTokenAuth(t *testing.T) {
 		t.Fatalf("dial(garbage token): status = %v, want 401", resp)
 	}
 
-	// настоящий токен — сокет уже authed, publish проходит без единого кадра входа
+	// настоящий токен — сокет уже authed, без единого кадра входа
 	ws, _, err := websocket.DefaultDialer.Dial(wsBase+fmt.Sprintf("/ws?token=%s", token), nil)
 	if err != nil {
 		t.Fatalf("dial(valid token): %v", err)
@@ -224,33 +210,37 @@ func TestWebSocketTokenAuth(t *testing.T) {
 	if err := ws.ReadJSON(&env); err != nil {
 		t.Fatalf("read located: %v", err)
 	}
-	if err := ws.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "hi"})); err != nil {
-		t.Fatalf("write publish: %v", err)
+	var mine int
+	if err := store.db.QueryRow(
+		`SELECT COUNT(*) FROM user_channels WHERE user_id = ?`, userID).Scan(&mine); err != nil {
+		t.Fatalf("user_channels: %v", err)
 	}
-	if err := ws.ReadJSON(&env); err != nil {
-		t.Fatalf("read after publish: %v", err)
-	}
-	if env.Type != TypeMessage {
-		t.Fatalf("got %s %s, want message (сокет должен быть authed сразу по токену)", env.Type, env.Data)
+	if mine == 0 {
+		t.Fatal("каналы не запомнились — сокет не authed, хотя токен пришёл в апгрейде")
 	}
 
-	// анонимное подключение: locate работает, publish — нет
+	// анонимное подключение: locate работает, но запоминать каналы не за кем
 	anon, _, err := websocket.DefaultDialer.Dial(wsBase+"/ws", nil)
 	if err != nil {
 		t.Fatalf("dial(anon): %v", err)
 	}
 	defer anon.Close()
 	anon.SetReadDeadline(time.Now().Add(5 * time.Second))
-	if err := anon.WriteJSON(envelope(TypePublish, PublishData{Channel: "RU", Text: "hi"})); err != nil {
-		t.Fatalf("write publish anon: %v", err)
+	if err := anon.WriteJSON(envelope(TypeLocate, LocateData{Lat: 55.76, Lng: 37.61})); err != nil {
+		t.Fatalf("write locate anon: %v", err)
 	}
 	if err := anon.ReadJSON(&env); err != nil {
-		t.Fatalf("read after publish anon: %v", err)
+		t.Fatalf("read located anon: %v", err)
 	}
-	var e ErrorData
-	mustUnmarshal(t, env.Data, &e)
-	if env.Type != TypeError || e.Code != "not_authed" {
-		t.Fatalf("anon publish: got %s %+v, want error not_authed", env.Type, e)
+	if env.Type != TypeLocated {
+		t.Fatalf("anon locate: got %s %s, want located", env.Type, env.Data)
+	}
+	var total int
+	if err := store.db.QueryRow(`SELECT COUNT(DISTINCT user_id) FROM user_channels`).Scan(&total); err != nil {
+		t.Fatalf("user_channels: %v", err)
+	}
+	if total != 1 {
+		t.Fatalf("в user_channels %d пользователей, want 1 — анонимный locate записал себя", total)
 	}
 }
 
@@ -277,8 +267,8 @@ func TestPushRegistrationAndTargets(t *testing.T) {
 		}
 		people[i].token = tok
 
-		resp, body := restPost(t, srv.URL+"/push/register",
-			PushTokenData{Token: tok, FCMToken: p.device, Platform: "android"})
+		resp, body := restPostAuth(t, srv.URL+"/push/register", tok,
+			PushTokenData{FCMToken: p.device, Platform: "android"})
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("push/register %s = %d %v, want 200", p.tgUID, resp.StatusCode, body)
 		}

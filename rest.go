@@ -18,9 +18,9 @@ import (
 
 // REST — синхронный запрос-ответ без побочных эффектов на живом WS-соединении:
 // вход через провайдера (auth), resume, logout, удаление аккаунта,
-// accept_rules, жалобы, history, отправка сообщений. На WebSocket остались
-// locate (подписка) и message (рассылка); кадр publish устарел и живёт ради
-// старых сборок — см. client.go, publish.go и ether-meta/PROTOCOL.md.
+// accept_rules, жалобы, чтение и отправка сообщений. На WebSocket остались
+// только locate (подписка) и message (рассылка) — см. client.go, publish.go и
+// ether-meta/PROTOCOL.md.
 //
 // Идентификация здесь полностью стейтлесс: "аутентифицирован" значит "прислал
 // валидный токен сессии в этом запросе", без привязки к какому-либо Client —
@@ -59,10 +59,6 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 		mux.HandleFunc("POST /auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
 	}
 	mux.HandleFunc("GET /health", handleHealth(store))
-	// GET /history — прежнее имя чтения сообщений, оставлено ради сборок ≤1.3.0:
-	// они зовут его, и снимать его можно только вместе с кадром publish (см.
-	// ether-meta/PLANS.md).
-	mux.HandleFunc("GET /history", handleHistory(store))
 	mux.HandleFunc("POST /block", handleBlock(store, notify))
 	mux.HandleFunc("GET /blocked", handleBlocked(store))
 	// /messages — один ресурс: читаем коллекцию и добавляем в неё
@@ -103,7 +99,7 @@ func handleBlock(store *Store, notify *Notifier) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id пользователя")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и id пользователя")
+		u, ok := sessionUser(w, r, store, "токен сессии и id пользователя")
 		if !ok {
 			return
 		}
@@ -142,8 +138,7 @@ func handleBlock(store *Store, notify *Notifier) http.HandlerFunc {
 // чтение без побочных эффектов; токен — заголовком, как везде.
 func handleBlocked(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// query-токен — прежнее место, для сборок ≤1.3.0; новые присылают заголовок
-		u, ok := sessionUser(w, r, store, r.URL.Query().Get("token"), "")
+		u, ok := sessionUser(w, r, store, "")
 		if !ok {
 			return
 		}
@@ -163,11 +158,10 @@ func handleBlocked(store *Store) http.HandlerFunc {
 // сессию (401 bad_session иначе).
 func handleDeleteAccount(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var d DeleteAccountData
-		if !decodeLegacyBody(w, r, &d) {
+		if !decodeEmptyBody(w, r) {
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "")
+		u, ok := sessionUser(w, r, store, "")
 		if !ok {
 			return
 		}
@@ -536,8 +530,7 @@ func handleHealth(store *Store) http.HandlerFunc {
 
 // handleHistory — чтение сообщений канала: GET /messages?channel=&before_id=&limit=
 // → 200 {channel, messages}; без авторизации (читать можно не входя, как и
-// locate). Отвечает и по прежнему пути GET /history — он зарегистрирован
-// отдельно ради старых сборок.
+// locate).
 // channel — query-параметр, а не сегмент пути: ID канала сам может содержать
 // "/" (osm_type/osm_id, напр. "relation/2555133") и сломает роутинг по пути.
 func handleHistory(store *Store) http.HandlerFunc {
@@ -570,8 +563,7 @@ func handleHistory(store *Store) http.HandlerFunc {
 		// из выборки уходят заблокированные этим человеком авторы — иначе
 		// заблокированный возвращался бы при каждой подгрузке истории.
 		var viewerID int64
-		// заголовок главнее, query — прежнее место для сборок ≤1.3.0
-		if token := sessionToken(r, q.Get("token")); token != "" {
+		if token := bearerToken(r); token != "" {
 			if u, err := store.UserBySession(token); err != nil {
 				slog.Error("history session lookup", "err", err)
 			} else if u != nil {
@@ -592,15 +584,14 @@ func handleHistory(store *Store) http.HandlerFunc {
 // 200 {message} | 401 bad_session | 403 banned | 429 too_fast (+Retry-After) |
 // 400 bad_data — отправить сообщение в канал.
 //
-// Зачем REST, а не кадр `publish` на WS: у запроса есть ответ. Кадр уходил в
-// буфер сокета, и если соединение умирало между отправкой и сервером, сообщение
-// пропадало молча — а поле ввода клиент уже очистил. Здесь клиент знает, что
-// сообщение сохранено (и с каким id), а на повтор с тем же client_msg_id
-// получает то же сообщение вместо дубля (см. ether-meta/PLANS.md).
+// Зачем запросом, а не кадром на WS (так было до 1.4.0): у запроса есть ответ.
+// Кадр уходил в буфер сокета, и если соединение умирало между отправкой и
+// сервером, сообщение пропадало молча — а поле ввода клиент уже очистил. Здесь
+// клиент знает, что сообщение сохранено (и с каким id), а на повтор с тем же
+// client_msg_id получает то же сообщение вместо дубля.
 //
-// Публикация — общая с WS функция (publish.go): проверки бана и частоты, запись,
-// рассылка и пуши одни и те же, чтобы через один транспорт не оказалось можно то,
-// что через другой нельзя.
+// Сама публикация — в publish.go: проверки бана и частоты, запись, рассылка и
+// пуши живут отдельно от разбора HTTP.
 func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if pub == nil {
@@ -614,7 +605,7 @@ func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Не удалось разобрать запрос")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "")
+		u, ok := sessionUser(w, r, store, "")
 		if !ok {
 			return
 		}
@@ -674,7 +665,7 @@ func handleLink(store *Store, provider string, v *Verifier) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id_token")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и id_token")
+		u, ok := sessionUser(w, r, store, "токен сессии и id_token")
 		if !ok {
 			return
 		}
@@ -738,7 +729,7 @@ func handleSetName(store *Store) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Не удалось разобрать запрос")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "")
+		u, ok := sessionUser(w, r, store, "")
 		if !ok {
 			return
 		}
@@ -773,7 +764,7 @@ func handlePushRegister(store *Store) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и токен устройства")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и токен устройства")
+		u, ok := sessionUser(w, r, store, "токен сессии и токен устройства")
 		if !ok {
 			return
 		}
@@ -826,7 +817,7 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии и id сообщения")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "токен сессии и id сообщения")
+		u, ok := sessionUser(w, r, store, "токен сессии и id сообщения")
 		if !ok {
 			return
 		}
@@ -891,7 +882,7 @@ func handleDeleteMessage(store *Store, hub *Hub) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен id сообщения")
 			return
 		}
-		u, ok := sessionUser(w, r, store, "", "токен сессии")
+		u, ok := sessionUser(w, r, store, "токен сессии")
 		if !ok {
 			return
 		}
@@ -927,7 +918,7 @@ func handleVote(store *Store) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Голос — это +1, -1 или 0")
 			return
 		}
-		u, ok := sessionUser(w, r, store, "", "токен сессии и id сообщения")
+		u, ok := sessionUser(w, r, store, "токен сессии и id сообщения")
 		if !ok {
 			return
 		}
@@ -963,17 +954,16 @@ func handleVote(store *Store) http.HandlerFunc {
 // {rules_accepted: true} | 401 bad_session | 400 not_authed (нет токена).
 func handleAcceptRules(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var d AcceptRulesData
-		if !decodeLegacyBody(w, r, &d) {
+		if !decodeEmptyBody(w, r) {
 			return
 		}
 		// Код not_authed здесь, а не bad_data из sessionUser: он описан в
 		// PROTOCOL.md именно для этого эндпоинта, и менять его заодно нельзя.
-		if sessionToken(r, d.Token) == "" {
+		if bearerToken(r) == "" {
 			writeRESTError(w, http.StatusBadRequest, "not_authed", "Нужен токен сессии")
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "")
+		u, ok := sessionUser(w, r, store, "")
 		if !ok {
 			return
 		}
@@ -994,11 +984,10 @@ func handleAcceptRules(store *Store) http.HandlerFunc {
 // нет»). Отзывает только этот токен, другие устройства пользователя не трогает.
 func handleLogout(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var d LogoutData
-		if !decodeLegacyBody(w, r, &d) {
+		if !decodeEmptyBody(w, r) {
 			return
 		}
-		token := sessionToken(r, d.Token)
+		token := bearerToken(r)
 		if token == "" {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен токен сессии")
 			return
@@ -1016,11 +1005,10 @@ func handleLogout(store *Store) http.HandlerFunc {
 // rules_accepted, без token — клиент его и так прислал) | 401 bad_session.
 func handleResume(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		var d ResumeData
-		if !decodeLegacyBody(w, r, &d) {
+		if !decodeEmptyBody(w, r) {
 			return
 		}
-		u, ok := sessionUser(w, r, store, d.Token, "")
+		u, ok := sessionUser(w, r, store, "")
 		if !ok {
 			return
 		}
@@ -1036,8 +1024,8 @@ func handleResume(store *Store) http.HandlerFunc {
 // в параметрах: вердикт «ok» — единственный безопасный ответ, когда о клиенте
 // ничего не понятно.
 //
-// Без авторизации, как /health и /history: вердикт не зависит от того, кто
-// спрашивает, а знать его надо в том числе до входа.
+// Без авторизации, как /health и чтение сообщений: вердикт не зависит от того,
+// кто спрашивает, а знать его надо в том числе до входа.
 func handleVersion(store *Store, gate *versionGate) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -1055,13 +1043,13 @@ func handleVersion(store *Store, gate *versionGate) http.HandlerFunc {
 	}
 }
 
-// decodeLegacyBody разбирает тело у эндпоинтов, которым от него нужен только
-// legacy-токен (клиент с 1.4.0 присылает пустое тело и заголовок). Пустое тело —
+// decodeEmptyBody проверяет тело у эндпоинтов, которым от него ничего не нужно
+// (личность приезжает заголовком, полей в запросе нет). Пустое тело и `{}` —
 // норма, БИТОЕ — отказ: молча продолжать на нём нельзя. У /account/delete это
 // прямо опасно — запрос с испорченным телом и валидным токеном удалял бы аккаунт
 // вместо 400, а удаление необратимо.
-func decodeLegacyBody(w http.ResponseWriter, r *http.Request, d any) bool {
-	if err := json.NewDecoder(r.Body).Decode(d); err != nil && !errors.Is(err, io.EOF) {
+func decodeEmptyBody(w http.ResponseWriter, r *http.Request) bool {
+	if err := json.NewDecoder(r.Body).Decode(&struct{}{}); err != nil && !errors.Is(err, io.EOF) {
 		writeRESTError(w, http.StatusBadRequest, "bad_data", "Не удалось разобрать запрос")
 		return false
 	}
@@ -1070,18 +1058,20 @@ func decodeLegacyBody(w http.ResponseWriter, r *http.Request, d any) bool {
 
 // ─── сессия ───
 
-// Токен сессии приезжает в заголовке `Authorization: Bearer <токен>`.
+// Токен сессии приезжает ТОЛЬКО в заголовке `Authorization: Bearer <токен>`.
 //
-// Раньше он лежал в теле запроса (поле `token`) и в query у GET-эндпоинтов. Это
-// работало, но плохо тем, что токен попадал в URL — а значит и в любые
+// Раньше он лежал ещё и в теле запроса (поле `token`) и в query у GET-эндпоинтов.
+// Это работало, но плохо тем, что токен попадал в URL — а значит и в любые
 // access-логи, которые кто-нибудь однажды включит, — и что единой точки проверки
-// не было: одиннадцать хендлеров повторяли один и тот же разбор.
+// не было: одиннадцать хендлеров повторяли один и тот же разбор. Оба прежних
+// места сняты вместе с остальной поддержкой сборок ≤1.3.0.
 //
-// Прежние места сервер ПОКА принимает: сборки ≤1.3.0 присылают токен только так.
-// Уйдут они вместе с остальным легаси (см. ether-meta/PLANS.md).
+// Исключение одно и останется навсегда: WebSocket авторизуется `?token=` при
+// апгрейде (см. wsHandler) — заголовки в апгрейде задать нельзя.
 
-// bearerToken — токен из заголовка. Пусто, если заголовка нет или он не Bearer:
-// тогда вызывающий возьмёт токен из старого места.
+// bearerToken — токен из заголовка. Пусто, если заголовка нет или он не Bearer;
+// не-Bearer схема считается отсутствием токена, а не ошибкой: чужой
+// Authorization от прокси не должен выглядеть как попытка входа.
 func bearerToken(r *http.Request) string {
 	const prefix = "Bearer "
 	h := r.Header.Get("Authorization")
@@ -1091,23 +1081,14 @@ func bearerToken(r *http.Request) string {
 	return strings.TrimSpace(h[len(prefix):])
 }
 
-// sessionToken — какой токен считать присланным: заголовок главнее, legacy —
-// значение из тела или query у старых сборок.
-func sessionToken(r *http.Request, legacy string) string {
-	if t := bearerToken(r); t != "" {
-		return t
-	}
-	return legacy
-}
-
 // sessionUser — единая проверка сессии: находит пользователя по токену и сам
 // отвечает на все три неудачи (нет токена → 400, ошибка чтения → 500, токен не
 // найден → 401). Второе значение false означает «ответ уже отправлен, выходим».
 //
 // what — что именно эндпоинту нужно, для текста ошибки при отсутствии токена
 // («токен сессии и id сообщения»); пусто → «токен сессии».
-func sessionUser(w http.ResponseWriter, r *http.Request, store *Store, legacy, what string) (*User, bool) {
-	token := sessionToken(r, legacy)
+func sessionUser(w http.ResponseWriter, r *http.Request, store *Store, what string) (*User, bool) {
+	token := bearerToken(r)
 	if token == "" {
 		if what == "" {
 			what = "токен сессии"

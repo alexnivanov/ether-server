@@ -157,7 +157,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	registerREST(mux, store, verifiers, notify, gate, pub, hub)
-	mux.HandleFunc("/ws", wsHandler(hub, geo, store, push, limiter))
+	mux.HandleFunc("/ws", wsHandler(hub, geo, store))
 
 	// Паники в хендлерах: net/http гасит их внутри соединения, и мы бы о них не
 	// узнали. sentryhttp перехватывает, отправляет со стектрейсом и не даёт
@@ -180,7 +180,7 @@ func main() {
 // что протухший токен здесь — сигнал рассинхронизации, а не штатный путь,
 // поэтому отвечаем 401 до апгрейда. ?token= — единственный способ авторизовать
 // сокет: логин-кадров на WS больше нет.
-func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher, limiter *RateLimiter) http.HandlerFunc {
+func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var authedUser *User
 		if token := r.URL.Query().Get("token"); token != "" {
@@ -196,7 +196,7 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher, limiter *Rate
 			}
 			// Сокет не открываем только при постоянном бане (аккаунт удалён).
 			// Временный бан — мьют: соединение нужно, чтобы читать; отправка
-			// отбивается в publish (см. client.go).
+			// отбивается в publish.go, на POST /messages.
 			if u.BanPermanent {
 				http.Error(w, "banned", http.StatusForbidden)
 				return
@@ -210,22 +210,14 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store, push *Pusher, limiter *Rate
 			return
 		}
 		c := &Client{
-			hub:     hub,
-			conn:    conn,
-			send:    make(chan Envelope, 16),
-			geo:     geo,
-			store:   store,
-			push:    push,
-			limiter: limiter,
+			hub:   hub,
+			conn:  conn,
+			send:  make(chan Envelope, 16),
+			geo:   geo,
+			store: store,
 		}
 		if authedUser != nil {
-			c.setAuthed(
-				authedUser.ID,
-				authedUser.FullName,
-				authedUser.TgUsername,
-				authedUser.AvatarURL,
-				authedUser.CreatedAt,
-			)
+			c.setAuthed(authedUser.ID, authedUser.FullName)
 		}
 		go c.writePump()
 		go c.readPump()

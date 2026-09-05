@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	maxMessageLen   = 4096 // байт текста в publish
-	maxHistoryLimit = 200  // сообщений в одном ответе history
+	maxMessageLen   = 4096 // байт текста в сообщении
+	maxHistoryLimit = 200  // сообщений в одном ответе GET /messages
 
 	// Keepalive сокета. В нашем протоколе тишина — норма: человек читает и
 	// ничего не пишет, сервер молчит, пока в каналах нет сообщений. А оператор
@@ -46,22 +46,17 @@ type Client struct {
 	send  chan Envelope
 	geo   Geocoder
 	store *Store
-	push  *Pusher // FCM-пуши о новых сообщениях; nil — пуши выключены
 
-	// частота публикаций (см. ratelimit.go); общий на все соединения, поэтому
-	// лимит держится на аккаунт, а не на сокет — иначе его обходили бы вторым
-	// подключением. nil — без ограничений (тесты).
-	limiter *RateLimiter
-
-	// кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
-	// дальше только читается (publish)
-	mu        sync.Mutex
-	userID    int64     // внутренний id аккаунта
-	fullName  string    // отображаемое имя автора — в live-сообщения
-	username  string    // @username — в live-сообщения для ссылки на профиль
-	avatarURL string    // фото профиля — в live-сообщения автора
-	createdAt time.Time // когда аккаунт зарегистрирован — для лимита свежих
-	authed    bool
+	// Кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
+	// дальше только читается. Личность нужна сокету ровно для двух вещей —
+	// запомнить каналы вошедшего на locate (по ним считаются получатели пушей)
+	// и подписать соединение в логах. Данные автора сообщения здесь больше не
+	// живут: сообщения уходят через POST /messages, и там автор берётся из
+	// сессии запроса (см. publish.go).
+	mu       sync.Mutex
+	userID   int64  // внутренний id аккаунта
+	fullName string // отображаемое имя — для логов
+	authed   bool
 }
 
 func (c *Client) DisplayName() string {
@@ -70,43 +65,28 @@ func (c *Client) DisplayName() string {
 	return c.fullName
 }
 
-// author отдаёт данные автора для publish: внутренний id, имя, @username,
-// аватар и флаг «вход выполнен».
-func (c *Client) author() (id int64, name, username, avatar string, authed bool) {
+// author — кто на этом соединении: внутренний id и флаг «вход выполнен».
+func (c *Client) author() (id int64, authed bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.userID, c.fullName, c.username, c.avatarURL, c.authed
+	return c.userID, c.authed
 }
 
-// publisher собирает общий путь публикации из того, что уже есть у соединения
-// (см. publish.go). Отдельного поля не держим: publisher — это склейка четырёх
-// зависимостей, а не состояние.
-func (c *Client) publisher() *publisher {
-	return &publisher{store: c.store, hub: c.hub, push: c.push, limiter: c.limiter}
-}
-
-// accountAge — сколько живёт аккаунт. Считается от сохранённой даты
-// регистрации, поэтому свежий аккаунт «дорастает» до обычного лимита прямо на
-// открытом соединении, без переподключения.
-func (c *Client) accountAge() time.Duration {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.createdAt.IsZero() {
-		return 0
-	}
-	return time.Since(c.createdAt)
-}
-
-func (c *Client) setAuthed(userID int64, fullName, username, avatarURL string, createdAt time.Time) {
+func (c *Client) setAuthed(userID int64, fullName string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.userID = userID
 	c.fullName = fullName
-	c.username = username
-	c.avatarURL = avatarURL
-	c.createdAt = createdAt
 	c.authed = true
 }
+
+// typePublishGone — надгробие кадра `publish`, которым отправляли сообщения до
+// перехода на POST /messages. Тега в protocol.go больше нет: кадр не часть
+// протокола, а литерал, на который надо ответить внятным отказом. Иначе он
+// провалится в default, и сборка ≤1.3.0 (только они его и посылают) покажет
+// «Ошибка unknown_type: unknown message type: publish» — техническую строку, из
+// которой не понять ни что случилось, ни что делать.
+const typePublishGone = "publish"
 
 func (c *Client) readPump() {
 	defer func() {
@@ -163,7 +143,7 @@ func (c *Client) readPump() {
 			//
 			// Порядок важен: сначала записываем свои каналы, потом считаем
 			// подписчиков — иначе человек не увидел бы в счётчике себя.
-			if userID, _, _, _, authed := c.author(); authed {
+			if userID, authed := c.author(); authed {
 				if err := c.store.SetUserChannels(userID, ids); err != nil {
 					slog.Error("set user channels", "err", err, "user_id", userID)
 				}
@@ -188,38 +168,9 @@ func (c *Client) readPump() {
 			}
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
 
-		// Кадр `publish` живёт только ради сборок, которые не умеют
-		// POST /messages (см. ether-meta/PLANS.md, шаг 3). Сама публикация — общая
-		// с REST функция, здесь остаётся только разбор кадра и ответ ошибкой.
-		case TypePublish:
-			userID, name, username, avatar, authed := c.author()
-			if !authed {
-				c.sendError("not_authed", "отправка доступна после входа через Telegram")
-				continue
-			}
-			var d PublishData
-			if err := json.Unmarshal(env.Data, &d); err != nil {
-				c.sendError("bad_data", "invalid publish payload")
-				continue
-			}
-			author := publishAuthor{
-				ID:         userID,
-				Name:       name,
-				Username:   username,
-				AvatarURL:  avatar,
-				AccountAge: c.accountAge(),
-			}
-			// client_msg_id на WS не передаётся: кадр отправляется в буфер и
-			// подтверждения не имеет, поэтому повторить его клиент всё равно не
-			// может — идемпотентность защищать нечего (это и есть та причина, по
-			// которой отправка уезжает в REST).
-			// Сохранённое сообщение здесь не нужно: автор получит его рассылкой
-			// из publish, тем же кадром `message` и в том же порядке, что чужие.
-			if _, perr := c.publisher().publish(
-				author, d.Channel, d.Text, ""); perr != nil {
-				c.sendError(perr.Code, perr.Message)
-				continue
-			}
+		case typePublishGone:
+			c.sendError("upgrade_required",
+				"Обнови Эфир — эта версия больше не отправляет сообщения")
 
 		default:
 			c.sendError("unknown_type", "unknown message type: "+env.Type)

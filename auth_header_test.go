@@ -30,6 +30,24 @@ func restPostAuth(t *testing.T, url, token string, body any) (*http.Response, ma
 	return resp, out
 }
 
+// getAuth — GET с токеном сессии в заголовке.
+func getAuth(t *testing.T, url, token string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get %s: %v", url, err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return resp
+}
+
 // TestAuthHeaderOnPublish — отправка с токеном только в заголовке.
 func TestAuthHeaderOnPublish(t *testing.T) {
 	srv, store := newTestServer(t)
@@ -63,61 +81,28 @@ func TestAuthHeaderOnGet(t *testing.T) {
 	}
 }
 
-// TestAuthLegacyTokenStillWorks — сборки ≤1.3.0 присылают токен в теле, и это
-// обязано работать до их вымирания (см. ether-meta/PLANS.md).
-func TestAuthLegacyTokenStillWorks(t *testing.T) {
-	srv, store := newTestServer(t)
-	_, token := publishSession(t, store)
-
-	resp, body := restPost(t, srv.URL+"/session/resume", ResumeData{Token: token})
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("resume с токеном в теле: status %d (%v)", resp.StatusCode, body)
-	}
-	// и query у GET — тоже прежнее место
-	getResp, err := http.Get(srv.URL + "/blocked?token=" + token)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	defer getResp.Body.Close()
-	if getResp.StatusCode != http.StatusOK {
-		t.Errorf("blocked с токеном в query: status %d", getResp.StatusCode)
-	}
-}
-
-// TestAuthHeaderWins — если пришли оба, главенствует заголовок: тело осталось
-// только ради старых сборок, и доверять ему больше нельзя.
-func TestAuthHeaderWins(t *testing.T) {
-	srv, store := newTestServer(t)
-	_, token := publishSession(t, store)
-
-	resp, _ := restPostAuth(t, srv.URL+"/session/resume", token,
-		ResumeData{Token: "мусор-в-теле"})
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200 — заголовок должен перебить тело", resp.StatusCode)
-	}
-}
-
-// TestAuthBrokenHeader — не-Bearer заголовок считается отсутствующим, и тогда
-// работает прежнее место. Иначе чужой Authorization от прокси ломал бы вход.
+// TestAuthBrokenHeader — не-Bearer заголовок считается отсутствием токена, а не
+// мусорным токеном: чужой Authorization от прокси должен давать «нужен токен»
+// (400 bad_data), а не «сессия не найдена» (401), от которого клиент выкидывает
+// человека на онбординг.
 func TestAuthBrokenHeader(t *testing.T) {
-	srv, store := newTestServer(t)
-	_, token := publishSession(t, store)
+	srv, _ := newTestServer(t)
 
-	b, _ := json.Marshal(ResumeData{Token: token})
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/session/resume", bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/session/resume", nil)
 	req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("status = %d, want 200 — Basic игнорируем, токен берём из тела", resp.StatusCode)
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	if resp.StatusCode != http.StatusBadRequest || body["code"] != "bad_data" {
+		t.Errorf("status/code = %d/%v, want 400/bad_data", resp.StatusCode, body["code"])
 	}
 }
 
-// TestAuthNoTokenAtAll — ни заголовка, ни тела: 400, а не 401. Отсутствие токена
+// TestAuthNoTokenAtAll — заголовка нет вовсе: 400, а не 401. Отсутствие токена
 // это неполный запрос, а не мёртвая сессия, и клиент различает их по коду.
 func TestAuthNoTokenAtAll(t *testing.T) {
 	srv, _ := newTestServer(t)
@@ -135,9 +120,7 @@ func TestAuthBearerCaseInsensitive(t *testing.T) {
 	srv, store := newTestServer(t)
 	_, token := publishSession(t, store)
 
-	b, _ := json.Marshal(ResumeData{})
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/session/resume", bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/session/resume", nil)
 	req.Header.Set("Authorization", "bearer "+token)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

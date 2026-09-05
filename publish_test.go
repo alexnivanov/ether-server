@@ -23,10 +23,11 @@ func publishSession(t *testing.T, store *Store) (int64, string) {
 	return userID, token
 }
 
-// postMessage — POST /messages, возвращает статус и разобранное тело.
-func postMessage(t *testing.T, url string, req PublishRequest) (*http.Response, map[string]any) {
+// postMessage — POST /messages с токеном сессии в заголовке (пустой токен —
+// запрос без Authorization). Возвращает статус и разобранное тело.
+func postMessage(t *testing.T, url, token string, req PublishRequest) (*http.Response, map[string]any) {
 	t.Helper()
-	return restPost(t, url+"/messages", req)
+	return restPostAuth(t, url+"/messages", token, req)
 }
 
 // TestPublishREST — обычная отправка: сообщение уходит в ответ и ложится в
@@ -35,8 +36,8 @@ func TestPublishREST(t *testing.T) {
 	srv, store := newTestServer(t)
 	userID, token := publishSession(t, store)
 
-	resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU-MOW", Text: "привет",
+	resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU-MOW", Text: "привет",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200 (%v)", resp.StatusCode, body)
@@ -73,11 +74,11 @@ func TestPublishRESTIdempotent(t *testing.T) {
 	srv, store := newTestServer(t)
 	userID, token := publishSession(t, store)
 	req := PublishRequest{
-		Token: token, Channel: "RU-MOW", Text: "привет", ClientMsgID: "abc-123",
+		Channel: "RU-MOW", Text: "привет", ClientMsgID: "abc-123",
 	}
 
-	_, first := postMessage(t, srv.URL, req)
-	resp, second := postMessage(t, srv.URL, req)
+	_, first := postMessage(t, srv.URL, token, req)
+	resp, second := postMessage(t, srv.URL, token, req)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("повтор: status = %d, want 200 — это успех, а не ошибка", resp.StatusCode)
 	}
@@ -98,7 +99,7 @@ func TestPublishRESTIdempotent(t *testing.T) {
 
 	// другой client_msg_id — уже другое сообщение
 	req.ClientMsgID = "abc-124"
-	postMessage(t, srv.URL, req)
+	postMessage(t, srv.URL, token, req)
 	if err := store.db.QueryRow(
 		`SELECT COUNT(*) FROM messages WHERE user_id = ?`, userID).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
@@ -120,11 +121,11 @@ func TestPublishRESTIdempotentPerUser(t *testing.T) {
 		t.Fatalf("сессия B: %v", err)
 	}
 
-	_, a := postMessage(t, srv.URL, PublishRequest{
-		Token: tokenA, Channel: "RU-MOW", Text: "от Alex", ClientMsgID: "same",
+	_, a := postMessage(t, srv.URL, tokenA, PublishRequest{
+		Channel: "RU-MOW", Text: "от Alex", ClientMsgID: "same",
 	})
-	_, b := postMessage(t, srv.URL, PublishRequest{
-		Token: tokenB, Channel: "RU-MOW", Text: "от Bob", ClientMsgID: "same",
+	_, b := postMessage(t, srv.URL, tokenB, PublishRequest{
+		Channel: "RU-MOW", Text: "от Bob", ClientMsgID: "same",
 	})
 	if a["message"].(map[string]any)["id"] == b["message"].(map[string]any)["id"] {
 		t.Error("сообщения слиплись: client_msg_id считается уникальным на всех")
@@ -144,20 +145,21 @@ func TestPublishRESTRejects(t *testing.T) {
 		long[i] = 'x'
 	}
 	cases := []struct {
-		name string
-		req  PublishRequest
-		want int
-		code string
+		name  string
+		token string
+		req   PublishRequest
+		want  int
+		code  string
 	}{
-		{"без токена", PublishRequest{Channel: "RU", Text: "x"}, 400, "bad_data"},
-		{"мёртвая сессия", PublishRequest{Token: "нет такой", Channel: "RU", Text: "x"}, 401, "bad_session"},
-		{"без канала", PublishRequest{Token: token, Text: "x"}, 400, "bad_data"},
-		{"пустой текст", PublishRequest{Token: token, Channel: "RU"}, 400, "bad_data"},
-		{"текст длиннее предела", PublishRequest{Token: token, Channel: "RU", Text: string(long)}, 400, "bad_data"},
+		{"без токена", "", PublishRequest{Channel: "RU", Text: "x"}, 400, "bad_data"},
+		{"мёртвая сессия", "нет такой", PublishRequest{Channel: "RU", Text: "x"}, 401, "bad_session"},
+		{"без канала", token, PublishRequest{Text: "x"}, 400, "bad_data"},
+		{"пустой текст", token, PublishRequest{Channel: "RU"}, 400, "bad_data"},
+		{"текст длиннее предела", token, PublishRequest{Channel: "RU", Text: string(long)}, 400, "bad_data"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			resp, body := postMessage(t, srv.URL, c.req)
+			resp, body := postMessage(t, srv.URL, c.token, c.req)
 			if resp.StatusCode != c.want {
 				t.Errorf("status = %d, want %d (%v)", resp.StatusCode, c.want, body)
 			}
@@ -182,8 +184,8 @@ func TestPublishRESTMuted(t *testing.T) {
 		t.Fatalf("мьют: %v", err)
 	}
 
-	resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "всё равно напишу",
+	resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "всё равно напишу",
 	})
 	if resp.StatusCode != http.StatusForbidden || body["code"] != "banned" {
 		t.Errorf("status/code = %d/%v, want 403/banned", resp.StatusCode, body["code"])
@@ -200,8 +202,8 @@ func TestPublishRESTBannedSession(t *testing.T) {
 		t.Fatalf("бан: %v", err)
 	}
 
-	resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "всё равно напишу",
+	resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "всё равно напишу",
 	})
 	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
 		t.Errorf("status/code = %d/%v, want 401/bad_session", resp.StatusCode, body["code"])
@@ -224,23 +226,32 @@ func TestPublishRESTTooFast(t *testing.T) {
 
 	// свежий аккаунт: тир уже базового, но сколько именно — дело ratelimit.go.
 	// Шлём заведомо больше любого разумного всплеска и ждём отказ.
-	var status int
+	var status, sent int
 	var body map[string]any
 	var resp *http.Response
 	for i := 0; i < 20; i++ {
-		resp, body = postMessage(t, limited, PublishRequest{
-			Token: token, Channel: localChannel, Text: "спам",
+		resp, body = postMessage(t, limited, token, PublishRequest{
+			Channel: localChannel, Text: "спам",
 		})
 		if resp.StatusCode != http.StatusOK {
 			status = resp.StatusCode
 			break
 		}
+		sent++
 	}
 	if status != http.StatusTooManyRequests || body["code"] != "too_fast" {
 		t.Fatalf("status/code = %d/%v, want 429/too_fast", status, body["code"])
 	}
 	if resp.Header.Get("Retry-After") == "" {
 		t.Error("нет заголовка Retry-After — машинно разобрать отказ нечем")
+	}
+	// лимит проверяется ДО записи: отбитое сообщение в истории не оседает
+	msgs, err := store.History(localChannel, 0, 100, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != sent {
+		t.Errorf("в истории %d сообщений, want %d — отбитое сохранилось", len(msgs), sent)
 	}
 }
 
@@ -253,7 +264,7 @@ func TestPublishRESTNotWired(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	resp, body := postMessage(t, srv.URL, PublishRequest{Token: "x", Channel: "RU", Text: "y"})
+	resp, body := postMessage(t, srv.URL, "x", PublishRequest{Channel: "RU", Text: "y"})
 	if resp.StatusCode != http.StatusNotImplemented {
 		t.Errorf("status = %d, want 501", resp.StatusCode)
 	}
@@ -286,8 +297,8 @@ func TestPublishRESTBroadcastsOverWS(t *testing.T) {
 		t.Fatalf("located: %v", err)
 	}
 
-	resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "через REST",
+	resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "через REST",
 	})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("отправка: status %d (%v)", resp.StatusCode, body)
@@ -317,8 +328,8 @@ func TestMessagesGetAndPost(t *testing.T) {
 	srv, store := newTestServer(t)
 	_, token := publishSession(t, store)
 
-	if resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "написали",
+	if resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "написали",
 	}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("POST: status %d (%v)", resp.StatusCode, body)
 	}
@@ -357,24 +368,48 @@ func TestMessagesGetAndPost(t *testing.T) {
 	}
 }
 
-// TestHistoryAliasStillWorks — прежний путь чтения обязан работать: по нему
-// читают сборки из сторов, и снять его можно только вместе с кадром publish.
-func TestHistoryAliasStillWorks(t *testing.T) {
+// TestPublishFrameRefused — кадр `publish` сняли, но не молча: сборки ≤1.3.0
+// умеют только его, и вместо технического unknown_type им отвечают внятным
+// upgrade_required (см. typePublishGone в client.go). Ничего не публикуется.
+func TestPublishFrameRefused(t *testing.T) {
 	srv, store := newTestServer(t)
 	_, token := publishSession(t, store)
-	postMessage(t, srv.URL, PublishRequest{Token: token, Channel: "RU", Text: "старым клиентам"})
 
-	resp, err := http.Get(srv.URL + "/history?channel=RU")
+	ws, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(srv.URL, "http")+"/ws?token="+token, nil)
 	if err != nil {
-		t.Fatalf("get: %v", err)
+		t.Fatalf("dial: %v", err)
 	}
-	defer resp.Body.Close()
-	var got HistoryData
-	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
-		t.Fatalf("decode: %v", err)
+	defer ws.Close()
+	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+	if err := ws.WriteJSON(Envelope{
+		Type: "publish",
+		Data: []byte(`{"channel": "RU", "text": "по старинке"}`),
+	}); err != nil {
+		t.Fatalf("publish: %v", err)
 	}
-	if len(got.Messages) != 1 {
-		t.Errorf("по /history пришло %d сообщений, want 1", len(got.Messages))
+	var env Envelope
+	if err := ws.ReadJSON(&env); err != nil {
+		t.Fatalf("ответ: %v", err)
+	}
+	if env.Type != TypeError {
+		t.Fatalf("тип ответа = %q, want error", env.Type)
+	}
+	var e ErrorData
+	mustUnmarshal(t, env.Data, &e)
+	if e.Code != "upgrade_required" {
+		t.Errorf("code = %q, want upgrade_required", e.Code)
+	}
+	if e.Message == "" {
+		t.Error("отказ без текста — человеку нечего прочитать")
+	}
+	msgs, err := store.History("RU", 0, 10, 0)
+	if err != nil {
+		t.Fatalf("history: %v", err)
+	}
+	if len(msgs) != 0 {
+		t.Errorf("кадром опубликовалось %d сообщений, want 0", len(msgs))
 	}
 }
 
@@ -386,14 +421,14 @@ func TestPublishRetryAfterMute(t *testing.T) {
 	srv, store := newTestServer(t)
 	userID, token := publishSession(t, store)
 	req := PublishRequest{
-		Token: token, Channel: "RU", Text: "успел", ClientMsgID: "id-1",
+		Channel: "RU", Text: "успел", ClientMsgID: "id-1",
 	}
-	_, first := postMessage(t, srv.URL, req)
+	_, first := postMessage(t, srv.URL, token, req)
 
 	if _, _, err := store.BanTemporary(userID, "спам"); err != nil {
 		t.Fatalf("мьют: %v", err)
 	}
-	resp, second := postMessage(t, srv.URL, req)
+	resp, second := postMessage(t, srv.URL, token, req)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("повтор после мьюта: status %d (%v)", resp.StatusCode, second)
 	}
@@ -401,8 +436,8 @@ func TestPublishRetryAfterMute(t *testing.T) {
 		t.Error("повтор вернул другое сообщение")
 	}
 	// а новая отправка — уже отказ
-	if resp, _ := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "новое", ClientMsgID: "id-2",
+	if resp, _ := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "новое", ClientMsgID: "id-2",
 	}); resp.StatusCode != http.StatusForbidden {
 		t.Errorf("новая отправка под мьютом: status %d, want 403", resp.StatusCode)
 	}
@@ -422,13 +457,13 @@ func TestPublishRetryDoesNotSpendLimit(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	req := PublishRequest{Token: token, Channel: "RU", Text: "раз", ClientMsgID: "same"}
-	if resp, body := postMessage(t, srv.URL, req); resp.StatusCode != http.StatusOK {
+	req := PublishRequest{Channel: "RU", Text: "раз", ClientMsgID: "same"}
+	if resp, body := postMessage(t, srv.URL, token, req); resp.StatusCode != http.StatusOK {
 		t.Fatalf("первая отправка: %d (%v)", resp.StatusCode, body)
 	}
 	// повторяем заведомо больше, чем позволяет всплеск лимитера
 	for i := 0; i < messageLimitFor(0, 0, scopeLocal).capacity+5; i++ {
-		resp, body := postMessage(t, srv.URL, req)
+		resp, body := postMessage(t, srv.URL, token, req)
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("повтор %d: status %d (%v), want 200", i+1, resp.StatusCode, body)
 		}
@@ -481,14 +516,14 @@ func TestPublishCountryLimit(t *testing.T) {
 	defer srv.Close()
 
 	for i := 0; i < countryLimit.capacity; i++ {
-		if resp, body := postMessage(t, srv.URL, PublishRequest{
-			Token: token, Channel: "RU", Text: "всей стране", ClientMsgID: fmt.Sprintf("c-%d", i),
+		if resp, body := postMessage(t, srv.URL, token, PublishRequest{
+			Channel: "RU", Text: "всей стране", ClientMsgID: fmt.Sprintf("c-%d", i),
 		}); resp.StatusCode != http.StatusOK {
 			t.Fatalf("сообщение в страну %d: %d (%v)", i+1, resp.StatusCode, body)
 		}
 	}
-	resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "ещё", ClientMsgID: "c-over",
+	resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "ещё", ClientMsgID: "c-over",
 	})
 	if resp.StatusCode != http.StatusTooManyRequests || body["code"] != "too_fast" {
 		t.Fatalf("после всплеска: %d/%v, want 429/too_fast", resp.StatusCode, body["code"])
@@ -497,13 +532,13 @@ func TestPublishCountryLimit(t *testing.T) {
 		t.Errorf("текст отказа = %q, ожидали объяснение про канал страны", msg)
 	}
 	// соседние скоупы не задеты
-	if resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: PlanetChannel.ID, Text: "всей планете",
+	if resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: PlanetChannel.ID, Text: "всей планете",
 	}); resp.StatusCode != http.StatusOK {
 		t.Errorf("исчерпанная страна закрыла Землю: %d (%v)", resp.StatusCode, body)
 	}
-	if resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: localChannel, Text: "соседям",
+	if resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: localChannel, Text: "соседям",
 	}); resp.StatusCode != http.StatusOK {
 		t.Errorf("исчерпанная страна закрыла район: %d (%v)", resp.StatusCode, body)
 	}
@@ -524,12 +559,12 @@ func TestPublishPlanetLimit(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	earth := PublishRequest{Token: token, Channel: PlanetChannel.ID, Text: "всем привет"}
-	if resp, body := postMessage(t, srv.URL, earth); resp.StatusCode != http.StatusOK {
+	earth := PublishRequest{Channel: PlanetChannel.ID, Text: "всем привет"}
+	if resp, body := postMessage(t, srv.URL, token, earth); resp.StatusCode != http.StatusOK {
 		t.Fatalf("первое сообщение в Землю: %d (%v)", resp.StatusCode, body)
 	}
 	// второе подряд — отказ, и он объясняет причину, а не «частишь»
-	resp, body := postMessage(t, srv.URL, earth)
+	resp, body := postMessage(t, srv.URL, token, earth)
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("второе сообщение в Землю: status %d, want 429 (%v)", resp.StatusCode, body)
 	}
@@ -548,8 +583,8 @@ func TestPublishPlanetLimit(t *testing.T) {
 	}
 
 	// локальный канал не задет: у Земли свой бакет
-	if resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU-MOW", Text: "а тут можно",
+	if resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU-MOW", Text: "а тут можно",
 	}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("локальная отправка после Земли: %d (%v)", resp.StatusCode, body)
 	}
@@ -561,12 +596,12 @@ func TestPublishPlanetLimit(t *testing.T) {
 func TestPublishDuplicateReturnsStored(t *testing.T) {
 	srv, store := newTestServer(t)
 	_, token := publishSession(t, store)
-	postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "настоящее", ClientMsgID: "reused",
+	postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "настоящее", ClientMsgID: "reused",
 	})
 
-	_, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "DE", Text: "подменённое", ClientMsgID: "reused",
+	_, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "DE", Text: "подменённое", ClientMsgID: "reused",
 	})
 	m := body["message"].(map[string]any)
 	if m["text"] != "настоящее" || m["channel"] != "RU" {
@@ -582,8 +617,8 @@ func TestPublishRejectsLongClientMsgID(t *testing.T) {
 	_, token := publishSession(t, store)
 
 	long := strings.Repeat("a", maxClientMsgIDLen+1)
-	resp, body := postMessage(t, srv.URL, PublishRequest{
-		Token: token, Channel: "RU", Text: "x", ClientMsgID: long,
+	resp, body := postMessage(t, srv.URL, token, PublishRequest{
+		Channel: "RU", Text: "x", ClientMsgID: long,
 	})
 	if resp.StatusCode != http.StatusBadRequest || body["code"] != "bad_data" {
 		t.Errorf("status/code = %d/%v, want 400/bad_data", resp.StatusCode, body["code"])

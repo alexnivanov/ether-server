@@ -354,20 +354,20 @@ func TestSetName(t *testing.T) {
 	}
 
 	// без сессии не пускаем
-	resp, body := restPost(t, srv.URL+"/profile/name", SetNameData{Token: "garbage", Name: "Кто-то"})
+	resp, body := restPostAuth(t, srv.URL+"/profile/name", "garbage", SetNameData{Name: "Кто-то"})
 	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
 		t.Fatalf("чужой токен = %d %v, want 401 bad_session", resp.StatusCode, body)
 	}
 	// пустое имя — не имя
 	for _, empty := range []string{"", "   ", "\n"} {
-		resp, body = restPost(t, srv.URL+"/profile/name", SetNameData{Token: token, Name: empty})
+		resp, body = restPostAuth(t, srv.URL+"/profile/name", token, SetNameData{Name: empty})
 		if resp.StatusCode != http.StatusBadRequest || body["code"] != "bad_data" {
 			t.Fatalf("имя %q = %d %v, want 400 bad_data", empty, resp.StatusCode, body)
 		}
 	}
 
 	// нормальный случай: имя сохранено и вернулось в ответе
-	resp, body = restPost(t, srv.URL+"/profile/name", SetNameData{Token: token, Name: "  Мария  "})
+	resp, body = restPostAuth(t, srv.URL+"/profile/name", token, SetNameData{Name: "  Мария  "})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("set name = %d %v, want 200", resp.StatusCode, body)
 	}
@@ -393,8 +393,8 @@ func TestSetName(t *testing.T) {
 	// присланное клиентом имя нормализуется так же, как при входе: без переводов
 	// строк и не длиннее maxNameLen — иначе им можно испортить вёрстку ленты
 	long := strings.Repeat("я", maxNameLen+10)
-	if resp, body = restPost(t, srv.URL+"/profile/name",
-		SetNameData{Token: token, Name: "мно\nго " + long}); resp.StatusCode != http.StatusOK {
+	if resp, body = restPostAuth(t, srv.URL+"/profile/name", token,
+		SetNameData{Name: "мно\nго " + long}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("длинное имя = %d %v", resp.StatusCode, body)
 	}
 	got, _ := body["user"].(map[string]any)["name"].(string)
@@ -431,14 +431,13 @@ func TestLinkIdentity(t *testing.T) {
 			Picture:           "https://t.me/i/a.jpg",
 		}
 	}
-	link := func(body LinkRequest) (int, map[string]any) {
-		resp, out := restPost(t, e.srv.URL+"/profile/link/telegram", body)
+	link := func(token string, body LinkRequest) (int, map[string]any) {
+		resp, out := restPostAuth(t, e.srv.URL+"/profile/link/telegram", token, body)
 		return resp.StatusCode, out
 	}
 
 	// привязка: аккаунт тот же, но появились @username и аватар
-	code, m = link(LinkRequest{
-		Token:   session,
+	code, m = link(session, LinkRequest{
 		IDToken: e.sign(e.key, tgIssuer, testTgClientID, hour, tgClaims("555")),
 	})
 	if code != http.StatusOK {
@@ -456,8 +455,7 @@ func TestLinkIdentity(t *testing.T) {
 	}
 
 	// повторная привязка той же личности — не ошибка
-	if code, m = link(LinkRequest{
-		Token:   session,
+	if code, m = link(session, LinkRequest{
 		IDToken: e.sign(e.key, tgIssuer, testTgClientID, hour, tgClaims("555")),
 	}); code != http.StatusOK {
 		t.Fatalf("повторная привязка = %d %v, want 200", code, m)
@@ -469,8 +467,7 @@ func TestLinkIdentity(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("второй аккаунт: %v", err)
 	}
-	code, m = link(LinkRequest{
-		Token:   session,
+	code, m = link(session, LinkRequest{
 		IDToken: e.sign(e.key, tgIssuer, testTgClientID, hour, tgClaims("999")),
 	})
 	if code != http.StatusConflict || m["code"] != "identity_taken" {
@@ -478,11 +475,11 @@ func TestLinkIdentity(t *testing.T) {
 	}
 
 	// мусорная сессия и мусорный токен провайдера
-	if code, m = link(LinkRequest{Token: "garbage", IDToken: "x"}); code != http.StatusUnauthorized ||
+	if code, m = link("garbage", LinkRequest{IDToken: "x"}); code != http.StatusUnauthorized ||
 		m["code"] != "bad_session" {
 		t.Fatalf("чужая сессия = %d %v, want 401 bad_session", code, m)
 	}
-	if code, m = link(LinkRequest{Token: session, IDToken: "not-a-jwt"}); code != http.StatusUnauthorized ||
+	if code, m = link(session, LinkRequest{IDToken: "not-a-jwt"}); code != http.StatusUnauthorized ||
 		m["code"] != "bad_auth" {
 		t.Fatalf("мусорный id_token = %d %v, want 401 bad_auth", code, m)
 	}
@@ -502,17 +499,17 @@ func TestBlockEndpoint(t *testing.T) {
 	}
 
 	// без сессии не пускаем
-	resp, body := restPost(t, e.srv.URL+"/block", BlockData{Token: "garbage", UserID: troll})
+	resp, body := restPostAuth(t, e.srv.URL+"/block", "garbage", BlockData{UserID: troll})
 	if resp.StatusCode != http.StatusUnauthorized || body["code"] != "bad_session" {
 		t.Fatalf("чужой токен = %d %v, want 401 bad_session", resp.StatusCode, body)
 	}
 	// без id тоже
-	if resp, body = restPost(t, e.srv.URL+"/block", BlockData{Token: token}); resp.StatusCode != http.StatusBadRequest {
+	if resp, body = restPostAuth(t, e.srv.URL+"/block", token, BlockData{}); resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("без user_id = %d %v, want 400", resp.StatusCode, body)
 	}
 
-	if resp, body = restPost(t, e.srv.URL+"/block",
-		BlockData{Token: token, UserID: troll, MessageText: "гадость"}); resp.StatusCode != http.StatusOK {
+	if resp, body = restPostAuth(t, e.srv.URL+"/block", token,
+		BlockData{UserID: troll, MessageText: "гадость"}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("block = %d %v, want 200", resp.StatusCode, body)
 	}
 
@@ -530,7 +527,7 @@ func TestBlockEndpoint(t *testing.T) {
 	}
 
 	// список заблокированных приходит в resume
-	_, body = restPost(t, e.srv.URL+"/session/resume", ResumeData{Token: token})
+	_, body = restPostAuth(t, e.srv.URL+"/session/resume", token, struct{}{})
 	u, _ := body["user"].(map[string]any)
 	blocked, _ := u["blocked"].([]any)
 	if len(blocked) != 1 || int64(blocked[0].(float64)) != troll {
@@ -539,11 +536,7 @@ func TestBlockEndpoint(t *testing.T) {
 
 	// список для экрана «Заблокированные» — с профилем, чтобы человек понял, кого
 	// именно он скрыл, и мог снять блокировку
-	resp2, err := http.Get(e.srv.URL + "/blocked?token=" + token)
-	if err != nil {
-		t.Fatalf("GET /blocked: %v", err)
-	}
-	defer resp2.Body.Close()
+	resp2 := getAuth(t, e.srv.URL+"/blocked", token)
 	var list BlockedData
 	if err := json.NewDecoder(resp2.Body).Decode(&list); err != nil {
 		t.Fatalf("decode /blocked: %v", err)
@@ -552,34 +545,25 @@ func TestBlockEndpoint(t *testing.T) {
 		t.Fatalf("/blocked = %+v, want одного «Тролль» с id %d", list.Users, troll)
 	}
 	// без токена — 400, с чужим — 401
-	if r, err := http.Get(e.srv.URL + "/blocked"); err == nil {
-		r.Body.Close()
-		if r.StatusCode != http.StatusBadRequest {
-			t.Fatalf("/blocked без токена = %d, want 400", r.StatusCode)
-		}
+	if r := getAuth(t, e.srv.URL+"/blocked", ""); r.StatusCode != http.StatusBadRequest {
+		t.Fatalf("/blocked без токена = %d, want 400", r.StatusCode)
 	}
-	if r, err := http.Get(e.srv.URL + "/blocked?token=garbage"); err == nil {
-		r.Body.Close()
-		if r.StatusCode != http.StatusUnauthorized {
-			t.Fatalf("/blocked с чужим токеном = %d, want 401", r.StatusCode)
-		}
+	if r := getAuth(t, e.srv.URL+"/blocked", "garbage"); r.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("/blocked с чужим токеном = %d, want 401", r.StatusCode)
 	}
 
 	// снятие тем же эндпоинтом
-	if resp, body = restPost(t, e.srv.URL+"/block",
-		BlockData{Token: token, UserID: troll, Unblock: true}); resp.StatusCode != http.StatusOK {
+	if resp, body = restPostAuth(t, e.srv.URL+"/block", token,
+		BlockData{UserID: troll, Unblock: true}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("unblock = %d %v, want 200", resp.StatusCode, body)
 	}
-	_, body = restPost(t, e.srv.URL+"/session/resume", ResumeData{Token: token})
+	_, body = restPostAuth(t, e.srv.URL+"/session/resume", token, struct{}{})
 	if u, _ := body["user"].(map[string]any); u["blocked"] != nil {
 		t.Fatalf("после снятия blocked = %v, want пусто", u["blocked"])
 	}
-	if r, err := http.Get(e.srv.URL + "/blocked?token=" + token); err == nil {
-		defer r.Body.Close()
-		var after BlockedData
-		json.NewDecoder(r.Body).Decode(&after)
-		if len(after.Users) != 0 {
-			t.Fatalf("после снятия список = %+v, want пустой", after.Users)
-		}
+	var after BlockedData
+	json.NewDecoder(getAuth(t, e.srv.URL+"/blocked", token).Body).Decode(&after)
+	if len(after.Users) != 0 {
+		t.Fatalf("после снятия список = %+v, want пустой", after.Users)
 	}
 }

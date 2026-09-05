@@ -32,7 +32,7 @@ func dialKeepalive(t *testing.T) *websocket.Conn {
 	hub := NewHub()
 	go hub.Run()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store, nil, nil))
+	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store))
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 

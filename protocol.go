@@ -3,18 +3,17 @@ package main
 import "encoding/json"
 
 // Wire-протокол — см. ether-meta/PROTOCOL.md. WS остаётся только там, где нужен
-// пуш или живой сокет как побочный эффект: locate — подписывает соединение;
-// publish/message — рассылка. Сокет авторизуется единственным способом —
-// токеном сессии в query ?token= при апгрейде (см. wsHandler). Аутентификация
-// (вход через провайдера — Telegram/Apple/Google), resume, accept_rules,
-// history — в REST (см. rest.go).
+// пуш или живой сокет как побочный эффект: locate — подписывает соединение,
+// message — рассылка. Сокет авторизуется единственным способом — токеном сессии
+// в query ?token= при апгрейде (см. wsHandler). Всё остальное — в REST
+// (см. rest.go): вход через провайдера (Telegram/Apple/Google), resume,
+// accept_rules, чтение и отправка сообщений.
 //
 // Каждый кадр WebSocket — это Envelope: тег типа + сырой payload, который
 // доразбирается по типу.
 const (
 	// client → server
-	TypeLocate  = "locate"  // {lat, lng}
-	TypePublish = "publish" // {channel, text} — только на authed-сокете
+	TypeLocate = "locate" // {lat, lng}
 
 	// server → client
 	TypeLocated = "located" // {channels: [...]}
@@ -34,33 +33,12 @@ type LocateData struct {
 	Lat float64 `json:"lat"`
 	Lng float64 `json:"lng"`
 }
-type PublishData struct {
-	Channel string `json:"channel"`
-	Text    string `json:"text"`
-}
-
-// ResumeData / AcceptRulesData / LogoutData / DeleteAccountData — тела
-// REST-запросов (см. rest.go), не WS. Разнесены по типу на запрос ради
-// читаемости, хотя поле одно и то же.
-type ResumeData struct {
-	Token string `json:"token"`
-}
-type AcceptRulesData struct {
-	Token string `json:"token"`
-}
-type LogoutData struct {
-	Token string `json:"token"`
-}
-type DeleteAccountData struct {
-	Token string `json:"token"`
-}
 
 // SetNameData — тело POST /profile/name: отображаемое имя, заданное вручную.
 // Отдельный запрос, а не поле входа: имя может понадобиться задать и позже
 // (аккаунт остался без имени, потому что провайдер его не дал).
 type SetNameData struct {
-	Token string `json:"token"`
-	Name  string `json:"name"`
+	Name string `json:"name"`
 }
 
 // BlockData — тело POST /block: кого блокируем (внутренний id) и, опционально,
@@ -69,7 +47,6 @@ type SetNameData struct {
 // контенте). Unblock=true — обратная операция тем же эндпоинтом: отдельный путь
 // ради одного флага не нужен.
 type BlockData struct {
-	Token       string `json:"token"`
 	UserID      int64  `json:"user_id"`
 	MessageText string `json:"message_text,omitempty"`
 	Unblock     bool   `json:"unblock,omitempty"`
@@ -80,11 +57,10 @@ type BlockedData struct {
 	Users []BlockedUser `json:"users"`
 }
 
-// LinkRequest — тело POST /profile/link/{провайдер}: токен сессии (к какому
-// аккаунту привязываем) + ID-token провайдера (что привязываем). Name — как в
-// AuthRequest, нужен только Apple.
+// LinkRequest — тело POST /profile/link/{провайдер}: ID-token провайдера (что
+// привязываем); к какому аккаунту — известно из токена сессии в заголовке.
+// Name — как в AuthRequest, нужен только Apple.
 type LinkRequest struct {
-	Token   string `json:"token"`
 	IDToken string `json:"id_token"`
 	Name    string `json:"name,omitempty"`
 }
@@ -94,7 +70,6 @@ type LinkRequest struct {
 // уведомлять автора о его же сообщении, — см. push.go. Platform (ios|android)
 // нужен только для диагностики.
 type PushTokenData struct {
-	Token    string `json:"token"`     // токен сессии — кто регистрирует
 	FCMToken string `json:"fcm_token"` // токен устройства от FCM
 	Platform string `json:"platform,omitempty"`
 }
@@ -104,7 +79,6 @@ type PushTokenData struct {
 // на что жалуется и почему. Reason — код причины из фиксированного набора
 // клиента (spam/abuse/illegal/other), свободного текста нет.
 type ReportData struct {
-	Token     string `json:"token"`
 	MessageID int64  `json:"message_id"`
 	Reason    string `json:"reason,omitempty"`
 }
@@ -208,17 +182,14 @@ type UpdateData struct {
 	URL    string `json:"url,omitempty"`
 }
 
-// PublishRequest — тело POST /messages. То же, что кадр `publish` на WS, плюс
-// два поля, которых у кадра быть не может: токен сессии (у сокета личность
-// установлена при апгрейде) и ClientMsgID.
+// PublishRequest — тело POST /messages; токен сессии — заголовком.
 //
 // ClientMsgID — id отправки, придуманный клиентом; повтор с тем же id не
 // публикует второе сообщение, а возвращает уже сохранённое. Ради этого отправка
-// и уезжает с WS: кадр уходил в буфер сокета без подтверждения, и повторить его
-// было нельзя (см. ether-meta/PLANS.md). Необязателен: без него запрос работает,
-// просто повтор создаст дубль.
+// когда-то и уехала с WS: кадр уходил в буфер сокета без подтверждения, и
+// повторить его было нельзя. Необязателен: без него запрос работает, просто
+// повтор создаст дубль.
 type PublishRequest struct {
-	Token       string `json:"token"`
 	Channel     string `json:"channel"`
 	Text        string `json:"text"`
 	ClientMsgID string `json:"client_msg_id,omitempty"`
@@ -231,7 +202,7 @@ type PublishedData struct {
 	Message MessageData `json:"message"`
 }
 
-// HistoryData — тело ответа REST GET /history (см. rest.go).
+// HistoryData — тело ответа GET /messages (см. rest.go).
 type HistoryData struct {
 	Channel  string        `json:"channel"`
 	Messages []MessageData `json:"messages"` // хронологически, по возрастанию id
