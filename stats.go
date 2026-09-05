@@ -139,7 +139,11 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 	// Причины отказов важнее их числа: http_429 — это «упёрлись в лимит», таймаут
 	// — «Nominatim медленный», и лечится это по-разному.
 	writeGroup(&b, "Отказы", st.ByGeocodeError)
-	writeGroup(&b, "Страны (в Nominatim)", st.ByGeocodeCountry)
+	// Названия, а не коды: «NE 1» читает только тот, кто помнит ISO наизусть.
+	// Подменяем при печати, а не в запросе, — в базе страна остаётся кодом,
+	// потому что там она ключ (geocode_request, unmapped_unit, ID канала страны),
+	// а подпись нужна одной этой строке.
+	writeGroup(&b, "Страны (в Nominatim)", namedCountries(st.ByGeocodeCountry))
 	// Единственная строка сводки про НАКОПЛЕННОЕ, а не про неделю, — поэтому
 	// названа «всего» прямо в заголовке: иначе читалась бы как счёт за период.
 	// Это рабочий список: что дописать в словарь подписей (unit_title.go).
@@ -197,6 +201,17 @@ func writeGroup(b *strings.Builder, title string, rows []CountRow) {
 		parts = append(parts, fmt.Sprintf("%s %d", html.EscapeString(r.Key), r.Count))
 	}
 	fmt.Fprintf(b, "\n%s: %s", title, strings.Join(parts, ", "))
+}
+
+// namedCountries — те же строки, но с названиями стран вместо ISO-кодов
+// (см. countryName). Копия, а не правка на месте: st приходит из хранилища, и
+// портить его ради вывода нельзя.
+func namedCountries(rows []CountRow) []CountRow {
+	out := make([]CountRow, len(rows))
+	for i, r := range rows {
+		out[i] = CountRow{Key: countryName(r.Key), Count: r.Count}
+	}
+	return out
 }
 
 // inviter — как показать позвавшего в строке списка: имя, если оно есть, иначе
