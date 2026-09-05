@@ -262,7 +262,7 @@ func TestWeeklyStatsByClientVersion(t *testing.T) {
 	}
 
 	text := formatWeeklyStats(st, now.AddDate(0, 0, -7), now)
-	if !strings.Contains(text, "Версии: ios 1.2.0 2") {
+	if !strings.Contains(text, "Версии, запусков: ios 1.2.0 2") {
 		t.Errorf("в сводке нет распределения версий: %q", text)
 	}
 }

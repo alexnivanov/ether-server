@@ -103,14 +103,19 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 	if st.Previews > 0 {
 		fmt.Fprintf(&b, " (не в счёт %d превью)", st.Previews)
 	}
-	b.WriteString("\n")
-
+	// Три группы — разрезы этих самых переходов (их числа сходятся с 🔗), поэтому
+	// идут вплотную к строке, а не отдельным абзацем: отбивка выдавала бы их за
+	// самостоятельную тему, и «Платформа» читалась бы как платформа приложения, а
+	// не как догадка по User-Agent того, кто открыл ссылку.
 	writeGroup(&b, "Источник", st.BySrc)
 	writeGroup(&b, "Платформа", st.ByPlatform)
 	writeGroup(&b, "Позвали", st.ByInviter)
 	// Версии — про запуски приложения, а не про переходы по ссылке, поэтому
-	// группа идёт последней, отдельно от трёх предыдущих.
-	writeGroup(&b, "Версии", st.ByClientVersion)
+	// группа отбита пустой строкой: вплотную к трём предыдущим она читалась бы
+	// как ещё один разрез тех же переходов, а числа в ней совсем про другое.
+	// Единица счёта — в заголовке, как у «Без подписи»: отметку шлёт каждый
+	// запуск, и без этого слова числа выглядят как люди или как номер сборки.
+	writeSpacedGroup(&b, "📱 Версии, запусков", st.ByClientVersion)
 	// Геокодинг — не про людей вовсе, а про нагрузку: держит ли кеш, упираемся ли
 	// в лимит публичного Nominatim и попадал ли кто-то в очередь.
 	total := st.GeocodeCacheHits + st.GeocodeRequests
@@ -171,6 +176,17 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 // unmappedTop — сколько пробелов словаря показывать в сводке. Список рабочий:
 // длинный хвост редких единиц в отчёте не нужен, чинить его всё равно по одной.
 const unmappedTop = 5
+
+// writeSpacedGroup — writeGroup с пустой строкой перед группой: отбивка там, где
+// группа меняет тему, а не даёт ещё один разрез предыдущих. Пустую группу
+// по-прежнему пропускаем целиком, вместе с отбивкой.
+func writeSpacedGroup(b *strings.Builder, title string, rows []CountRow) {
+	if len(rows) == 0 {
+		return
+	}
+	b.WriteString("\n")
+	writeGroup(b, title, rows)
+}
 
 func writeGroup(b *strings.Builder, title string, rows []CountRow) {
 	if len(rows) == 0 {
