@@ -11,17 +11,11 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Периоды keepalive на время теста — миллисекунды вместо минут.
-func shortKeepalive(t *testing.T, ping, pong time.Duration) {
-	t.Helper()
-	oldPing, oldPong := pingPeriod, pongWait
-	pingPeriod, pongWait = ping, pong
-	t.Cleanup(func() { pingPeriod, pongWait = oldPing, oldPong })
-}
-
-// Сокет для теста keepalive: свой сервер, потому что периоды подменяются
-// глобально и читаются в момент старта помп.
-func dialKeepalive(t *testing.T) *websocket.Conn {
+// Сокет для теста keepalive с периодами в миллисекундах вместо минут. Ручка
+// своя, а не wsHandler: только она и отличается — периоды задаются соединению
+// до старта помп. Возвращать глобальные значения после теста было бы гонкой:
+// httptest не ждёт hijacked-соединений, и readPump переживает конец теста.
+func dialKeepalive(t *testing.T, ping, pong time.Duration) *websocket.Conn {
 	t.Helper()
 	store, err := OpenStore(filepath.Join(t.TempDir(), "ka.db"))
 	if err != nil {
@@ -32,7 +26,16 @@ func dialKeepalive(t *testing.T) *websocket.Conn {
 	hub := NewHub()
 	go hub.Run()
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", wsHandler(hub, StubGeocoder{}, store))
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		c := newClient(hub, conn, StubGeocoder{}, store)
+		c.pingPeriod, c.pongWait = ping, pong
+		go c.writePump()
+		go c.readPump()
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
@@ -49,8 +52,7 @@ func dialKeepalive(t *testing.T) *websocket.Conn {
 // держит канал живым: без трафика оператор/NAT роняет простаивающий TCP, и обе
 // стороны продолжают считать сокет рабочим (см. константы в client.go).
 func TestServerPingsIdleClient(t *testing.T) {
-	shortKeepalive(t, 30*time.Millisecond, 5*time.Second)
-	ws := dialKeepalive(t)
+	ws := dialKeepalive(t, 30*time.Millisecond, 5*time.Second)
 
 	pinged := make(chan struct{}, 1)
 	ws.SetPingHandler(func(data string) error {
@@ -83,8 +85,7 @@ func TestServerPingsIdleClient(t *testing.T) {
 func TestServerDropsClientWithoutPong(t *testing.T) {
 	// пинг далеко за горизонтом теста: проверяем именно дедлайн чтения, а не
 	// реакцию на неотвеченный ping
-	shortKeepalive(t, time.Hour, 100*time.Millisecond)
-	ws := dialKeepalive(t)
+	ws := dialKeepalive(t, time.Hour, 100*time.Millisecond)
 
 	// Своего дедлайна на чтении НЕТ намеренно: с ним тест проходил бы и без
 	// keepalive — ошибку дало бы само истечение клиентского дедлайна, а не

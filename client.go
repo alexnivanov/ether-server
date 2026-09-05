@@ -28,13 +28,9 @@ const (
 	// Важное свойство: чинит и УЖЕ ВЫПУЩЕННЫЕ сборки. На ping отвечает сам
 	// WebSocket (dart:io, браузер), клиентского кода это не требует.
 	writeWait = 10 * time.Second // на саму запись кадра в сокет
-)
 
-// Периоды keepalive (см. writeWait выше). Не const, потому что тест иначе
-// пришлось бы держать минуту: он подменяет их на миллисекунды и возвращает.
-var (
-	pongWait   = 60 * time.Second // ждём pong (и любой кадр) не дольше
-	pingPeriod = 50 * time.Second // пингуем с запасом до pongWait
+	defaultPongWait   = 60 * time.Second // ждём pong (и любой кадр) не дольше
+	defaultPingPeriod = 50 * time.Second // пингуем с запасом до pongWait
 )
 
 // Client — одно WebSocket-соединение. readPump читает кадры из сокета и дёргает
@@ -46,6 +42,15 @@ type Client struct {
 	send  chan Envelope
 	geo   Geocoder
 	store *Store
+
+	// Периоды keepalive — поля соединения, а не глобальные переменные, хотя
+	// меняет их только тест (на миллисекунды, иначе он длился бы минуту).
+	// Глобальные были бы гонкой, и не теоретической: помпы читают периоды из
+	// своих горутин, а httptest не дожидается hijacked-соединений — значит
+	// readPump ещё жив, когда тест возвращает прежние значения. Здесь же
+	// период проставляется до старта помп и дальше только читается.
+	pingPeriod time.Duration
+	pongWait   time.Duration
 
 	// Кто вошёл: проставляется один раз при апгрейде из ?token= (см. wsHandler),
 	// дальше только читается. Личность нужна сокету ровно для двух вещей —
@@ -88,6 +93,20 @@ func (c *Client) setAuthed(userID int64, fullName string) {
 // которой не понять ни что случилось, ни что делать.
 const typePublishGone = "publish"
 
+// newClient — соединение с обычными периодами keepalive. Тест подменяет их
+// сразу после вызова, до старта помп (см. keepalive_test.go).
+func newClient(hub *Hub, conn *websocket.Conn, geo Geocoder, store *Store) *Client {
+	return &Client{
+		hub:        hub,
+		conn:       conn,
+		send:       make(chan Envelope, 16),
+		geo:        geo,
+		store:      store,
+		pingPeriod: defaultPingPeriod,
+		pongWait:   defaultPongWait,
+	}
+}
+
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
@@ -97,11 +116,11 @@ func (c *Client) readPump() {
 	// Половина keepalive, которая ловит мёртвого клиента: не ответил pong (или
 	// вообще замолчал) — чтение падает по дедлайну, и соединение уходит из
 	// хаба, вместо того чтобы висеть в подписках.
-	if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+	if err := c.conn.SetReadDeadline(time.Now().Add(c.pongWait)); err != nil {
 		return
 	}
 	c.conn.SetPongHandler(func(string) error {
-		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return c.conn.SetReadDeadline(time.Now().Add(c.pongWait))
 	})
 
 	for {
@@ -111,7 +130,7 @@ func (c *Client) readPump() {
 		}
 		// Свой кадр — тоже доказательство живости, не хуже pong: сдвигаем
 		// дедлайн, чтобы активный клиент не отвалился, если pong потерялся.
-		if err := c.conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		if err := c.conn.SetReadDeadline(time.Now().Add(c.pongWait)); err != nil {
 			return
 		}
 		var env Envelope
@@ -179,7 +198,7 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
-	ping := time.NewTicker(pingPeriod)
+	ping := time.NewTicker(c.pingPeriod)
 	defer func() {
 		ping.Stop()
 		// Закрываем сокет и здесь: если писатель ушёл (не прошёл пинг или

@@ -225,13 +225,7 @@ func wsHandler(hub *Hub, geo Geocoder, store *Store) http.HandlerFunc {
 			slog.Warn("ws upgrade failed", "err", err)
 			return
 		}
-		c := &Client{
-			hub:   hub,
-			conn:  conn,
-			send:  make(chan Envelope, 16),
-			geo:   geo,
-			store: store,
-		}
+		c := newClient(hub, conn, geo, store)
 		if authedUser != nil {
 			c.setAuthed(authedUser.ID, authedUser.FullName)
 		}
