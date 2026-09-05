@@ -72,9 +72,25 @@ func main() {
 	}
 	go startCleanup(store) // сообщения и статистика геокодинга, см. cleanup.go
 
+	// Пробелы словаря подписей: строки, снятые прежним словарём, выносим на
+	// старте — правка словаря и есть «чистим базу» (см. unitDictHash).
+	if n, err := store.DeleteUnmappedUnitsExcept(unitDictHash()); err != nil {
+		slog.Error("unmapped units cleanup", "err", err)
+	} else if n > 0 {
+		slog.Info("unmapped units dropped after dictionary change", "count", n, "dict", unitDictHash())
+	}
+
 	nominatim := NewNominatimGeocoder()
 	if cfg.NominatimURL != "" {
 		nominatim.BaseURL = cfg.NominatimURL
+	}
+	// Единицы, которым словарь не подобрал подписи, копим в БД и печатаем в
+	// недельной сводке: иначе про них можно узнать только случайно, глядя на
+	// свой экран. Сбой записи геокодинг не ломает — это заметка, а не данные.
+	nominatim.OnUnmapped = func(g unitGap, slot, country string) {
+		if err := store.SaveUnmappedUnit(g, slot, country); err != nil {
+			slog.Error("unmapped unit", "err", err, "name", g.Name)
+		}
 	}
 	// Кеш поверх геокодера: набор каналов для точки стабилен, а публичный
 	// Nominatim ограничен 1 req/s (см. geocache.go). Без него задержка упирается

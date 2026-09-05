@@ -114,6 +114,13 @@ func TestMigrateLegacyDB(t *testing.T) {
 	if clientMsgID != "" {
 		t.Errorf("client_msg_id старой строки = %q, want пусто", clientMsgID)
 	}
+	// Новая таблица приезжает БЕЗ шага миграции: storeSchema применяется при
+	// каждом старте и весь состоит из CREATE TABLE IF NOT EXISTS. Шаг нужен
+	// только там, где схему надо менять (ALTER, backfill), — иначе он дублирует
+	// DDL и зря двигает schemaVersion. unmapped_unit проверяем именно поэтому.
+	if _, err := store.db.Exec(`SELECT COUNT(*) FROM unmapped_unit`); err != nil {
+		t.Errorf("новая таблица не появилась в дожившей базе: %v", err)
+	}
 }
 
 // TestMigrateTwice — второй запуск на той же базе не должен делать ничего:

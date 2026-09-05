@@ -146,9 +146,8 @@ CREATE TABLE IF NOT EXISTS reports (
 );
 CREATE INDEX IF NOT EXISTS reports_created_at ON reports(created_at);
 CREATE INDEX IF NOT EXISTS reports_author ON reports(author_user_id);
--- Голоса за сообщения (см. ether-meta/PLANS.md, «Цена охвата»). Ограничено само
--- голосование, а не рейтинг: у человека voteBudget голосов на всех авторов, и
--- строка держит один голос, пока жива.
+-- Голоса за сообщения. Ограничено само голосование, а не рейтинг: у человека
+-- voteBudget голосов на всех авторов, и строка держит один голос, пока жива.
 --
 -- ON DELETE CASCADE от messages здесь несущий, а не защитный: голос живёт ровно
 -- столько, сколько отмеченное сообщение, поэтому уборка по TTL
@@ -351,6 +350,30 @@ CREATE TABLE IF NOT EXISTS geocode_request (
 	wait_ms INTEGER
 );
 CREATE INDEX IF NOT EXISTS geocode_request_ts ON geocode_request(ts);
+-- Единицы, которым словарь подписей не подобрал слова, хотя похоже, что мог бы
+-- (см. unitGap в unit_title.go): рабочий список «что дописать в словарь», а не
+-- журнал нагрузки. Отсюда и отличия от geocode_request: строка на УНИКАЛЬНУЮ
+-- единицу, а не на событие, и уборщика по TTL нет.
+--
+-- Живёт до правки словаря: dict_hash помнит, каким словарём строка снята, и при
+-- старте сервер выносит всё, что снято прежним (см. DeleteUnmappedUnitsExcept).
+-- Иначе список копил бы уже починенное и переставал отвечать на свой вопрос.
+--
+-- seen считает ПРОМАХИ геокеша, а не людей: при попадании геокодер не работает
+-- вовсе. Для «что чинить первым» этого хватает, для «сколько человек увидело» — нет.
+CREATE TABLE IF NOT EXISTS unmapped_unit (
+	class       TEXT NOT NULL,    -- place | boundary
+	type        TEXT NOT NULL,    -- locality | administrative | ...
+	admin_level INTEGER NOT NULL, -- 0 — тега нет
+	name        TEXT NOT NULL,    -- localname как пришёл из Nominatim
+	country     TEXT NOT NULL,    -- ISO 3166-1: отделяет РФ от заграницы, где подпись слота нормальна
+	slot        TEXT NOT NULL,    -- какой слот заняла: city | district | ...
+	dict_hash   TEXT NOT NULL,    -- отпечаток словаря, которым снята строка
+	seen        INTEGER NOT NULL,
+	first_ts    INTEGER NOT NULL,
+	last_ts     INTEGER NOT NULL,
+	PRIMARY KEY (class, type, admin_level, name)
+);
 -- Отметки об отправленных еженедельных сводках (см. stats.go). Одна строка на
 -- момент расписания (суббота, statsHour), за который сводка ушла в Telegram.
 --
@@ -1124,7 +1147,7 @@ func (s *Store) DeleteUserMessages(userID int64) (int64, error) {
 // именно голосование, а не рейтинг: отдал — запас уменьшился, и отказ приходит в
 // момент нажатия. Ограничение, которое человек видит, честнее того, которое
 // молча обесценивает нажатие; заодно общий запас делает голос обдуманным —
-// отдать пять голосов одному это реальная трата (ether-meta/PLANS.md).
+// отдать пять голосов одному это реальная трата.
 //
 // Десять на недельном TTL сообщений — полтора голоса в день у активного
 // человека: отметка остаётся жестом, а не рефлексом. Число подбирается на живой
@@ -1257,8 +1280,10 @@ func voteState(q rowQuerier, voterID, messageID int64) (VoteState, error) {
 
 // AuthorRating — рейтинг автора: сумма голосов по всем его сообщениям. Никаких
 // зажимов и пересчётов, каждый голос стоит ровно 1 — потолок на пару
-// «голосующий → автор» разобран и снят, его роль играет дефицит голосов
-// (см. ether-meta/PLANS.md).
+// «голосующий → автор» разобран и снят, его роль играет дефицит голосов у
+// голосующего. Цена решения известна: второй аккаунт может слить весь свой запас
+// на подельника, и удерживает такую ферму только мелкость приза — см. потолок
+// разгона в planetGoodLimit (ratelimit.go).
 //
 // Читается на каждой публикации, поэтому запрос идёт по покрывающему
 // votes_author. Голоса уезжают вместе с сообщениями, так что это «сколько
@@ -1856,6 +1881,39 @@ func (s *Store) SaveClientVersion(platform, clientVersion string) error {
 	return err
 }
 
+// SaveUnmappedUnit отмечает единицу, которой словарь подписей не подобрал слова
+// (см. unitGap в unit_title.go). Повтор той же единицы не плодит строк, а двигает
+// seen и last_ts: список отвечает на вопрос «что дописать в словарь», и одна
+// деревня, попавшаяся сто раз, — это одна строка работы, а не сто.
+//
+// dict_hash пишем текущий и обновляем на конфликте: строка, дожившая до новой
+// версии словаря, — это по-прежнему НЕ распознанная единица, и помечать её
+// старым отпечатком значило бы вынести её при следующем старте.
+func (s *Store) SaveUnmappedUnit(g unitGap, slot, country string) error {
+	now := time.Now().UnixMilli()
+	_, err := s.db.Exec(`
+		INSERT INTO unmapped_unit
+			(class, type, admin_level, name, country, slot, dict_hash, seen, first_ts, last_ts)
+		VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+		ON CONFLICT(class, type, admin_level, name) DO UPDATE SET
+			seen = seen + 1, last_ts = excluded.last_ts,
+			country = excluded.country, slot = excluded.slot,
+			dict_hash = excluded.dict_hash`,
+		g.Class, g.Type, g.AdminLevel, g.Name, country, slot, unitDictHash(), now, now)
+	return err
+}
+
+// DeleteUnmappedUnitsExcept выносит строки, снятые прежним словарём: их пробел
+// либо уже закрыт правкой, либо будет замечен заново на следующем промахе кеша.
+// Зовётся при старте — «после обновления словаря чистим базу» без ручного шага.
+func (s *Store) DeleteUnmappedUnitsExcept(hash string) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM unmapped_unit WHERE dict_hash <> ?`, hash)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
 // ─── еженедельная сводка ───
 
 // CountRow — «что-то и сколько его»: строка любой группировки в сводке.
@@ -1923,6 +1981,11 @@ type WeeklyStats struct {
 	// «упёрлись мы в лимит или Nominatim просто медленный», а он требует разных
 	// решений.
 	ByGeocodeError []CountRow
+	// UnmappedUnits — единицы, которым словарь подписей не подобрал слова
+	// (unmapped_unit). ОТЛИЧАЕТСЯ ОТ ОСТАЛЬНЫХ СТРОК СВОДКИ: показывает
+	// накопленное, а не неделю. Таблица не оконная — это рабочий список, он
+	// живёт до правки словаря и сам обнуляется при её выкатке.
+	UnmappedUnits []CountRow
 }
 
 // humanUAExpr — SQL-условие «заход сделал человек, а не сборщик превью». Ставится
@@ -2029,6 +2092,18 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 		SELECT country, COUNT(*) n FROM geocode_request
 		WHERE ts >= ? AND ts < ? AND source = ? AND country <> ''
 		GROUP BY 1 ORDER BY n DESC`, from, to, geocodeSourceNet); err != nil {
+		return nil, err
+	}
+	// Пробелы словаря подписей — БЕЗ рамок периода, в отличие от всего выше:
+	// список накопительный (см. UnmappedUnits). Ключ собираем читаемым: тип и
+	// имя рядом, потому что «place/locality» без имени не подсказывает, что это
+	// было, а имя без типа — что дописывать в словарь.
+	if st.UnmappedUnits, err = s.countRows(`
+		SELECT class || '/' || CASE WHEN admin_level > 0
+		           THEN type || ' ' || admin_level ELSE type END
+		       || ' «' || name || '»', seen
+		FROM unmapped_unit ORDER BY seen DESC, last_ts DESC LIMIT ?`,
+		unmappedTop); err != nil {
 		return nil, err
 	}
 

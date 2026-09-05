@@ -86,6 +86,16 @@ type NominatimGeocoder struct {
 	BaseURL   string
 	UserAgent string
 
+	// OnUnmapped — куда сообщать о единице, которой словарь подписей не знает
+	// (см. unit_title.go). Хук, а не Store полем: геокодер про хранение ничего
+	// не знает и знать не должен, а в тестах и в стабе писать некуда. nil — не
+	// сообщаем.
+	//
+	// Зовётся только на ПРОМАХЕ геокеша (клетка ~100 м, сутки), потому что при
+	// попадании геокодер не работает вовсе: счётчик в таблице — это число
+	// промахов, а не людей, увидевших подпись.
+	OnUnmapped func(gap unitGap, slot, country string)
+
 	client      *http.Client
 	minInterval time.Duration
 
@@ -392,7 +402,7 @@ func (g *NominatimGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 	// у всех и из координат не выводится (см. PlanetChannel).
 	out := make([]Channel, 0, 6)
 	out = append(out, PlanetChannel)
-	add := func(level, label, isoID string, cand *nomAddressEntry) {
+	add := func(level, slotLabel, isoID string, cand *nomAddressEntry) {
 		if cand == nil {
 			return
 		}
@@ -403,7 +413,13 @@ func (g *NominatimGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 		if id == "" {
 			return
 		}
-		out = append(out, Channel{ID: id, Level: level, Label: label, Name: cand.LocalName})
+		// Подпись — про тип единицы, а не про слот: в «Город» под Истрой
+		// ложится муниципальный округ, а в «Район» — деревня (см. unit_title.go).
+		label, name, gap := unitTitle(cand, slotLabel)
+		if gap != nil && g.OnUnmapped != nil {
+			g.OnUnmapped(*gap, level, countryISO)
+		}
+		out = append(out, Channel{ID: id, Level: level, Label: label, Name: name})
 	}
 	add("country", "Страна", countryISO, countryEntry)
 	add("region", "Область", regionISO, regionEntry)

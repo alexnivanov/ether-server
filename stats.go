@@ -135,6 +135,10 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 	// — «Nominatim медленный», и лечится это по-разному.
 	writeGroup(&b, "Отказы", st.ByGeocodeError)
 	writeGroup(&b, "Страны (в Nominatim)", st.ByGeocodeCountry)
+	// Единственная строка сводки про НАКОПЛЕННОЕ, а не про неделю, — поэтому
+	// названа «всего» прямо в заголовке: иначе читалась бы как счёт за период.
+	// Это рабочий список: что дописать в словарь подписей (unit_title.go).
+	writeGroup(&b, "🏷 Без подписи, всего", st.UnmappedUnits)
 
 	if len(st.AccessRows) == 0 {
 		return b.String()
@@ -164,6 +168,10 @@ func formatWeeklyStats(st *WeeklyStats, from, to time.Time) string {
 // writeGroup печатает группировку одной строкой: «Источник: apli 5, apqr 2».
 // Пустая группа пропускается — в сводке за тихую неделю пустых заголовков быть
 // не должно.
+// unmappedTop — сколько пробелов словаря показывать в сводке. Список рабочий:
+// длинный хвост редких единиц в отчёте не нужен, чинить его всё равно по одной.
+const unmappedTop = 5
+
 func writeGroup(b *strings.Builder, title string, rows []CountRow) {
 	if len(rows) == 0 {
 		return
