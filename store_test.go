@@ -934,3 +934,70 @@ func TestStoreBlocks(t *testing.T) {
 		t.Fatalf("после удаления аккаунта осталось %d блокировок", n)
 	}
 }
+
+// Страница истории вверх (before_id): клиент докручивает ленту и просит всё,
+// что старее самого старого известного ему сообщения (см. _loadOlder в
+// ether-client/lib/main.dart). Проверка нужна именно здесь: страницы обязаны
+// стыковаться без дыр и без повторов, а «дыра» в ленте выглядит не как ошибка,
+// а как будто часть разговора не сохранилась.
+func TestHistoryPagesUpWithoutGaps(t *testing.T) {
+	s := openTestStore(t)
+	author := mkTgUser(t, s, "1", "author", "Автор")
+	const total = 120
+	ids := make([]int64, 0, total)
+	for i := 0; i < total; i++ {
+		ids = append(ids, mkMessage(t, s, "RU", author, "реплика"))
+	}
+
+	// Первая страница — как при входе в комнату: последние 50, хронологически.
+	first, err := s.History("RU", 0, 50, author)
+	if err != nil {
+		t.Fatalf("первая страница: %v", err)
+	}
+	if len(first) != 50 {
+		t.Fatalf("в первой странице %d сообщений, want 50", len(first))
+	}
+	if first[0].ID != ids[total-50] || first[49].ID != ids[total-1] {
+		t.Fatalf("первая страница = [%d…%d], want [%d…%d] (последние 50, по возрастанию)",
+			first[0].ID, first[49].ID, ids[total-50], ids[total-1])
+	}
+
+	// Дальше как клиент: курсор = самый старый известный id.
+	seen := append([]int64(nil), idsOf(first)...)
+	cursor := first[0].ID
+	for page := 2; ; page++ {
+		got, err := s.History("RU", cursor, 50, author)
+		if err != nil {
+			t.Fatalf("страница %d: %v", page, err)
+		}
+		if len(got) == 0 {
+			break // пустая страница = история кончилась, клиент больше не просит
+		}
+		if got[len(got)-1].ID >= cursor {
+			t.Fatalf("страница %d вернула %d, а просили строго старее %d",
+				page, got[len(got)-1].ID, cursor)
+		}
+		seen = append(idsOf(got), seen...)
+		cursor = got[0].ID
+		if page > 10 {
+			t.Fatal("страницы не кончаются: курсор не двигается")
+		}
+	}
+
+	if len(seen) != total {
+		t.Fatalf("собрали %d сообщений из %d: страницы не стыкуются", len(seen), total)
+	}
+	for i, id := range seen {
+		if id != ids[i] {
+			t.Fatalf("склеенная лента разошлась на позиции %d: %d, want %d", i, id, ids[i])
+		}
+	}
+}
+
+func idsOf(msgs []MessageData) []int64 {
+	out := make([]int64, 0, len(msgs))
+	for _, m := range msgs {
+		out = append(out, m.ID)
+	}
+	return out
+}
