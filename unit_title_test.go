@@ -45,6 +45,11 @@ func TestUnitTitle(t *testing.T) {
 			slotLabel: "Город", wantLabel: "Город", wantName: "Москва",
 		},
 		{
+			name:      "имя-существительное: «район Якиманка» режется, в отличие от «Тверского района»",
+			entry:     nomAddressEntry{LocalName: "район Якиманка", Class: "boundary", Type: "administrative", AdminLevel: 8},
+			slotLabel: "Район", wantLabel: "Район", wantName: "Якиманка",
+		},
+		{
 			name:      "район остаётся Районом",
 			entry:     nomAddressEntry{LocalName: "Тверской", Class: "boundary", Type: "administrative"},
 			slotLabel: "Район", wantLabel: "Район", wantName: "Тверской",
@@ -63,6 +68,26 @@ func TestUnitTitle(t *testing.T) {
 			name:      "типовое слово не в начале — имя целиком",
 			entry:     nomAddressEntry{LocalName: "Красное Село", Class: "place", Type: "town"},
 			slotLabel: "Город", wantLabel: "Город", wantName: "Красное Село",
+		},
+		{
+			name:      "СНТ: аббревиатура сохраняет регистр, кавычки у имени снимаются",
+			entry:     nomAddressEntry{LocalName: `СНТ «Марушкино-92»`, Class: "place", Type: "allotments"},
+			slotLabel: "Квартал", wantLabel: "СНТ", wantName: "Марушкино-92",
+		},
+		{
+			name:      "огородническое товарищество с прямыми кавычками",
+			entry:     nomAddressEntry{LocalName: `Огородническое товарищество "Дружба"`, Class: "place", Type: "allotments"},
+			slotLabel: "Район", wantLabel: "Огородническое товарищество", wantName: "Дружба",
+		},
+		{
+			name:      "коттеджный посёлок: имя главнее знакомого тега",
+			entry:     nomAddressEntry{LocalName: `Коттеджный посёлок «2x2»`, Class: "place", Type: "neighbourhood"},
+			slotLabel: "Квартал", wantLabel: "Коттеджный посёлок", wantName: "2x2",
+		},
+		{
+			name:      "садовые участки без типа в имени — из словаря типов",
+			entry:     nomAddressEntry{LocalName: "Ромашка", Class: "place", Type: "allotments"},
+			slotLabel: "Квартал", wantLabel: "Садовое товарищество", wantName: "Ромашка",
 		},
 		{
 			name:      "незнакомая страна и тип — подпись слота",
@@ -158,5 +183,20 @@ func TestUnmappedUnitStore(t *testing.T) {
 	}
 	if n, err := store.DeleteUnmappedUnitsExcept(unitDictHash()); err != nil || n != 0 {
 		t.Errorf("вынесено %d (err %v), want 0 — словарь не менялся", n, err)
+	}
+}
+
+// Страна в цепочке — это place/country, и подпись ей даёт словарь типов, а не
+// откат на слот: иначе она попадала бы в список пробелов на каждом геокодинге
+// (24 строки в первой же сводке). Фильтровать пробелы по слоту было бы неверно —
+// у Области подпись врёт на «крае», и такой сигнал терять нельзя.
+func TestCountryIsNotAGap(t *testing.T) {
+	e := nomAddressEntry{LocalName: "Россия", Class: "place", Type: "country"}
+	label, name, gap := unitTitle(&e, "Страна")
+	if label != "Страна" || name != "Россия" {
+		t.Errorf("unitTitle = %q / %q, want Страна / Россия", label, name)
+	}
+	if gap != nil {
+		t.Errorf("страна помечена пробелом: %+v", gap)
 	}
 }

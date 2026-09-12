@@ -364,7 +364,7 @@ CREATE INDEX IF NOT EXISTS geocode_request_ts ON geocode_request(ts);
 CREATE TABLE IF NOT EXISTS unmapped_unit (
 	class       TEXT NOT NULL,    -- place | boundary
 	type        TEXT NOT NULL,    -- locality | administrative | ...
-	admin_level INTEGER NOT NULL, -- 0 — тега нет
+	admin_level INTEGER NOT NULL, -- у place/* это 15: столько Nominatim ставит, когда тега нет
 	name        TEXT NOT NULL,    -- localname как пришёл из Nominatim
 	country     TEXT NOT NULL,    -- ISO 3166-1: отделяет РФ от заграницы, где подпись слота нормальна
 	slot        TEXT NOT NULL,    -- какой слот заняла: city | district | ...
@@ -2098,8 +2098,10 @@ func (s *Store) WeeklyStats(from, to int64) (*WeeklyStats, error) {
 	// список накопительный (см. UnmappedUnits). Ключ собираем читаемым: тип и
 	// имя рядом, потому что «place/locality» без имени не подсказывает, что это
 	// было, а имя без типа — что дописывать в словарь.
+	// admin_level печатаем только у границ: у place/* Nominatim ставит 15 —
+	// это «тега нет», а не уровень, и в ключе оно читалось бы как глубина.
 	if st.UnmappedUnits, err = s.countRows(`
-		SELECT class || '/' || CASE WHEN admin_level > 0
+		SELECT class || '/' || CASE WHEN class = 'boundary' AND admin_level > 0
 		           THEN type || ' ' || admin_level ELSE type END
 		       || ' «' || name || '»', seen
 		FROM unmapped_unit ORDER BY seen DESC, last_ts DESC LIMIT ?`,
