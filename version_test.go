@@ -42,7 +42,7 @@ func TestVersionVerdict(t *testing.T) {
 		platformIOS: full(),
 	})
 
-	week := released.Add(softDelay)
+	softAt := released.Add(softDelay)
 	cases := []struct {
 		name     string
 		platform string
@@ -50,17 +50,17 @@ func TestVersionVerdict(t *testing.T) {
 		now      time.Time
 		want     string
 	}{
-		{"ниже min — обновиться обязательно", platformIOS, "1.0.0", week, updateRequired},
-		{"ровно min — уже не required", platformIOS, "1.1.0", week, updateSoft},
-		{"старее latest, неделя прошла", platformIOS, "1.2.0", week, updateSoft},
-		{"старее latest, но неделя ещё нет", platformIOS, "1.2.0", week.Add(-time.Second), updateOK},
-		{"ровно latest", platformIOS, "1.3.0", week, updateOK},
-		{"новее latest — dev-сборка", platformIOS, "1.4.0", week, updateOK},
+		{"ниже min — обновиться обязательно", platformIOS, "1.0.0", softAt, updateRequired},
+		{"ровно min — уже не required", platformIOS, "1.1.0", softAt, updateSoft},
+		{"старее latest, задержка прошла", platformIOS, "1.2.0", softAt, updateSoft},
+		{"старее latest, но задержка ещё не прошла", platformIOS, "1.2.0", softAt.Add(-time.Second), updateOK},
+		{"ровно latest", platformIOS, "1.3.0", softAt, updateOK},
+		{"новее latest — dev-сборка", platformIOS, "1.4.0", softAt, updateOK},
 		// min важнее задержки: сборка объявлена неработающей, ждать нечего
-		{"ниже min до истечения недели", platformIOS, "1.0.0", released, updateRequired},
-		{"платформы нет в конфиге", platformAndroid, "0.1.0", week, updateOK},
-		{"версия не разобралась", platformIOS, "1.2", week, updateOK},
-		{"версия пустая", platformIOS, "", week, updateOK},
+		{"ниже min до истечения задержки", platformIOS, "1.0.0", released, updateRequired},
+		{"платформы нет в конфиге", platformAndroid, "0.1.0", softAt, updateOK},
+		{"версия не разобралась", platformIOS, "1.2", softAt, updateOK},
+		{"версия пустая", platformIOS, "", softAt, updateOK},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -78,19 +78,19 @@ func TestVersionVerdictURL(t *testing.T) {
 		platformIOS:     full(),
 		platformAndroid: full(),
 	})
-	week := released.Add(softDelay)
+	softAt := released.Add(softDelay)
 
-	if got := gate.verdict(platformIOS, "1.0.0", week); got.URL != appStoreURL {
+	if got := gate.verdict(platformIOS, "1.0.0", softAt); got.URL != appStoreURL {
 		t.Errorf("ios url = %q, want %q", got.URL, appStoreURL)
 	}
-	if got := gate.verdict(platformAndroid, "1.0.0", week); got.URL != playURL {
+	if got := gate.verdict(platformAndroid, "1.0.0", softAt); got.URL != playURL {
 		t.Errorf("android url = %q, want %q", got.URL, playURL)
 	}
-	if got := gate.verdict(platformIOS, "1.3.0", week); got.URL != "" {
+	if got := gate.verdict(platformIOS, "1.3.0", softAt); got.URL != "" {
 		t.Errorf("url при ok = %q, want пусто", got.URL)
 	}
 	// latest отдаём всегда: клиенту его показывать человеку, даже когда всё ок
-	if got := gate.verdict(platformIOS, "1.3.0", week); got.Latest != "1.3.0" {
+	if got := gate.verdict(platformIOS, "1.3.0", softAt); got.Latest != "1.3.0" {
 		t.Errorf("latest = %q, want 1.3.0", got.Latest)
 	}
 }
