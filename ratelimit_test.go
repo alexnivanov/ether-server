@@ -361,3 +361,38 @@ func TestSweepDropsFullBuckets(t *testing.T) {
 		t.Fatalf("бакетов было %d, стало %d — полные не выброшены", before, len(r.buckets))
 	}
 }
+
+// TestIPLimiterBurstRefillAndKeys — бакет по адресу: всплеск, доливка и главное
+// — разные адреса не делят запас (иначе один любопытный закрыл бы лендинг всем).
+func TestIPLimiterBurstAndKeys(t *testing.T) {
+	lim := messageLimit{capacity: 2, refill: 15 * time.Second}
+	now := time.Now()
+	l := newIPLimiter(lim)
+	l.now = func() time.Time { return now }
+
+	for i := 0; i < lim.capacity; i++ {
+		if ok, _ := l.Allow("203.0.113.7"); !ok {
+			t.Fatalf("запрос %d из всплеска отбит, а должен пройти", i+1)
+		}
+	}
+	ok, retry := l.Allow("203.0.113.7")
+	if ok {
+		t.Fatal("после исчерпания всплеска запрос прошёл")
+	}
+	if retry <= 0 || retry > lim.refill {
+		t.Fatalf("retryAfter = %v, ожидали (0, %v]", retry, lim.refill)
+	}
+
+	// сосед по улице, но не по бакету
+	if ok, _ := l.Allow("203.0.113.8"); !ok {
+		t.Fatal("другой адрес отбит чужим лимитом")
+	}
+
+	now = now.Add(lim.refill)
+	if ok, _ := l.Allow("203.0.113.7"); !ok {
+		t.Fatal("после refill запрос не прошёл")
+	}
+	if ok, _ := l.Allow("203.0.113.7"); ok {
+		t.Fatal("refill долил больше одного запроса")
+	}
+}

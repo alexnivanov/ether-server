@@ -48,16 +48,21 @@ import (
 // отвечает ok (см. version.go).
 // pub — общий с WS путь публикации (см. publish.go); nil — POST /messages
 // отвечает 501, как незаданный провайдер входа.
+// geo — тот же геокодер, что у WS (кеширующий декоратор): GET /geocode обязан
+// отвечать ровно то же, что locate, и греть тот же кеш.
 // hub передаётся отдельно от pub, хотя pub его и содержит: удаление своего
 // сообщения не должно отключаться заодно с публикацией. nil-хаб просто не
 // рассылает кадр (см. Hub.AnnounceRemoved).
-func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher, hub *Hub) {
+func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher, hub *Hub, geo Geocoder) {
 	mux.HandleFunc("POST /account/delete", handleDeleteAccount(store))
 	// GET покрывает и HEAD — им ходят сборщики превью ссылок (см. handleAppLink)
 	mux.HandleFunc("GET /app", handleAppLink(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
 		mux.HandleFunc("POST /auth/"+provider, handleAuth(store, provider, verifiers[provider], notify))
 	}
+	// Каналы точки — публично и без авторизации: этим лендинг показывает
+	// посетителю его собственные каналы (см. handleGeocode)
+	mux.HandleFunc("GET /geocode", handleGeocode(geo, newIPLimiter(geocodeIPLimit)))
 	mux.HandleFunc("GET /health", handleHealth(store))
 	mux.HandleFunc("POST /block", handleBlock(store, notify))
 	mux.HandleFunc("GET /blocked", handleBlocked(store))
@@ -499,6 +504,59 @@ func handleAuth(store *Store, provider string, v *Verifier, notify *Notifier) ht
 		})
 	}
 }
+
+// handleGeocode — GET /geocode?lat=&lng= → 200 {channels} | 400 bad_data
+// | 429 too_fast (+Retry-After) | 502 geocode_failed — какие каналы у этой точки.
+//
+// Геокодер и кеш те же, что у locate на WS, поэтому ответ здесь и набор каналов
+// в приложении совпадают по построению. Спрашивает лендинг etherapp.ru: он
+// показывает посетителю его собственные каналы вместо выдуманных (см.
+// ether-web/index.html). Без авторизации, как /health и /version: география не
+// зависит от того, кто спрашивает.
+//
+// Базу эндпоинт НЕ трогает — ни справочник каналов, ни user_channels, ни
+// счётчик подписчиков. Счётчик остаётся нулём, а ноль по контракту Channel и
+// значит «не посчитали»; заполнять его ради лендинга — это запрос в базу за
+// числом, которое там не показывается. Публичный анонимный путь, который пишет
+// в таблицы, — приглашение их наполнить.
+//
+// Лимит по адресу, а не по аккаунту: аккаунта здесь нет, зато за эндпоинтом
+// публичный Nominatim с лимитом 1 req/s, и очередь к нему общая с живыми
+// пользователями.
+func handleGeocode(geo Geocoder, ips *ipLimiter) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		lat, errLat := strconv.ParseFloat(q.Get("lat"), 64)
+		lng, errLng := strconv.ParseFloat(q.Get("lng"), 64)
+		if errLat != nil || errLng != nil || !validCoord(lat, 90) || !validCoord(lng, 180) {
+			writeRESTError(w, http.StatusBadRequest, "bad_data",
+				"нужны числовые lat и lng в пределах координат")
+			return
+		}
+		// Лимит списывается только с разобранного запроса: на мусор в параметрах
+		// мы никуда не ходим, и тратить на него чужую квоту незачем.
+		if ok, retry := ips.Allow(clientIP(r)); !ok {
+			w.Header().Set("Retry-After", strconv.Itoa(int(retry.Seconds())+1))
+			writeRESTError(w, http.StatusTooManyRequests, "too_fast",
+				"Слишком много запросов, попробуй позже")
+			return
+		}
+		chans, err := geo.Channels(lat, lng)
+		if err != nil {
+			slog.Error("geocode: http", "err", err)
+			writeRESTError(w, http.StatusBadGateway, "geocode_failed",
+				"Не удалось определить каналы")
+			return
+		}
+		writeJSON(w, http.StatusOK, LocatedData{Channels: chans})
+	}
+}
+
+// validCoord — координата в пределах ±max. Сравнением «в пределах», а не
+// «за пределами»: ParseFloat принимает NaN и Inf, а любое сравнение с NaN ложно,
+// поэтому проверка на выход за диапазон пропустила бы NaN дальше — в ключ кеша и
+// в запрос к Nominatim.
+func validCoord(v, max float64) bool { return v >= -max && v <= max }
 
 // startedAt — момент запуска процесса, для uptime в /health.
 var startedAt = time.Now()

@@ -251,3 +251,74 @@ func (r *RateLimiter) sweepLocked(now time.Time) {
 		}
 	}
 }
+
+// ── Лимит по адресу ──────────────────────────────────────────────────────────
+
+// geocodeIPLimit — сколько геокодингов отдаём одному адресу (GET /geocode).
+// Эндпоинт публичный и без авторизации, а за ним стоит внешний Nominatim с
+// лимитом 1 req/s, поэтому считать некому, кроме как по адресу.
+//
+// Числа под лендинг: страница тратит ОДИН запрос на визит, так что всплеск в
+// десять — это запас для офиса или дома за общим NAT, где адрес у всех один.
+// Устойчивый темп 4/мин отсекает перебор координат сеткой, ради которого
+// эндпоинт и пришлось бы иначе закрывать.
+var geocodeIPLimit = messageLimit{capacity: 10, refill: 15 * time.Second}
+
+// ipLimiter — те же бакеты, что у RateLimiter, но ключ — адрес, а тир один на
+// всех. Отдельный тип, а не скоуп в RateLimiter: там ключ по аккаунту (int64) и
+// тир зависит от репутации, а здесь ни аккаунта, ни репутации нет — спрашивает
+// аноним.
+type ipLimiter struct {
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	lim     messageLimit
+	now     func() time.Time // подменяется в тестах
+}
+
+func newIPLimiter(lim messageLimit) *ipLimiter {
+	return &ipLimiter{buckets: make(map[string]*bucket), lim: lim, now: time.Now}
+}
+
+// Allow списывает один запрос у адреса. Возвращает false и время до следующей
+// возможности, если бакет пуст.
+func (l *ipLimiter) Allow(ip string) (ok bool, retryAfter time.Duration) {
+	now := l.now()
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	b := l.buckets[ip]
+	if b == nil {
+		// новый адрес начинает с полного бакета: первый запрос не ждёт
+		b = &bucket{tokens: float64(l.lim.capacity), last: now}
+		l.buckets[ip] = b
+	} else {
+		b.tokens += now.Sub(b.last).Seconds() / l.lim.refill.Seconds()
+		if b.tokens > float64(l.lim.capacity) {
+			b.tokens = float64(l.lim.capacity)
+		}
+		b.last = now
+	}
+
+	if b.tokens >= 1 {
+		b.tokens--
+	} else {
+		retryAfter = time.Duration((1 - b.tokens) * float64(l.lim.refill))
+	}
+	b.fullAt = now.Add(time.Duration((float64(l.lim.capacity) - b.tokens) * float64(l.lim.refill)))
+	l.sweepLocked(now)
+	return retryAfter == 0, retryAfter
+}
+
+// sweepLocked — как у RateLimiter: долившийся бакет неотличим от нового, и без
+// уборки map рос бы вместе с числом когда-либо заходивших адресов.
+func (l *ipLimiter) sweepLocked(now time.Time) {
+	if len(l.buckets) < 64 {
+		return
+	}
+	for ip, b := range l.buckets {
+		if !now.Before(b.fullAt) {
+			delete(l.buckets, ip)
+		}
+	}
+}
