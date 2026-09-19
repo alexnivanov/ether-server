@@ -80,7 +80,7 @@ func TestDeleteOwnMessageReturnsVotes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("запас до голоса: %v", err)
 	}
-	if _, _, err := s.Vote(fan, id, 1); err != nil {
+	if _, err := s.Vote(fan, id, 1); err != nil {
 		t.Fatalf("голос: %v", err)
 	}
 	if left, _ := s.VotesLeft(fan); left != before-1 {

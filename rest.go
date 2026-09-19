@@ -82,7 +82,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("POST /push/unregister", handlePushUnregister(store))
 	mux.HandleFunc("POST /report", handleReport(store, notify))
 	mux.HandleFunc("POST /rules/accept", handleAcceptRules(store))
-	mux.HandleFunc("POST /vote", handleVote(store, push))
+	mux.HandleFunc("POST /vote", handleVote(store, hub, push))
 	mux.HandleFunc("POST /session/logout", handleLogout(store))
 	mux.HandleFunc("POST /session/resume", handleResume(store))
 	mux.HandleFunc("GET /version", handleVersion(store, gate))
@@ -972,7 +972,7 @@ func handleDeleteMessage(store *Store, hub *Hub) http.HandlerFunc {
 	}
 }
 
-func handleVote(store *Store, push *Pusher) http.HandlerFunc {
+func handleVote(store *Store, hub *Hub, push *Pusher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var d VoteData
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.MessageID <= 0 {
@@ -987,7 +987,7 @@ func handleVote(store *Store, push *Pusher) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		st, notice, err := store.Vote(u.ID, d.MessageID, d.Value)
+		out, err := store.Vote(u.ID, d.MessageID, d.Value)
 		switch {
 		case errors.Is(err, ErrMessageGone):
 			writeRESTError(w, http.StatusNotFound, "not_found",
@@ -1006,17 +1006,24 @@ func handleVote(store *Store, push *Pusher) http.HandlerFunc {
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось учесть голос")
 			return
 		}
-		// Уведомление автору — только на новой отметке (notice != nil, см.
+		// Новая сумма — подписчикам канала: у них сообщение уже на экране, и
+		// без кадра число под ним застынет до перезапуска приложения. Кадр
+		// уходит на любое изменение, включая снятие голоса.
+		hub.AnnounceVoted(out.Channel, VotedData{
+			MessageID: d.MessageID,
+			Rating:    out.State.Rating,
+		})
+		// Уведомление автору — только на новой отметке (Notice != nil, см.
 		// Store.Vote) и асинхронно: HTTP к FCM не должен задерживать ответ тому,
 		// кто голосует.
-		if push != nil && notice != nil {
-			go push.NotifyVote(u.ID, d.MessageID, *notice)
+		if push != nil && out.Notice != nil {
+			go push.NotifyVote(u.ID, d.MessageID, out.Channel, *out.Notice)
 		}
 		writeJSON(w, http.StatusOK, VoteResultData{
 			MessageID: d.MessageID,
-			Rating:    st.Rating,
-			MyVote:    st.MyVote,
-			VotesLeft: st.VotesLeft,
+			Rating:    out.State.Rating,
+			MyVote:    out.State.MyVote,
+			VotesLeft: out.State.VotesLeft,
 		})
 	}
 }

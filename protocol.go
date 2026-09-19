@@ -19,6 +19,7 @@ const (
 	TypeLocated = "located" // {channels: [...]}
 	TypeMessage = "message" // {id, channel, sender_id, sender, username, avatar_url, text, ts}
 	TypeRemoved = "removed" // {message_id} | {user_id} — модератор убрал контент
+	TypeVoted   = "voted"   // {message_id, rating} — сумма под сообщением изменилась
 	TypeError   = "error"   // {code, message}
 )
 
@@ -165,6 +166,24 @@ type VoteResultData struct {
 type RemovedData struct {
 	MessageID int64 `json:"message_id,omitempty"`
 	UserID    int64 `json:"user_id,omitempty"`
+}
+
+// VotedData — под сообщением изменилась сумма голосов. Кадр уходит подписчикам
+// канала на КАЖДОЕ изменение: и на новую отметку, и на смену знака, и на
+// снятие голоса — рейтинг меняется во всех трёх случаях.
+//
+// Своего голоса (`my_vote`) здесь нет намеренно: он у каждого смотрящего свой,
+// а кадр общий на канал. Клиент меняет только сумму и оставляет свою кнопку
+// как была; собственный голос он и так знает из ответа POST /vote.
+//
+// Зачем кадр: до него чужие голоса приезжали только с загрузкой истории, то
+// есть сумма под сообщением у открытой ленты застывала до перезапуска.
+type VotedData struct {
+	MessageID int64 `json:"message_id"`
+	// Rating без omitempty: ноль — это значимое значение (голоса погасили друг
+	// друга или последний сняли), и пропажа поля прочиталась бы клиентом как
+	// «сумма не менялась».
+	Rating int `json:"rating"`
 }
 
 // HealthData — тело ответа GET /health: то, что нужно внешнему пингеру и

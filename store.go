@@ -1176,17 +1176,28 @@ type VoteState struct {
 }
 
 // VoteNotice — данные, чтобы уведомить автора о новой отметке под его
-// сообщением: кому слать, в каком канале и что он там написал (текст нужен
-// самому уведомлению — по одному «твоё сообщение отметили» автор не поймёт, о
-// каком из них речь).
+// сообщением: кому слать и что он там написал (текст нужен самому уведомлению
+// — по одному «твоё сообщение отметили» автор не поймёт, о каком из них речь).
 //
-// Vote возвращает его ТОЛЬКО когда голос появился, то есть на вставке строки.
-// Смена знака и снятие голоса — правка прежней реакции, а не новая: будить
-// автора второй раз тем же человеком не за что.
+// Заполняется ТОЛЬКО когда голос появился, то есть на вставке строки. Смена
+// знака и снятие голоса — правка прежней реакции, а не новая: будить автора
+// второй раз тем же человеком не за что.
 type VoteNotice struct {
 	AuthorID int64
-	Channel  string
 	Text     string
+}
+
+// VoteOutcome — всё, что случилось от одного голоса: что показать
+// проголосовавшему (State), кому разослать новую сумму (Channel — канал
+// сообщения, подписчикам которого уходит кадр `voted`) и надо ли будить автора
+// (Notice, nil — не надо).
+//
+// Канал отдельно от Notice потому, что нужен ВСЕГДА: сумма меняется и на смене
+// знака, и на снятии голоса, а уведомление автору там не уходит.
+type VoteOutcome struct {
+	State   VoteState
+	Channel string
+	Notice  *VoteNotice
 }
 
 // rowQuerier — общее у *sql.DB и *sql.Tx: состояние голоса читается и внутри
@@ -1204,12 +1215,10 @@ type rowQuerier interface {
 //
 // Всё одной транзакцией: между проверкой запаса и вставкой не должно влезть
 // второе нажатие с другого устройства.
-// Второй результат — уведомление автору (nil, если будить его не за что);
-// подробности в VoteNotice.
-func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, *VoteNotice, error) {
+func (s *Store) Vote(voterID, messageID int64, value int) (VoteOutcome, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return VoteState{}, nil, err
+		return VoteOutcome{}, err
 	}
 	defer tx.Rollback()
 
@@ -1220,13 +1229,13 @@ func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, *VoteNotic
 	err = tx.QueryRow(`SELECT user_id, channel, text FROM messages WHERE id = ?`, messageID).
 		Scan(&authorID, &channel, &text)
 	if errors.Is(err, sql.ErrNoRows) {
-		return VoteState{}, nil, ErrMessageGone
+		return VoteOutcome{}, ErrMessageGone
 	}
 	if err != nil {
-		return VoteState{}, nil, err
+		return VoteOutcome{}, err
 	}
 	if authorID == voterID {
-		return VoteState{}, nil, ErrSelfVote
+		return VoteOutcome{}, ErrSelfVote
 	}
 
 	// have остаётся нулём, если строки нет: сохранённый голос нулевым не бывает,
@@ -1235,7 +1244,7 @@ func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, *VoteNotic
 	err = tx.QueryRow(`SELECT value FROM votes WHERE voter_user_id = ? AND message_id = ?`,
 		voterID, messageID).Scan(&have)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return VoteState{}, nil, err
+		return VoteOutcome{}, err
 	}
 
 	var notice *VoteNotice
@@ -1245,42 +1254,43 @@ func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, *VoteNotic
 		if _, err := tx.Exec(
 			`DELETE FROM votes WHERE voter_user_id = ? AND message_id = ?`,
 			voterID, messageID); err != nil {
-			return VoteState{}, nil, err
+			return VoteOutcome{}, err
 		}
 	case have != 0:
 		if _, err := tx.Exec(
 			`UPDATE votes SET value = ?, created_at = ?
 				WHERE voter_user_id = ? AND message_id = ?`,
 			value, now, voterID, messageID); err != nil {
-			return VoteState{}, nil, err
+			return VoteOutcome{}, err
 		}
 	default:
 		var spent int
 		if err := tx.QueryRow(
 			`SELECT COUNT(*) FROM votes WHERE voter_user_id = ?`, voterID).Scan(&spent); err != nil {
-			return VoteState{}, nil, err
+			return VoteOutcome{}, err
 		}
 		if spent >= voteBudget {
-			return VoteState{}, nil, ErrNoVotesLeft
+			return VoteOutcome{}, ErrNoVotesLeft
 		}
 		if _, err := tx.Exec(
 			`INSERT INTO votes (voter_user_id, message_id, author_user_id, value, created_at)
 				VALUES (?, ?, ?, ?, ?)`,
 			voterID, messageID, authorID, value, now); err != nil {
-			return VoteState{}, nil, err
+			return VoteOutcome{}, err
 		}
-		notice = &VoteNotice{AuthorID: authorID, Channel: channel, Text: text}
+		notice = &VoteNotice{AuthorID: authorID, Text: text}
 	}
 
 	st, err := voteState(tx, voterID, messageID)
 	if err != nil {
-		return VoteState{}, nil, err
+		return VoteOutcome{}, err
 	}
 	if err := tx.Commit(); err != nil {
-		// Уведомление о голосе, который не сохранился, — обещание того, чего нет
-		return VoteState{}, nil, err
+		// Кадр и уведомление о голосе, который не сохранился, — обещание того,
+		// чего нет
+		return VoteOutcome{}, err
 	}
-	return st, notice, nil
+	return VoteOutcome{State: st, Channel: channel, Notice: notice}, nil
 }
 
 func voteState(q rowQuerier, voterID, messageID int64) (VoteState, error) {

@@ -24,6 +24,18 @@ type Hub struct {
 	// событие редкое — экономить тут нечего, и лишний кадр клиент просто не
 	// найдёт у себя в ленте.
 	announce chan Envelope
+
+	// announceIn — кадр подписчикам ОДНОГО канала. Отличие от announce не в
+	// экономии: событие про сообщение, а сообщение живёт в канале, и незачем
+	// рассказывать о нём тем, кто его не видит. announce остаётся для событий,
+	// у которых канала нет вовсе (удаление всех сообщений автора).
+	announceIn chan channelFrame
+}
+
+// channelFrame — кадр вместе с каналом, подписчикам которого он предназначен.
+type channelFrame struct {
+	channel string
+	env     Envelope
 }
 
 type subscription struct {
@@ -38,6 +50,7 @@ func NewHub() *Hub {
 		subscribe:  make(chan subscription),
 		broadcast:  make(chan MessageData),
 		announce:   make(chan Envelope),
+		announceIn: make(chan channelFrame),
 	}
 }
 
@@ -53,6 +66,15 @@ func (h *Hub) AnnounceRemoved(d RemovedData) {
 		return
 	}
 	h.announce <- envelope(TypeRemoved, d)
+}
+
+// AnnounceVoted говорит подписчикам канала, что сумма голосов под сообщением
+// стала другой. nil-хаб молча ничего не делает — как и у AnnounceRemoved.
+func (h *Hub) AnnounceVoted(channel string, d VotedData) {
+	if h == nil {
+		return
+	}
+	h.announceIn <- channelFrame{channel: channel, env: envelope(TypeVoted, d)}
 }
 
 func (h *Hub) Run() {
@@ -92,6 +114,16 @@ func (h *Hub) Run() {
 					default:
 						slog.Warn("send buffer full, dropping announce", "client", c.DisplayName())
 					}
+				}
+			}
+
+		case f := <-h.announceIn:
+			for c := range h.channels[f.channel] {
+				select {
+				case c.send <- f.env:
+				default:
+					slog.Warn("send buffer full, dropping announce",
+						"client", c.DisplayName(), "channel", f.channel)
 				}
 			}
 

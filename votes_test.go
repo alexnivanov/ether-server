@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 )
@@ -29,17 +30,17 @@ func TestVoteRatingIsPlainSum(t *testing.T) {
 	b := mkMessage(t, s, "RU", author, "второе")
 
 	// один человек отметил два сообщения — оба голоса в рейтинге
-	if _, _, err := s.Vote(fan, a, 1); err != nil {
+	if _, err := s.Vote(fan, a, 1); err != nil {
 		t.Fatalf("голос: %v", err)
 	}
-	if _, _, err := s.Vote(fan, b, 1); err != nil {
+	if _, err := s.Vote(fan, b, 1); err != nil {
 		t.Fatalf("голос: %v", err)
 	}
 	if r, err := s.AuthorRating(author); err != nil || r != 2 {
 		t.Fatalf("рейтинг = %d (err %v), want 2", r, err)
 	}
 	// минус стоит столько же, сколько плюс
-	if _, _, err := s.Vote(other, a, -1); err != nil {
+	if _, err := s.Vote(other, a, -1); err != nil {
 		t.Fatalf("минус: %v", err)
 	}
 	if r, _ := s.AuthorRating(author); r != 1 {
@@ -62,20 +63,20 @@ func TestVoteBudgetIsShared(t *testing.T) {
 		// разные авторы: запас общий, и от того, кому отдан голос, он не зависит
 		author := mkTgUser(t, s, string(rune('a'+i)), "", "Автор")
 		last = mkMessage(t, s, "RU", author, "текст")
-		st, _, err := s.Vote(voter, last, 1)
+		st, err := s.Vote(voter, last, 1)
 		if err != nil {
 			t.Fatalf("голос %d: %v", i, err)
 		}
-		if want := voteBudget - i - 1; st.VotesLeft != want {
-			t.Fatalf("после голоса %d остаток %d, want %d", i, st.VotesLeft, want)
+		if want := voteBudget - i - 1; st.State.VotesLeft != want {
+			t.Fatalf("после голоса %d остаток %d, want %d", i, st.State.VotesLeft, want)
 		}
 	}
 	extra := mkMessage(t, s, "RU", mkTgUser(t, s, "z", "", "Ещё"), "текст")
-	if _, _, err := s.Vote(voter, extra, 1); !errors.Is(err, ErrNoVotesLeft) {
+	if _, err := s.Vote(voter, extra, 1); !errors.Is(err, ErrNoVotesLeft) {
 		t.Fatalf("запас не кончился: %v", err)
 	}
 	// исчерпанный запас не мешает менять уже отданный голос: слот тот же
-	if st, _, err := s.Vote(voter, last, -1); err != nil || st.MyVote != -1 {
+	if st, err := s.Vote(voter, last, -1); err != nil || st.State.MyVote != -1 {
 		t.Fatalf("смена знака при пустом запасе: %+v (err %v)", st, err)
 	}
 	if left, _ := s.VotesLeft(voter); left != 0 {
@@ -91,21 +92,21 @@ func TestVoteRetractFreesSlot(t *testing.T) {
 	voter := mkTgUser(t, s, "2", "voter", "Голосующий")
 	m := mkMessage(t, s, "RU", author, "текст")
 
-	if _, _, err := s.Vote(voter, m, 1); err != nil {
+	if _, err := s.Vote(voter, m, 1); err != nil {
 		t.Fatalf("голос: %v", err)
 	}
-	st, _, err := s.Vote(voter, m, 0)
+	st, err := s.Vote(voter, m, 0)
 	if err != nil {
 		t.Fatalf("снятие: %v", err)
 	}
-	if st.MyVote != 0 || st.Rating != 0 || st.VotesLeft != voteBudget {
+	if st.State.MyVote != 0 || st.State.Rating != 0 || st.State.VotesLeft != voteBudget {
 		t.Fatalf("снятие не вернуло состояние: %+v", st)
 	}
 	if r, _ := s.AuthorRating(author); r != 0 {
 		t.Fatalf("рейтинг после снятия = %d, want 0", r)
 	}
 	// снятие несуществующего голоса — тоже успех: клиент мог не получить ответ
-	if _, _, err := s.Vote(voter, m, 0); err != nil {
+	if _, err := s.Vote(voter, m, 0); err != nil {
 		t.Fatalf("повторное снятие: %v", err)
 	}
 }
@@ -117,16 +118,21 @@ func TestVoteRepeatIsIdempotent(t *testing.T) {
 	voter := mkTgUser(t, s, "2", "voter", "Голосующий")
 	m := mkMessage(t, s, "RU", author, "текст")
 
-	first, _, err := s.Vote(voter, m, 1)
+	first, err := s.Vote(voter, m, 1)
 	if err != nil {
 		t.Fatalf("голос: %v", err)
 	}
-	second, _, err := s.Vote(voter, m, 1)
+	second, err := s.Vote(voter, m, 1)
 	if err != nil {
 		t.Fatalf("повтор: %v", err)
 	}
-	if first != second {
-		t.Fatalf("повтор изменил состояние: %+v → %+v", first, second)
+	// Сравниваем состояние, а не весь исход: уведомление автору есть только у
+	// первого голоса, и это как раз правильно — повтор автора не будит.
+	if first.State != second.State {
+		t.Fatalf("повтор изменил состояние: %+v → %+v", first.State, second.State)
+	}
+	if second.Notice != nil {
+		t.Fatalf("повтор дал уведомление автору: %+v", *second.Notice)
 	}
 	if r, _ := s.AuthorRating(author); r != 1 {
 		t.Fatalf("повтор удвоил рейтинг: %d", r)
@@ -140,10 +146,10 @@ func TestVoteRejects(t *testing.T) {
 	author := mkTgUser(t, s, "1", "author", "Автор")
 	m := mkMessage(t, s, "RU", author, "текст")
 
-	if _, _, err := s.Vote(author, m, 1); !errors.Is(err, ErrSelfVote) {
+	if _, err := s.Vote(author, m, 1); !errors.Is(err, ErrSelfVote) {
 		t.Fatalf("голос за себя прошёл: %v", err)
 	}
-	if _, _, err := s.Vote(author, m+1000, 1); !errors.Is(err, ErrMessageGone) {
+	if _, err := s.Vote(author, m+1000, 1); !errors.Is(err, ErrMessageGone) {
 		t.Fatalf("голос за несуществующее сообщение: %v", err)
 	}
 }
@@ -162,10 +168,10 @@ func TestVotesExpireWithMessages(t *testing.T) {
 		t.Fatalf("сохранить старое: %v", err)
 	}
 	fresh := mkMessage(t, s, "RU", author, "свежее")
-	if _, _, err := s.Vote(voter, old, 1); err != nil {
+	if _, err := s.Vote(voter, old, 1); err != nil {
 		t.Fatalf("голос за старое: %v", err)
 	}
-	if _, _, err := s.Vote(voter, fresh, 1); err != nil {
+	if _, err := s.Vote(voter, fresh, 1); err != nil {
 		t.Fatalf("голос за свежее: %v", err)
 	}
 	if r, _ := s.AuthorRating(author); r != 2 {
@@ -193,10 +199,10 @@ func TestHistoryCarriesVotes(t *testing.T) {
 	other := mkTgUser(t, s, "3", "other", "Другой")
 	m := mkMessage(t, s, "RU", author, "текст")
 
-	if _, _, err := s.Vote(viewer, m, 1); err != nil {
+	if _, err := s.Vote(viewer, m, 1); err != nil {
 		t.Fatalf("плюс: %v", err)
 	}
-	if _, _, err := s.Vote(other, m, -1); err != nil {
+	if _, err := s.Vote(other, m, -1); err != nil {
 		t.Fatalf("минус: %v", err)
 	}
 
@@ -231,7 +237,7 @@ func TestVotesGoWithVoter(t *testing.T) {
 	voter := mkTgUser(t, s, "2", "voter", "Голосующий")
 	m := mkMessage(t, s, "RU", author, "текст")
 
-	if _, _, err := s.Vote(voter, m, 1); err != nil {
+	if _, err := s.Vote(voter, m, 1); err != nil {
 		t.Fatalf("голос: %v", err)
 	}
 	if err := s.DeleteUser(voter); err != nil {
@@ -360,33 +366,52 @@ func TestVoteNoticeOnlyOnNewVote(t *testing.T) {
 	fan := mkTgUser(t, s, "2", "fan", "Читатель")
 	m := mkMessage(t, s, "relation/2555133", author, "пойдём гулять")
 
-	_, notice, err := s.Vote(fan, m, 1)
+	out, err := s.Vote(fan, m, 1)
 	if err != nil {
 		t.Fatalf("голос: %v", err)
 	}
-	if notice == nil {
+	if out.Notice == nil {
 		t.Fatal("новая отметка должна давать уведомление")
 	}
-	if notice.AuthorID != author || notice.Channel != "relation/2555133" ||
-		notice.Text != "пойдём гулять" {
-		t.Fatalf("уведомление = %+v", *notice)
+	if out.Notice.AuthorID != author || out.Notice.Text != "пойдём гулять" {
+		t.Fatalf("уведомление = %+v", *out.Notice)
 	}
 
 	// повтор тем же знаком — идемпотентность, ничего нового не случилось
-	if _, notice, err := s.Vote(fan, m, 1); err != nil || notice != nil {
-		t.Fatalf("повтор дал уведомление: %+v (err %v)", notice, err)
+	if out, err := s.Vote(fan, m, 1); err != nil || out.Notice != nil {
+		t.Fatalf("повтор дал уведомление: %+v (err %v)", out.Notice, err)
 	}
 	// смена знака — правка своей же отметки
-	if _, notice, err := s.Vote(fan, m, -1); err != nil || notice != nil {
-		t.Fatalf("смена знака дала уведомление: %+v (err %v)", notice, err)
+	if out, err := s.Vote(fan, m, -1); err != nil || out.Notice != nil {
+		t.Fatalf("смена знака дала уведомление: %+v (err %v)", out.Notice, err)
 	}
 	// снятие голоса
-	if _, notice, err := s.Vote(fan, m, 0); err != nil || notice != nil {
-		t.Fatalf("снятие дало уведомление: %+v (err %v)", notice, err)
+	if out, err := s.Vote(fan, m, 0); err != nil || out.Notice != nil {
+		t.Fatalf("снятие дало уведомление: %+v (err %v)", out.Notice, err)
 	}
 	// отказ — тем более: голоса не было
-	if _, notice, err := s.Vote(author, m, 1); !errors.Is(err, ErrSelfVote) || notice != nil {
-		t.Fatalf("голос за своё дал уведомление: %+v (err %v)", notice, err)
+	if out, err := s.Vote(author, m, 1); !errors.Is(err, ErrSelfVote) || out.Notice != nil {
+		t.Fatalf("голос за своё дал уведомление: %+v (err %v)", out.Notice, err)
+	}
+}
+
+// Канал сообщения возвращается ВСЕГДА, а не только вместе с уведомлением: кадр
+// `voted` уходит подписканту канала и на смене знака, и на снятии голоса, когда
+// будить автора не за что.
+func TestVoteOutcomeAlwaysCarriesChannel(t *testing.T) {
+	s := openTestStore(t)
+	author := mkTgUser(t, s, "1", "author", "Автор")
+	fan := mkTgUser(t, s, "2", "fan", "Читатель")
+	m := mkMessage(t, s, "relation/2555133", author, "пойдём гулять")
+
+	for _, value := range []int{1, -1, 0} {
+		out, err := s.Vote(fan, m, value)
+		if err != nil {
+			t.Fatalf("голос %d: %v", value, err)
+		}
+		if out.Channel != "relation/2555133" {
+			t.Fatalf("голос %d: канал = %q", value, out.Channel)
+		}
 	}
 }
 
@@ -421,5 +446,75 @@ func TestDeviceTokensForUser(t *testing.T) {
 	// Человек без устройств — пустой список, а не ошибка: пуши опциональны.
 	if got, err := s.DeviceTokensForUser(mkTgUser(t, s, "3", "mute", "Без пушей")); err != nil || len(got) != 0 {
 		t.Fatalf("без устройств = %v (err %v)", got, err)
+	}
+}
+
+// Кадр `voted` держит сумму под сообщением живой у тех, у кого лента уже
+// открыта: до него чужие голоса приезжали только с загрузкой истории, и число
+// застывало до перезапуска приложения.
+//
+// Рассылка адресная — подписчикам канала сообщения: событие про сообщение, а
+// сообщение живёт в канале, и незачем рассказывать о нём тем, кто его не видит.
+func TestVoteAnnouncesRating(t *testing.T) {
+	hub := NewHub()
+	go hub.Run()
+	_, store := newTestServer(t)
+	_, token := publishSession(t, store)
+	author := mkTgUser(t, store, "999", "author", "Автор")
+	m := mkMessage(t, store, "RU", author, "текст")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /vote", handleVote(store, hub, nil))
+	voteSrv := httptest.NewServer(mux)
+	defer voteSrv.Close()
+
+	reader := &Client{send: make(chan Envelope, 8)}    // смотрит канал сообщения
+	bystander := &Client{send: make(chan Envelope, 8)} // сидит в другом канале
+	hub.subscribe <- subscription{client: reader, channels: []string{"RU"}}
+	hub.subscribe <- subscription{client: bystander, channels: []string{"DE"}}
+
+	next := func(what string) VotedData {
+		select {
+		case env := <-reader.send:
+			if env.Type != TypeVoted {
+				t.Fatalf("%s: тип кадра %q, want %q", what, env.Type, TypeVoted)
+			}
+			var d VotedData
+			mustUnmarshal(t, env.Data, &d)
+			return d
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: кадр voted не пришёл — сумма застынет до перезапуска", what)
+			return VotedData{}
+		}
+	}
+
+	vote := func(value int) {
+		t.Helper()
+		resp, body := restPostAuth(t, voteSrv.URL+"/vote", token,
+			VoteData{MessageID: m, Value: value})
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("голос %d: %d (%v)", value, resp.StatusCode, body)
+		}
+	}
+
+	vote(1)
+	if d := next("плюс"); d.MessageID != m || d.Rating != 1 {
+		t.Fatalf("плюс: voted = %+v, want message_id %d rating 1", d, m)
+	}
+	// смена знака: уведомления автору тут нет, а сумма изменилась — кадр нужен
+	vote(-1)
+	if d := next("смена знака"); d.Rating != -1 {
+		t.Fatalf("смена знака: rating = %d, want -1", d.Rating)
+	}
+	// снятие голоса: ноль — значимое значение, а не «ничего не изменилось»
+	vote(0)
+	if d := next("снятие"); d.Rating != 0 {
+		t.Fatalf("снятие: rating = %d, want 0", d.Rating)
+	}
+
+	select {
+	case env := <-bystander.send:
+		t.Fatalf("кадр уехал в чужой канал: %+v", env)
+	default:
 	}
 }

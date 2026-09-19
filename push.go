@@ -109,7 +109,7 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 //
 // Как и Notify, задумана для вызова в горутине: блокируется на HTTP к FCM, а
 // ответ на POST /vote от уведомления не зависит.
-func (p *Pusher) NotifyVote(voterID, messageID int64, n VoteNotice) {
+func (p *Pusher) NotifyVote(voterID, messageID int64, channel string, n VoteNotice) {
 	if !p.firstVoteNotice(voterID, messageID) {
 		return
 	}
@@ -121,16 +121,16 @@ func (p *Pusher) NotifyVote(voterID, messageID int64, n VoteNotice) {
 	if len(tokens) == 0 {
 		return // у автора нет устройств с включёнными пушами
 	}
-	name := p.channelName(n.Channel)
+	name := p.channelName(channel)
 	title, body := voteText(name, n.Text)
-	data := channelData(n.Channel, name)
+	data := channelData(channel, name)
 	// type отличает уведомление об отметке от уведомления о сообщении, а
 	// message_id ведёт тап к самому сообщению, а не просто в комнату.
 	data["type"] = "vote"
 	data["message_id"] = strconv.FormatInt(messageID, 10)
 	p.deliver(pushNote{
 		kind:    "vote",
-		channel: n.Channel,
+		channel: channel,
 		title:   title,
 		body:    body,
 		data:    data,
