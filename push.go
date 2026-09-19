@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -31,6 +33,17 @@ type Pusher struct {
 	ts        oauth2.TokenSource
 	http      *http.Client
 	store     *Store // нужен, чтобы вычислить получателей и убрать мёртвые токены
+
+	// Пары «проголосовавший + сообщение», о которых автора уже будили. Голос
+	// можно снять и поставить заново, и каждый раз это новая строка в votes,
+	// то есть новый повод для уведомления; запас голосов качелям не помеха —
+	// снятый голос возвращается в него целиком. Поэтому предел здесь.
+	//
+	// В памяти, а не в базе: пуш и так доставка без гарантий, а рестарт сервера
+	// в худшем случае стоит автору одного лишнего уведомления. Набор ограничен
+	// сверху сам: голоса не переживают сообщения, то есть неделю.
+	mu       sync.Mutex
+	notified map[string]struct{}
 }
 
 // NewPusher читает service-account JSON. Пустой credsFile → (nil, nil): пуши
@@ -54,6 +67,7 @@ func NewPusher(projectID, credsFile string, store *Store) (*Pusher, error) {
 		ts:        creds.TokenSource, // сам обновляет access-token по мере протухания
 		http:      &http.Client{Timeout: 10 * time.Second},
 		store:     store,
+		notified:  map[string]struct{}{},
 	}, nil
 }
 
@@ -70,24 +84,115 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 	if len(tokens) == 0 {
 		return // некому: в канале нет других устройств
 	}
+	// Имя канала — из справочника (заполняется на locate, см. Store.SaveChannels):
+	// в сообщении лежит только ID, а человеку нужно понять, откуда оно пришло.
+	// Ошибка и пустое имя равносильны: уведомление уйдёт без названия канала.
+	name := p.channelName(channelID)
+	title, body := pushText(name, sender, text)
+	p.deliver(pushNote{
+		kind:    "message",
+		channel: channelID,
+		title:   title,
+		body:    body,
+		data:    channelData(channelID, name),
+	}, tokens)
+}
+
+// NotifyVote уведомляет автора о том, что под его сообщением появилась отметка.
+// Получатель ровно один — сам автор, поэтому устройства берём напрямую
+// (Store.DeviceTokensForUser), а не через подписчиков канала.
+//
+// Знак голоса в уведомлении НЕ называется. Плюс и минус в Эфире стоят
+// одинаково, а «тебя заминусовали» в шторке — это удар в спину человеку,
+// который в приложение сейчас не смотрит; что именно случилось, видно по
+// рейтингу, когда он его откроет.
+//
+// Как и Notify, задумана для вызова в горутине: блокируется на HTTP к FCM, а
+// ответ на POST /vote от уведомления не зависит.
+func (p *Pusher) NotifyVote(voterID, messageID int64, n VoteNotice) {
+	if !p.firstVoteNotice(voterID, messageID) {
+		return
+	}
+	tokens, err := p.store.DeviceTokensForUser(n.AuthorID)
+	if err != nil {
+		slog.Error("vote push targets", "err", err, "user_id", n.AuthorID)
+		return
+	}
+	if len(tokens) == 0 {
+		return // у автора нет устройств с включёнными пушами
+	}
+	name := p.channelName(n.Channel)
+	title, body := voteText(name, n.Text)
+	data := channelData(n.Channel, name)
+	// type отличает уведомление об отметке от уведомления о сообщении, а
+	// message_id ведёт тап к самому сообщению, а не просто в комнату.
+	data["type"] = "vote"
+	data["message_id"] = strconv.FormatInt(messageID, 10)
+	p.deliver(pushNote{
+		kind:    "vote",
+		channel: n.Channel,
+		title:   title,
+		body:    body,
+		data:    data,
+	}, tokens)
+}
+
+// firstVoteNotice — «об этой паре автора ещё не будили». Второй раз по той же
+// паре отвечает false, и уведомление не уходит (см. Pusher.notified).
+func (p *Pusher) firstVoteNotice(voterID, messageID int64) bool {
+	key := strconv.FormatInt(voterID, 10) + ":" + strconv.FormatInt(messageID, 10)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, seen := p.notified[key]; seen {
+		return false
+	}
+	// Чистим не по одной записи, а разом: отдельного срока жизни у ключа нет
+	// (голоса уезжают вместе с сообщениями, и сообщать об этом сюда некому), а
+	// сброс всей карты стоит одному автору одного лишнего уведомления.
+	if len(p.notified) >= maxVoteNotices {
+		clear(p.notified)
+	}
+	p.notified[key] = struct{}{}
+	return true
+}
+
+// maxVoteNotices — потолок набора пар до сброса. 10 000 отметок — это заведомо
+// больше недели жизни голосов при нынешнем размере Эфира, то есть в норме
+// сброса не случается вовсе.
+const maxVoteNotices = 10_000
+
+// channelName — имя канала для шторки. Ошибку логируем и живём дальше: имя
+// украшает уведомление, но не решает, слать его или нет.
+func (p *Pusher) channelName(channelID string) string {
+	name, err := p.store.ChannelName(channelID)
+	if err != nil {
+		slog.Error("channel name", "err", err, "channel", channelID)
+	}
+	return name
+}
+
+// pushNote — готовое уведомление: что показать и что положить в data.
+type pushNote struct {
+	kind    string // message | vote — только для строки в логе
+	channel string
+	title   string
+	body    string
+	data    map[string]string
+}
+
+// deliver рассылает уведомление по токенам и подчищает мёртвые. Общая часть
+// Notify и NotifyVote: различаются они тем, кому и что шлют, а транспорт,
+// чистка токенов и строка в логе у них одни.
+func (p *Pusher) deliver(n pushNote, tokens []string) {
 	tok, err := p.ts.Token()
 	if err != nil {
 		slog.Error("fcm token", "err", err)
 		return
 	}
-	// Имя канала — из справочника (заполняется на locate, см. Store.SaveChannels):
-	// в сообщении лежит только ID, а человеку нужно понять, откуда оно пришло.
-	// Ошибка и пустое имя равносильны: уведомление уйдёт без названия канала.
-	name, err := p.store.ChannelName(channelID)
-	if err != nil {
-		slog.Error("channel name", "err", err, "channel", channelID)
-	}
-	title, body := pushText(name, sender, text)
-
 	var sent int
 	var stale []string
 	for _, device := range tokens {
-		switch p.sendTo(tok.AccessToken, device, title, body, channelID, name) {
+		switch p.sendTo(tok.AccessToken, device, n.title, n.body, n.data) {
 		case sendOK:
 			sent++
 		case sendStale:
@@ -100,7 +205,7 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 			slog.Error("delete stale tokens", "err", err)
 		}
 	}
-	slog.Info("fcm send", "channel", channelID, "sent", sent,
+	slog.Info("fcm send", "kind", n.kind, "channel", n.channel, "sent", sent,
 		"targets", len(tokens), "stale", len(stale))
 }
 
@@ -118,6 +223,45 @@ func pushText(channel, sender, text string) (title, body string) {
 	return channel, sender + ": " + text
 }
 
+// voteText — что автор прочитает в шторке, когда его сообщение отметили.
+// Заголовок тот же, что у уведомления о сообщении, — канал: так ОС сложит оба
+// вида в одну стопку по зоне, а не разведёт по видам события.
+//
+// Фрагмент самого сообщения в теле не для красоты: у человека в канале их
+// несколько, и «твоё сообщение отметили» без текста заставляет его искать, о
+// каком речь. Имени проголосовавшего нет намеренно — отметка анонимна и в
+// ленте (под сообщением только сумма), а в уведомлении она выдала бы соседа.
+//
+// Имя канала неизвестно (справочник о нём ещё не знает) — заголовком становится
+// имя приложения: пустая первая строка выглядит как сбой.
+func voteText(channel, text string) (title, body string) {
+	title = channel
+	if title == "" {
+		title = "Эфир"
+	}
+	if r := []rune(text); len(r) > maxVoteText {
+		text = string(r[:maxVoteText]) + "…"
+	}
+	return title, "Твоё сообщение отметили: " + text
+}
+
+// maxVoteText — сколько символов сообщения показать. Шторка всё равно обрежет
+// длинное сама, но обрезать по рунам надо нам: срез по байтам развалил бы
+// кириллицу пополам.
+const maxVoteText = 80
+
+// channelData — общая часть data у обоих видов уведомления: какую комнату
+// открыть по тапу и как её назвать. Пустое имя не кладём вовсе — клиенту
+// «поля нет» и «поле пустое» означают одно и то же, а в контракте лишнее поле
+// пришлось бы объяснять.
+func channelData(channelID, channelName string) map[string]string {
+	data := map[string]string{"channel": channelID}
+	if channelName != "" {
+		data["channel_name"] = channelName
+	}
+	return data
+}
+
 type sendResult int
 
 const (
@@ -129,26 +273,19 @@ const (
 // pushPayload — тело запроса к FCM HTTP v1 для одного устройства.
 //
 // Кроме notification (то, что человек читает в шторке) кладём data — то, что
-// читает приложение по тапу: в какой канал открывать. Без него тап приводил
-// человека просто «в приложение», и найти сообщение, о котором его позвали, он
-// должен был сам.
+// читает приложение по тапу: в какой канал открывать, а у отметки ещё и к
+// какому сообщению вести. Без него тап приводил человека просто «в приложение»,
+// и найти сообщение, о котором его позвали, он должен был сам.
 //
-// Имя канала едет рядом с ID, хотя ID достаточно, чтобы открыть комнату: пуш
-// мог догнать человека там, где он в этом канале уже не состоит, — и назвать
-// зону, в которую он не попадёт, клиенту больше нечем (в его наборе такого
-// канала нет). Значения в data у FCM всегда строки, отсюда и `channel_name`
-// строкой, а не объектом.
+// data приходит готовой (см. channelData и NotifyVote), потому что у разных
+// уведомлений она разная, а собирать её по флагам внутри значило бы держать
+// знание про виды уведомлений в слое транспорта. Значения у FCM всегда строки,
+// отсюда map[string]string, а не any.
 //
 // Отдельная функция ради теста: собранный payload — это контракт с клиентом
 // (см. ether-meta/PROTOCOL.md), и проверять его надо на JSON, а не на живом
 // HTTP к Google.
-func pushPayload(device, title, body, channelID, channelName string) []byte {
-	data := map[string]any{"channel": channelID}
-	// Пустое имя в data не кладём: клиенту пустая строка и отсутствие поля
-	// означают одно и то же, а в контракте лишнее поле пришлось бы объяснять.
-	if channelName != "" {
-		data["channel_name"] = channelName
-	}
+func pushPayload(device, title, body string, data map[string]string) []byte {
 	payload, _ := json.Marshal(map[string]any{
 		"message": map[string]any{
 			"token": device,
@@ -164,8 +301,8 @@ func pushPayload(device, title, body, channelID, channelName string) []byte {
 
 // sendTo отправляет одно уведомление на один токен устройства. title/body уже
 // готовы (см. pushText), тело — pushPayload; здесь только транспорт.
-func (p *Pusher) sendTo(accessToken, device, title, body, channelID, channelName string) sendResult {
-	payload := pushPayload(device, title, body, channelID, channelName)
+func (p *Pusher) sendTo(accessToken, device, title, body string, data map[string]string) sendResult {
+	payload := pushPayload(device, title, body, data)
 	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", p.projectID)
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	req.Header.Set("Authorization", "Bearer "+accessToken)

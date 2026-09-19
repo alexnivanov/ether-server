@@ -53,7 +53,10 @@ import (
 // hub передаётся отдельно от pub, хотя pub его и содержит: удаление своего
 // сообщения не должно отключаться заодно с публикацией. nil-хаб просто не
 // рассылает кадр (см. Hub.AnnounceRemoved).
-func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher, hub *Hub, geo Geocoder) {
+// push — тот же Pusher, что у публикации; нужен голосам (уведомление автору об
+// отметке). nil — пуши выключены в конфиге, голоса при этом работают как
+// раньше, просто молча.
+func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher, hub *Hub, geo Geocoder, push *Pusher) {
 	mux.HandleFunc("POST /account/delete", handleDeleteAccount(store))
 	// GET покрывает и HEAD — им ходят сборщики превью ссылок (см. handleAppLink)
 	mux.HandleFunc("GET /app", handleAppLink(store))
@@ -79,7 +82,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("POST /push/unregister", handlePushUnregister(store))
 	mux.HandleFunc("POST /report", handleReport(store, notify))
 	mux.HandleFunc("POST /rules/accept", handleAcceptRules(store))
-	mux.HandleFunc("POST /vote", handleVote(store))
+	mux.HandleFunc("POST /vote", handleVote(store, push))
 	mux.HandleFunc("POST /session/logout", handleLogout(store))
 	mux.HandleFunc("POST /session/resume", handleResume(store))
 	mux.HandleFunc("GET /version", handleVersion(store, gate))
@@ -924,6 +927,10 @@ func handleReport(store *Store, notify *Notifier) http.HandlerFunc {
 // Отказ 429 здесь не про частоту, а про исчерпанный запас: голоса возвращаются
 // не по таймеру, а когда отмеченные сообщения уедут по TTL, поэтому Retry-After
 // не выставляем — обещать точный срок нечем.
+//
+// Побочный эффект — уведомление автору («твоё сообщение отметили», см.
+// Pusher.NotifyVote). Уходит только на НОВОЙ отметке и в горутине: ответ
+// голосующему ждать FCM не должен.
 // handleDeleteMessage — автор удаляет своё сообщение.
 //
 // id в пути, а не в теле: у DELETE тела нет, а токен приезжает заголовком
@@ -965,7 +972,7 @@ func handleDeleteMessage(store *Store, hub *Hub) http.HandlerFunc {
 	}
 }
 
-func handleVote(store *Store) http.HandlerFunc {
+func handleVote(store *Store, push *Pusher) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var d VoteData
 		if err := json.NewDecoder(r.Body).Decode(&d); err != nil || d.MessageID <= 0 {
@@ -980,7 +987,7 @@ func handleVote(store *Store) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		st, err := store.Vote(u.ID, d.MessageID, d.Value)
+		st, notice, err := store.Vote(u.ID, d.MessageID, d.Value)
 		switch {
 		case errors.Is(err, ErrMessageGone):
 			writeRESTError(w, http.StatusNotFound, "not_found",
@@ -998,6 +1005,12 @@ func handleVote(store *Store) http.HandlerFunc {
 			slog.Error("vote", "err", err, "message_id", d.MessageID, "user_id", u.ID)
 			writeRESTError(w, http.StatusInternalServerError, "internal", "Не удалось учесть голос")
 			return
+		}
+		// Уведомление автору — только на новой отметке (notice != nil, см.
+		// Store.Vote) и асинхронно: HTTP к FCM не должен задерживать ответ тому,
+		// кто голосует.
+		if push != nil && notice != nil {
+			go push.NotifyVote(u.ID, d.MessageID, *notice)
 		}
 		writeJSON(w, http.StatusOK, VoteResultData{
 			MessageID: d.MessageID,

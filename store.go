@@ -1175,6 +1175,20 @@ type VoteState struct {
 	VotesLeft int // сколько голосов у него осталось
 }
 
+// VoteNotice — данные, чтобы уведомить автора о новой отметке под его
+// сообщением: кому слать, в каком канале и что он там написал (текст нужен
+// самому уведомлению — по одному «твоё сообщение отметили» автор не поймёт, о
+// каком из них речь).
+//
+// Vote возвращает его ТОЛЬКО когда голос появился, то есть на вставке строки.
+// Смена знака и снятие голоса — правка прежней реакции, а не новая: будить
+// автора второй раз тем же человеком не за что.
+type VoteNotice struct {
+	AuthorID int64
+	Channel  string
+	Text     string
+}
+
 // rowQuerier — общее у *sql.DB и *sql.Tx: состояние голоса читается и внутри
 // транзакции Vote, и снаружи.
 type rowQuerier interface {
@@ -1190,23 +1204,29 @@ type rowQuerier interface {
 //
 // Всё одной транзакцией: между проверкой запаса и вставкой не должно влезть
 // второе нажатие с другого устройства.
-func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, error) {
+// Второй результат — уведомление автору (nil, если будить его не за что);
+// подробности в VoteNotice.
+func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, *VoteNotice, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return VoteState{}, err
+		return VoteState{}, nil, err
 	}
 	defer tx.Rollback()
 
+	// Канал и текст берём тем же запросом, что и автора: они нужны уведомлению,
+	// а отдельное обращение к messages ради них — лишний проход по той же строке.
 	var authorID int64
-	err = tx.QueryRow(`SELECT user_id FROM messages WHERE id = ?`, messageID).Scan(&authorID)
+	var channel, text string
+	err = tx.QueryRow(`SELECT user_id, channel, text FROM messages WHERE id = ?`, messageID).
+		Scan(&authorID, &channel, &text)
 	if errors.Is(err, sql.ErrNoRows) {
-		return VoteState{}, ErrMessageGone
+		return VoteState{}, nil, ErrMessageGone
 	}
 	if err != nil {
-		return VoteState{}, err
+		return VoteState{}, nil, err
 	}
 	if authorID == voterID {
-		return VoteState{}, ErrSelfVote
+		return VoteState{}, nil, ErrSelfVote
 	}
 
 	// have остаётся нулём, если строки нет: сохранённый голос нулевым не бывает,
@@ -1215,46 +1235,52 @@ func (s *Store) Vote(voterID, messageID int64, value int) (VoteState, error) {
 	err = tx.QueryRow(`SELECT value FROM votes WHERE voter_user_id = ? AND message_id = ?`,
 		voterID, messageID).Scan(&have)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return VoteState{}, err
+		return VoteState{}, nil, err
 	}
 
+	var notice *VoteNotice
 	now := time.Now().UnixMilli()
 	switch {
 	case value == 0:
 		if _, err := tx.Exec(
 			`DELETE FROM votes WHERE voter_user_id = ? AND message_id = ?`,
 			voterID, messageID); err != nil {
-			return VoteState{}, err
+			return VoteState{}, nil, err
 		}
 	case have != 0:
 		if _, err := tx.Exec(
 			`UPDATE votes SET value = ?, created_at = ?
 				WHERE voter_user_id = ? AND message_id = ?`,
 			value, now, voterID, messageID); err != nil {
-			return VoteState{}, err
+			return VoteState{}, nil, err
 		}
 	default:
 		var spent int
 		if err := tx.QueryRow(
 			`SELECT COUNT(*) FROM votes WHERE voter_user_id = ?`, voterID).Scan(&spent); err != nil {
-			return VoteState{}, err
+			return VoteState{}, nil, err
 		}
 		if spent >= voteBudget {
-			return VoteState{}, ErrNoVotesLeft
+			return VoteState{}, nil, ErrNoVotesLeft
 		}
 		if _, err := tx.Exec(
 			`INSERT INTO votes (voter_user_id, message_id, author_user_id, value, created_at)
 				VALUES (?, ?, ?, ?, ?)`,
 			voterID, messageID, authorID, value, now); err != nil {
-			return VoteState{}, err
+			return VoteState{}, nil, err
 		}
+		notice = &VoteNotice{AuthorID: authorID, Channel: channel, Text: text}
 	}
 
 	st, err := voteState(tx, voterID, messageID)
 	if err != nil {
-		return VoteState{}, err
+		return VoteState{}, nil, err
 	}
-	return st, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		// Уведомление о голосе, который не сохранился, — обещание того, чего нет
+		return VoteState{}, nil, err
+	}
+	return st, notice, nil
 }
 
 func voteState(q rowQuerier, voterID, messageID int64) (VoteState, error) {
@@ -1776,6 +1802,31 @@ func (s *Store) PushTargets(channel string, exceptUserID int64) ([]string, error
 		WHERE uc.channel = ? AND uc.user_id != ?
 		  AND uc.user_id NOT IN (SELECT blocker_user_id FROM blocks WHERE blocked_user_id = ?)`,
 		channel, exceptUserID, exceptUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// DeviceTokensForUser — токены устройств одного человека. Нужны уведомлению об
+// отметке под его сообщением: получатель там ровно один, и путь через
+// PushTargets не годится — тот считает подписчиков канала и автора как раз
+// ИСКЛЮЧАЕТ.
+//
+// Блокировки здесь не при чём: в уведомлении нет ни имени проголосовавшего, ни
+// его сообщения, так что заблокированный ничего автору не «передаёт».
+func (s *Store) DeviceTokensForUser(userID int64) ([]string, error) {
+	rows, err := s.db.Query(
+		`SELECT fcm_token FROM device_tokens WHERE user_id = ?`, userID)
 	if err != nil {
 		return nil, err
 	}
