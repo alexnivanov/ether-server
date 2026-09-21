@@ -148,7 +148,12 @@ func (c *Client) readPump() {
 			}
 			chans, err := c.geo.Channels(d.Lat, d.Lng)
 			if err != nil {
-				c.sendError("geocode_failed", err.Error())
+				// Сырой текст ошибки наружу не отдаём: в приложении он
+				// показывался человеку как есть («nominatim: ошибка в ответе:
+				// "Unable to geocode"»). Причина нужна нам, а не ему: она уходит в лог.
+				slog.Warn("locate: geocode", "err", err, "lat", d.Lat, "lng", d.Lng)
+				code, msg := geocodeFailure(err)
+				c.sendError(code, msg)
 				continue
 			}
 			ids := make([]string, 0, len(chans))

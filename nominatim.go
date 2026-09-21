@@ -73,6 +73,27 @@ func geocodeErrLabel(err error) string {
 	return geocodeErrOther
 }
 
+// geocodeFailure — отказ геокодера в кадре `error`: код и текст для человека.
+//
+// Кодов два, и различает их не причина сама по себе, а то, что клиенту с ней
+// делать. `no_place` — в этой точке геокодировать нечего: Nominatim ответил
+// 200 с «Unable to geocode» (открытая вода, полюс) либо координаты вообще вне
+// диапазона; повтор вернёт ровно то же, и выход единственный — другая точка.
+// `geocode_failed` — Nominatim не ответил (таймаут, лимит 1 req/s, 5xx): та же
+// точка через секунду отвечает нормально, и повторить имеет смысл.
+//
+// Без этого различия клиент повторял locate вечно: сторож ответа не отличал
+// отказ от молчания и через два таймаута шёл пересобирать соединение, показывая
+// «Переподключение…» на живой связи.
+func geocodeFailure(err error) (code, message string) {
+	switch geocodeErrLabel(err) {
+	case geocodeErrNominatim, geocodeErrBadCoords:
+		return "no_place", "В этой точке нет ни адресов, ни границ: выбери место поближе к жилью"
+	default:
+		return "geocode_failed", "Не удалось определить каналы, попробуй ещё раз"
+	}
+}
+
 // NominatimGeocoder — порт логики из ether-research/nominatim_hierarchy.js.
 // Подход: 1 reverse (находит самую локальную точку) + 1 /details (отдаёт всю
 // цепочку родителей с osm_id и нормализованным rank_address). Из цепочки слоты

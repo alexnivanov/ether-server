@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -108,6 +109,38 @@ func TestGeocodeErrLabel(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			if got := geocodeErrLabel(c.err); got != c.want {
 				t.Errorf("geocodeErrLabel(%v) = %q, want %q", c.err, got, c.want)
+			}
+		})
+	}
+}
+
+// TestGeocodeFailure — по какому коду клиент решает, повторять ли locate.
+// Ошибок у геокодера много, а решений у клиента два, и перепутать их дорого:
+// на `geocode_failed` он повторяет, и точка, которой нет на карте, крутила бы
+// повтор вечно; на `no_place` он сразу зовёт выбрать другое место, и временный
+// таймаут Nominatim выглядел бы как «здесь ничего нет».
+func TestGeocodeFailure(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"точки нет на карте", fmt.Errorf("%w: %s", errNomPayload, "Unable to geocode"), "no_place"},
+		{"координаты вне диапазона", fmt.Errorf("%w: lat=91", errBadCoords), "no_place"},
+		{"лимит публичного сервера", nomHTTPError{429}, "geocode_failed"},
+		{"сеть не дошла", &url.Error{Op: "Get", Err: errors.New("connection refused")}, "geocode_failed"},
+		{"неизвестная ошибка", errors.New("что-то своё"), "geocode_failed"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, msg := geocodeFailure(c.err)
+			if code != c.want {
+				t.Errorf("code = %q, want %q", code, c.want)
+			}
+			// Текст ошибки геокодера наружу не уходит: человеку он ничего не
+			// объясняет, а выглядит как сломавшееся приложение.
+			if strings.Contains(msg, "nominatim") || msg == c.err.Error() {
+				t.Errorf("message = %q — это сырая ошибка, а не текст для человека", msg)
 			}
 		})
 	}
