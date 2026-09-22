@@ -78,6 +78,9 @@ SSH_HOST=ether scripts/deploy.sh
 > `resume` — то есть встанет на сплэше; вошедшая заново читает ленту, а на
 > отправку получает `error upgrade_required` с текстом «Обнови Эфир».
 
+**Рестарт руками**: `sudo systemctl restart ether-server` — нужен, когда бинарник
+тот же, а поменялся конфиг (`/etc/ether/config.prod.yaml`) или процесс завис;
+ради новой версии его звать не надо, `deploy.sh` рестартит сам.
 **Логи**: `sudo journalctl -u ether-server -f`.
 **Сброс базы**: команды в [`scripts/reset-db-prod.sh`](./scripts/reset-db-prod.sh)
 (запускать руками на сервере — стирает всех пользователей, сессии и сообщения).
