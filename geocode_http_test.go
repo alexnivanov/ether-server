@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -118,6 +119,25 @@ func TestGeocodeEndpointRateLimit(t *testing.T) {
 	// Отбитый запрос до геокодера не дошёл — ради этого лимит и стоит.
 	if geo.count() != 2 {
 		t.Errorf("геокодер позвали %d раз, want 2", geo.count())
+	}
+}
+
+// TestGeocodeEndpointNoPlace — точка, по которой геокодировать нечего, это 404,
+// а не 502: клиент спрашивает эндпоинт ровно затем, чтобы не пустить человека
+// дальше с такой точкой, и «повтори запрос» тут был бы ложным советом.
+func TestGeocodeEndpointNoPlace(t *testing.T) {
+	geo := &countingGeocoder{err: fmt.Errorf("%w: %s", errNomPayload, "Unable to geocode")}
+	srv := geocodeServer(t, geo, geocodeIPLimit)
+
+	resp, err := http.Get(srv.URL + "/geocode?lat=0&lng=-40")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	var body map[string]any
+	json.NewDecoder(resp.Body).Decode(&body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound || body["code"] != "no_place" {
+		t.Fatalf("= %d %v, want 404 no_place", resp.StatusCode, body)
 	}
 }
 
