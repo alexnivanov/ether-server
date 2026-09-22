@@ -547,16 +547,8 @@ func handleGeocode(geo Geocoder, ips *ipLimiter) http.HandlerFunc {
 		chans, err := geo.Channels(lat, lng)
 		if err != nil {
 			slog.Error("geocode: http", "err", err)
-			code, msg := geocodeFailure(err)
-			// `no_place` — не сбой шлюза, а честный ответ «по этой точке
-			// ничего нет»: спрашивали открытую воду. 502 сказало бы, что
-			// виноват Nominatim, и звало бы повторить запрос, которому
-			// неоткуда стать успешным.
-			status := http.StatusBadGateway
-			if code == "no_place" {
-				status = http.StatusNotFound
-			}
-			writeRESTError(w, status, code, msg)
+			writeRESTError(w, http.StatusBadGateway, "geocode_failed",
+				"Не удалось определить каналы")
 			return
 		}
 		writeJSON(w, http.StatusOK, LocatedData{Channels: chans})

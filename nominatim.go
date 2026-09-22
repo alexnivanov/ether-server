@@ -73,27 +73,6 @@ func geocodeErrLabel(err error) string {
 	return geocodeErrOther
 }
 
-// geocodeFailure — отказ геокодера в кадре `error`: код и текст для человека.
-//
-// Кодов два, и различает их не причина сама по себе, а то, что клиенту с ней
-// делать. `no_place` — в этой точке геокодировать нечего: Nominatim ответил
-// 200 с «Unable to geocode» (открытая вода, полюс) либо координаты вообще вне
-// диапазона; повтор вернёт ровно то же, и выход единственный — другая точка.
-// `geocode_failed` — Nominatim не ответил (таймаут, лимит 1 req/s, 5xx): та же
-// точка через секунду отвечает нормально, и повторить имеет смысл.
-//
-// Без этого различия клиент повторял locate вечно: сторож ответа не отличал
-// отказ от молчания и через два таймаута шёл пересобирать соединение, показывая
-// «Переподключение…» на живой связи.
-func geocodeFailure(err error) (code, message string) {
-	switch geocodeErrLabel(err) {
-	case geocodeErrNominatim, geocodeErrBadCoords:
-		return "no_place", "В этой точке нет ни адресов, ни границ: выбери место поближе к жилью"
-	default:
-		return "geocode_failed", "Не удалось определить каналы, попробуй ещё раз"
-	}
-}
-
 // NominatimGeocoder — порт логики из ether-research/nominatim_hierarchy.js.
 // Подход: 1 reverse (находит самую локальную точку) + 1 /details (отдаёт всю
 // цепочку родителей с osm_id и нормализованным rank_address). Из цепочки слоты
@@ -340,6 +319,19 @@ func (g *NominatimGeocoder) Channels(lat, lng float64) ([]Channel, error) {
 
 	rev, err := g.reverse(lat, lng)
 	if err != nil {
+		// «Unable to geocode» (200 с полем error) значит, что в точке нет ни
+		// одной административной единицы: открытая вода, полюс. Это не сбой, и
+		// отказом отвечать нельзя — человек в море в Эфире есть, просто каналов
+		// у него ровно один. Пока тут была ошибка, клиент повторял locate
+		// вечно, а точка успевала сохраниться как своя и встречала его тем же
+		// отказом после перезапуска.
+		//
+		// Только на reverse: у /details ниже такой же ответ означал бы, что
+		// место нашлось, а его иерархию мы не получили, и подменять её Планетой
+		// значит молча отнять у человека настоящие каналы.
+		if errors.Is(err, errNomPayload) {
+			return []Channel{PlanetChannel}, nil
+		}
 		return nil, err
 	}
 	levels, err := g.details(rev.OSMType, rev.OSMID)
