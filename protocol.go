@@ -20,6 +20,7 @@ const (
 	TypeMessage = "message" // {id, channel, sender_id, sender, username, avatar_url, text, ts}
 	TypeRemoved = "removed" // {message_id} | {user_id} — модератор убрал контент
 	TypeVoted   = "voted"   // {message_id, rating} — сумма под сообщением изменилась
+	TypeEdited  = "edited"  // {message_id, text, edited_at} — автор поправил текст
 	TypeError   = "error"   // {code, message}
 )
 
@@ -116,6 +117,10 @@ type MessageData struct {
 	AvatarURL string `json:"avatar_url,omitempty"`
 	Text      string `json:"text"`
 	TS        int64  `json:"ts"`
+	// EditedAt — когда автор последний раз поправил текст (unix-мс); 0 и
+	// отсутствие поля — не правил. Клиенту нужен сам факт (пометка «изм.»),
+	// поэтому omitempty: у непоправленного сообщения поля нет вовсе.
+	EditedAt int64 `json:"edited_at,omitempty"`
 	// Rating — сумма голосов под сообщением (плюс и минус стоят одинаково).
 	// omitempty намеренно: нуля клиент не показывает, а «нет голосов» и «плюс с
 	// минусом погасились» для читателя одно и то же — информации в нуле нет.
@@ -184,6 +189,25 @@ type VotedData struct {
 	// друга или последний сняли), и пропажа поля прочиталась бы клиентом как
 	// «сумма не менялась».
 	Rating int `json:"rating"`
+}
+
+// EditData — тело PATCH /messages/{id}: новый текст. Какое сообщение, видно из
+// пути, чьё — из токена сессии.
+type EditData struct {
+	Text string `json:"text"`
+}
+
+// EditedData — автор поправил текст сообщения. Это и ответ на PATCH
+// /messages/{id}, и кадр `edited` подписчикам канала: одно и то же событие,
+// поэтому и форма одна.
+//
+// Кадр нужен по той же причине, что `removed` и `voted`: открытые ленты историю
+// не перезапрашивают, и без него правка доезжала бы до читателей только после
+// перезапуска приложения.
+type EditedData struct {
+	MessageID int64  `json:"message_id"`
+	Text      string `json:"text"`
+	EditedAt  int64  `json:"edited_at"`
 }
 
 // HealthData — тело ответа GET /health: то, что нужно внешнему пингеру и

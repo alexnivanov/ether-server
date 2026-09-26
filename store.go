@@ -118,7 +118,11 @@ CREATE TABLE IF NOT EXISTS messages (
 	-- id отправки, придуманный клиентом: делает повтор запроса идемпотентным
 	-- (см. publisher.publish). Пусто — идемпотентности нет: так пишет WS-кадр,
 	-- старые сборки про это поле не знают.
-	client_msg_id TEXT NOT NULL DEFAULT ''
+	client_msg_id TEXT NOT NULL DEFAULT '',
+	-- когда автор последний раз правил текст (unix-миллисекунды); 0 — не правил.
+	-- Время, а не флаг: клиент показывает только «изм.», но момент правки
+	-- пригодится модерации, если отредактированное сообщение станет спорным.
+	edited_at INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
 -- под уборку старых сообщений по TTL (DeleteMessagesOlderThan)
@@ -469,7 +473,7 @@ func OpenStore(path string) (*Store, error) {
 
 // schemaVersion — на какую версию схемы рассчитан этот бинарник. Поднимать
 // ВМЕСТЕ с добавлением шага в migrations, иначе шаг не выполнится.
-const schemaVersion = 1
+const schemaVersion = 2
 
 // migrations — шаги по версиям: индекс это версия, НА которую шаг переводит
 // базу. Ноль не используется: версия 0 — база, не знавшая миграций вовсе.
@@ -492,6 +496,11 @@ var migrations = [][]string{
 	// идемпотентным.
 	1: {
 		`ALTER TABLE messages ADD COLUMN client_msg_id TEXT NOT NULL DEFAULT ''`,
+	},
+	// edited_at — под PATCH /messages/{id} (см. EditOwnMessage): правка своего
+	// сообщения и пометка «изм.» у клиента.
+	2: {
+		`ALTER TABLE messages ADD COLUMN edited_at INTEGER NOT NULL DEFAULT 0`,
 	},
 }
 
@@ -931,11 +940,12 @@ func (s *Store) BlockedBy(userID int64) ([]int64, error) {
 // действительно сохранено и разослано. Иначе клиент, переиспользовавший id с
 // другим текстом, получил бы 200 про сообщение, которого не существует.
 type savedMessage struct {
-	exists  bool
-	id      int64
-	ts      int64
-	channel string
-	text    string
+	exists   bool
+	id       int64
+	ts       int64
+	channel  string
+	text     string
+	editedAt int64
 }
 
 // SaveMessage пишет сообщение в историю. clientMsgID делает повтор
@@ -979,9 +989,9 @@ func (s *Store) MessageByClientMsgID(userID int64, clientMsgID string) (savedMes
 	}
 	var m savedMessage
 	err := s.db.QueryRow(`
-		SELECT id, ts, channel, text FROM messages
+		SELECT id, ts, channel, text, edited_at FROM messages
 		WHERE user_id = ? AND client_msg_id = ?`,
-		userID, clientMsgID).Scan(&m.id, &m.ts, &m.channel, &m.text)
+		userID, clientMsgID).Scan(&m.id, &m.ts, &m.channel, &m.text, &m.editedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return savedMessage{}, nil
 	}
@@ -1029,7 +1039,7 @@ func (s *Store) History(channel string, beforeID int64, limit int, viewerID int6
 	// сообщением и свой голос смотрящего (0 у не вошедшего — viewerID тогда 0 и
 	// не совпадёт ни с кем). Подзапросы, а не GROUP BY по всей таблице: строк тут
 	// не больше maxHistoryLimit, и каждая идёт по индексу.
-	q := `SELECT m.id, m.channel, m.user_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts,
+	q := `SELECT m.id, m.channel, m.user_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts, m.edited_at,
 			(SELECT COALESCE(SUM(value), 0) FROM votes WHERE message_id = m.id),
 			COALESCE((SELECT value FROM votes WHERE message_id = m.id AND voter_user_id = ?), 0)
 		FROM messages m LEFT JOIN users u ON u.id = m.user_id
@@ -1057,7 +1067,7 @@ func (s *Store) History(channel string, beforeID int64, limit int, viewerID int6
 		var m MessageData
 		if err := rows.Scan(
 			&m.ID, &m.Channel, &m.SenderID, &m.Sender, &m.Username,
-			&m.AvatarURL, &m.Text, &m.TS, &m.Rating, &m.MyVote,
+			&m.AvatarURL, &m.Text, &m.TS, &m.EditedAt, &m.Rating, &m.MyVote,
 		); err != nil {
 			return nil, err
 		}
@@ -1129,6 +1139,80 @@ func (s *Store) DeleteOwnMessage(authorID, messageID int64) (bool, error) {
 		return false, err
 	}
 	return false, ErrNotAuthor
+}
+
+// editWindow — сколько после отправки автор может править своё сообщение.
+// Окно короткое намеренно: его хватает на опечатку, но не на то, чтобы задним
+// числом переписать реплику, под которой уже голосовали и отвечали. Голоса
+// при правке остаются на месте, и держится это ровно на коротком окне (плюс
+// пометке «изм.» у клиента): иначе плюсы, собранные одним текстом, доставались
+// бы другому.
+const editWindow = 15 * time.Minute
+
+// ErrEditExpired — окно правки прошло (см. editWindow).
+var ErrEditExpired = errors.New("окно правки прошло")
+
+// EditOutcome — что стало с сообщением после правки. Channel нужен рассылке
+// (кадр `edited` уходит подписчикам канала), Changed — была ли правка вообще:
+// повтор того же текста ничего не меняет, и рассылать тогда нечего.
+type EditOutcome struct {
+	Channel  string
+	Text     string
+	EditedAt int64
+	Changed  bool
+}
+
+// EditOwnMessage меняет текст сообщения автора, если окно правки не прошло.
+//
+// Отказы: ErrMessageGone (сообщения нет: удалено или уехало по TTL),
+// ErrNotAuthor (чужое), ErrEditExpired (поздно). Порядок проверок такой же, как
+// их видит человек: про чужое сообщение незачем говорить «поздно».
+//
+// Тот же текст — успех без изменений (Changed == false, edited_at прежний).
+// Это повтор запроса, не дошедшего ответом, и отвечать на него надо тем же
+// состоянием, а не двигать время правки и не рассылать кадр второй раз.
+//
+// Одной транзакцией, как Vote: между проверкой автора и окна и самой записью
+// строку может унести уборка по TTL или удаление с другого устройства.
+//
+// Жалобы правка не трогает: в reports лежит копия текста на момент жалобы (см.
+// ReportMessage), иначе правкой стирали бы улику так же, как удалением.
+func (s *Store) EditOwnMessage(authorID, messageID int64, text string, now time.Time) (EditOutcome, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return EditOutcome{}, err
+	}
+	defer tx.Rollback()
+
+	var owner, ts, editedAt int64
+	var out EditOutcome
+	err = tx.QueryRow(`SELECT user_id, channel, text, ts, edited_at FROM messages WHERE id = ?`, messageID).
+		Scan(&owner, &out.Channel, &out.Text, &ts, &editedAt)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return EditOutcome{}, ErrMessageGone
+	case err != nil:
+		return EditOutcome{}, err
+	case owner != authorID:
+		return EditOutcome{}, ErrNotAuthor
+	}
+	// Повтор проверяем раньше окна: ответ на «дошла ли правка» не должен
+	// зависеть от того, успел ли повтор до конца окна.
+	if out.Text == text {
+		out.EditedAt = editedAt
+		return out, nil
+	}
+	if now.Sub(time.UnixMilli(ts)) > editWindow {
+		return EditOutcome{}, ErrEditExpired
+	}
+	out.Text = text
+	out.EditedAt = now.UnixMilli()
+	out.Changed = true
+	if _, err := tx.Exec(`UPDATE messages SET text = ?, edited_at = ? WHERE id = ?`,
+		out.Text, out.EditedAt, messageID); err != nil {
+		return EditOutcome{}, err
+	}
+	return out, tx.Commit()
 }
 
 // DeleteUserMessages удаляет все сообщения пользователя и возвращает их число —

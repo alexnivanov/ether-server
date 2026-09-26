@@ -71,6 +71,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("GET /blocked", handleBlocked(store))
 	// /messages — один ресурс: читаем коллекцию и добавляем в неё
 	mux.HandleFunc("DELETE /messages/{id}", handleDeleteMessage(store, hub))
+	mux.HandleFunc("PATCH /messages/{id}", handleEditMessage(store, hub))
 	mux.HandleFunc("GET /messages", handleHistory(store))
 	mux.HandleFunc("POST /messages", handlePublish(store, pub))
 	mux.HandleFunc("POST /profile/name", handleSetName(store))
@@ -969,6 +970,71 @@ func handleDeleteMessage(store *Store, hub *Hub) http.HandlerFunc {
 			hub.AnnounceRemoved(RemovedData{MessageID: id})
 		}
 		writeJSON(w, http.StatusOK, struct{}{})
+	}
+}
+
+// handleEditMessage — PATCH /messages/{id} {text} (токен — заголовком) →
+// 200 {message_id, text, edited_at} | 401 bad_session | 403 forbidden (чужое) |
+// 403 edit_expired (окно правки прошло) | 403 banned | 404 not_found |
+// 400 bad_data — автор правит своё сообщение.
+//
+// PATCH, а не PUT: меняется одно поле ресурса, остальное (канал, автор, время)
+// остаётся как было. Повтор того же текста — 200 с тем же состоянием и без
+// рассылки (см. Store.EditOwnMessage), так что ретрай после обрыва безопасен.
+//
+// Мьют правку запрещает так же, как отправку: иначе замьюченный переписал бы
+// свои свежие сообщения в то, за что его и замьютили.
+func handleEditMessage(store *Store, hub *Hub) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil || id <= 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "Нужен id сообщения")
+			return
+		}
+		var d EditData
+		if err := json.NewDecoder(r.Body).Decode(&d); err != nil ||
+			d.Text == "" || len(d.Text) > maxMessageLen {
+			writeRESTError(w, http.StatusBadRequest, "bad_data",
+				fmt.Sprintf("Текст должен быть от 1 до %d байт", maxMessageLen))
+			return
+		}
+		u, ok := sessionUser(w, r, store, "токен сессии")
+		if !ok {
+			return
+		}
+		if banned, until, permanent, reason, err := store.BanStatus(u.ID); err != nil {
+			slog.Error("ban check", "err", err, "user_id", u.ID)
+		} else if banned {
+			writeRESTError(w, http.StatusForbidden, "banned", BanMessage(until, permanent, reason))
+			return
+		}
+		out, err := store.EditOwnMessage(u.ID, id, d.Text, time.Now())
+		switch {
+		case errors.Is(err, ErrMessageGone):
+			writeRESTError(w, http.StatusNotFound, "not_found",
+				"Сообщение не найдено — возможно, оно уже удалено")
+			return
+		case errors.Is(err, ErrNotAuthor):
+			writeRESTError(w, http.StatusForbidden, "forbidden",
+				"Изменить можно только своё сообщение")
+			return
+		case errors.Is(err, ErrEditExpired):
+			writeRESTError(w, http.StatusForbidden, "edit_expired",
+				fmt.Sprintf("Сообщение можно изменить в течение %d минут после отправки",
+					int(editWindow.Minutes())))
+			return
+		case err != nil:
+			slog.Error("edit message", "err", err, "message_id", id, "user_id", u.ID)
+			writeRESTError(w, http.StatusInternalServerError, "internal",
+				"Не удалось изменить сообщение")
+			return
+		}
+		res := EditedData{MessageID: id, Text: out.Text, EditedAt: out.EditedAt}
+		// Кадр только на настоящей правке: на повторе у читателей уже тот же текст.
+		if out.Changed {
+			hub.AnnounceEdited(out.Channel, res)
+		}
+		writeJSON(w, http.StatusOK, res)
 	}
 }
 

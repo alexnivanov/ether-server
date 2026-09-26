@@ -77,6 +77,15 @@ func (h *Hub) AnnounceVoted(channel string, d VotedData) {
 	h.announceIn <- channelFrame{channel: channel, env: envelope(TypeVoted, d)}
 }
 
+// AnnounceEdited говорит подписчикам канала, что автор поправил текст
+// сообщения. nil-хаб молча ничего не делает — как и у AnnounceRemoved.
+func (h *Hub) AnnounceEdited(channel string, d EditedData) {
+	if h == nil {
+		return
+	}
+	h.announceIn <- channelFrame{channel: channel, env: envelope(TypeEdited, d)}
+}
+
 func (h *Hub) Run() {
 	for {
 		select {

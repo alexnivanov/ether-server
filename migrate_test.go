@@ -78,8 +78,8 @@ func TestMigrateFreshDB(t *testing.T) {
 	if got := userVersion(t, s.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
 	}
-	if cols := columns(t, s.db, "messages"); !cols["client_msg_id"] {
-		t.Errorf("в свежей базе нет колонки версии 1: %v", cols)
+	if cols := columns(t, s.db, "messages"); !cols["client_msg_id"] || !cols["edited_at"] {
+		t.Errorf("в свежей базе нет колонок версий 1 и 2: %v", cols)
 	}
 }
 
@@ -100,8 +100,8 @@ func TestMigrateLegacyDB(t *testing.T) {
 	if got := userVersion(t, store.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
 	}
-	if cols := columns(t, store.db, "messages"); !cols["client_msg_id"] {
-		t.Errorf("миграция не добавила колонку: %v", cols)
+	if cols := columns(t, store.db, "messages"); !cols["client_msg_id"] || !cols["edited_at"] {
+		t.Errorf("миграция не добавила колонки: %v", cols)
 	}
 	var text, clientMsgID string
 	if err := store.db.QueryRow(

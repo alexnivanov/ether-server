@@ -287,5 +287,6 @@ func storedMessage(a publishAuthor, dup savedMessage) MessageData {
 		AvatarURL: a.AvatarURL,
 		Text:      dup.text,
 		TS:        dup.ts,
+		EditedAt:  dup.editedAt,
 	}
 }
