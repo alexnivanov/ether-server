@@ -95,32 +95,50 @@ func TestUnitTitle(t *testing.T) {
 			slotLabel: "Квартал", wantLabel: "Квартал", wantName: "Bahnhofsviertel",
 		},
 		{
+			name:      "местность по тегу place",
+			entry:     nomAddressEntry{LocalName: "Мандрыковка", Class: "place", Type: "locality"},
+			slotLabel: "Район", wantLabel: "Местность", wantName: "Мандрыковка",
+		},
+		{
 			// Дыра в словаре типов: подпись слота могла оказаться неправдой,
 			// и слово дописывается в placeLabels одной строкой.
 			name:      "незнакомый тип place — в список пробелов",
-			entry:     nomAddressEntry{LocalName: "Пустошь", Class: "place", Type: "locality"},
+			entry:     nomAddressEntry{LocalName: "Пустошь", Class: "place", Type: "isolated_dwelling"},
 			slotLabel: "Район", wantLabel: "Район", wantName: "Пустошь", wantGap: true,
 		},
 		{
-			// Дыра в правиле, а не в словаре: тип стоит в конце имени, а ищем
-			// мы его в начале. Превратить в подпись нельзя, не решив, что
-			// делать с прилагательным, — поэтому в список, а не в label.
-			name:      "типовое слово в конце имени — в список пробелов",
-			entry:     nomAddressEntry{LocalName: "Клинский район", Class: "boundary", Type: "administrative", AdminLevel: 6},
-			slotLabel: "Город", wantLabel: "Город", wantName: "Клинский район", wantGap: true,
+			// Незнакомый тег, но тип назван в имени — пробела нет.
+			name:      "незнакомый тип place с типом в конце имени — подпись из имени",
+			entry:     nomAddressEntry{LocalName: "Пригородный район", Class: "place", Type: "isolated_dwelling"},
+			slotLabel: "Район", wantLabel: "Район", wantName: "Пригородный район",
 		},
 		{
-			// Суффикс совпал с подписью слота — чинить нечего, и в список это
-			// не идёт: иначе «Московская область» заняла бы его целиком.
-			name:      "суффикс совпадает с подписью слота — не пробел",
+			// Тип в конце имени становится подписью, но из имени не вырезается:
+			// «Клинский» без «района» — обрубок.
+			name:      "типовое слово в конце имени — подпись, имя целиком",
+			entry:     nomAddressEntry{LocalName: "Клинский район", Class: "boundary", Type: "administrative", AdminLevel: 6},
+			slotLabel: "Город", wantLabel: "Район", wantName: "Клинский район",
+		},
+		{
+			name:      "суффикс совпадает с подписью слота",
 			entry:     nomAddressEntry{LocalName: "Московская область", Class: "boundary", Type: "administrative", AdminLevel: 4},
 			slotLabel: "Область", wantLabel: "Область", wantName: "Московская область",
 		},
 		{
-			// А тут слово другое: «Край» точнее «Области», это настоящий пробел.
-			name:      "край в слоте Области — пробел",
-			entry:     nomAddressEntry{LocalName: "Краснодарский край", Class: "boundary", Type: "administrative", AdminLevel: 4},
-			slotLabel: "Область", wantLabel: "Область", wantName: "Краснодарский край", wantGap: true,
+			name:      "край в слоте Области",
+			entry:     nomAddressEntry{LocalName: "Забайкальский край", Class: "boundary", Type: "administrative", AdminLevel: 4},
+			slotLabel: "Область", wantLabel: "Край", wantName: "Забайкальский край",
+		},
+		{
+			// Муниципальный округ Петербурга в слоте Района.
+			name:      "округ в слоте Района",
+			entry:     nomAddressEntry{LocalName: "Сенной округ", Class: "boundary", Type: "administrative", AdminLevel: 8},
+			slotLabel: "Район", wantLabel: "Округ", wantName: "Сенной округ",
+		},
+		{
+			name:      "длинный суффикс примеряется раньше короткого",
+			entry:     nomAddressEntry{LocalName: "Одинцовский городской округ", Class: "boundary", Type: "administrative", AdminLevel: 6},
+			slotLabel: "Город", wantLabel: "Городской округ", wantName: "Одинцовский городской округ",
 		},
 	}
 	for _, c := range cases {
@@ -150,7 +168,7 @@ func TestUnitTitleKeepsNameWhenNothingLeft(t *testing.T) {
 // счётчик, а не плодит строки, и после правки словаря список сам пустеет.
 func TestUnmappedUnitStore(t *testing.T) {
 	store := openTestStore(t)
-	gap := unitGap{Class: "place", Type: "locality", Name: "Пустошь"}
+	gap := unitGap{Class: "place", Type: "isolated_dwelling", Name: "Пустошь"}
 
 	for i := 0; i < 3; i++ {
 		if err := store.SaveUnmappedUnit(gap, "district", "RU"); err != nil {
@@ -165,7 +183,7 @@ func TestUnmappedUnitStore(t *testing.T) {
 	if len(rows.UnmappedUnits) != 1 || rows.UnmappedUnits[0].Count != 3 {
 		t.Fatalf("список = %+v, want одна строка со счётчиком 3", rows.UnmappedUnits)
 	}
-	if got := rows.UnmappedUnits[0].Key; !strings.Contains(got, "locality") || !strings.Contains(got, "Пустошь") {
+	if got := rows.UnmappedUnits[0].Key; !strings.Contains(got, "isolated_dwelling") || !strings.Contains(got, "Пустошь") {
 		t.Errorf("ключ строки = %q, want тип и имя вместе", got)
 	}
 
