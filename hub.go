@@ -13,6 +13,10 @@ type Hub struct {
 	// channelID → множество подписанных клиентов
 	channels map[string]subscribers
 
+	// joined — обратный индекс: клиент → его каналы. По нему смена набора и
+	// отключение трогают только каналы самого клиента, а не обходят все.
+	joined map[*Client]map[string]bool
+
 	unregister chan *Client
 	subscribe  chan subscription
 	broadcast  chan MessageData
@@ -46,6 +50,7 @@ type subscription struct {
 func NewHub() *Hub {
 	return &Hub{
 		channels:   make(map[string]subscribers),
+		joined:     make(map[*Client]map[string]bool),
 		unregister: make(chan *Client),
 		subscribe:  make(chan subscription),
 		broadcast:  make(chan MessageData),
@@ -86,43 +91,70 @@ func (h *Hub) AnnounceEdited(channel string, d EditedData) {
 	h.announceIn <- channelFrame{channel: channel, env: envelope(TypeEdited, d)}
 }
 
+// resubscribe заменяет набор каналов клиента на ids: отписывает от тех, которых
+// в новом наборе нет, и подписывает на те, которых не было. Общие с прежним
+// набором каналы (планета, страна…) не трогает. Вызывается только из Run.
+func (h *Hub) resubscribe(c *Client, ids []string) {
+	prev := h.joined[c]
+	next := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		next[id] = true
+	}
+	for id := range prev {
+		if !next[id] {
+			h.leave(c, id)
+		}
+	}
+	for id := range next {
+		if prev[id] {
+			continue
+		}
+		if h.channels[id] == nil {
+			h.channels[id] = make(subscribers)
+		}
+		h.channels[id][c] = true
+	}
+	if len(next) == 0 {
+		delete(h.joined, c)
+		return
+	}
+	h.joined[c] = next
+}
+
+// leave убирает клиента из одного канала; опустевший канал удаляется из карты.
+func (h *Hub) leave(c *Client, id string) {
+	subs := h.channels[id]
+	delete(subs, c)
+	if len(subs) == 0 {
+		delete(h.channels, id)
+	}
+}
+
 func (h *Hub) Run() {
 	for {
 		select {
 		case c := <-h.unregister:
-			for id, subs := range h.channels {
-				if subs[c] {
-					delete(subs, c)
-					if len(subs) == 0 {
-						delete(h.channels, id)
-					}
-				}
+			for id := range h.joined[c] {
+				h.leave(c, id)
 			}
+			delete(h.joined, c)
 			close(c.send)
 
 		case s := <-h.subscribe:
-			for _, id := range s.channels {
-				if h.channels[id] == nil {
-					h.channels[id] = make(subscribers)
-				}
-				h.channels[id][s.client] = true
-			}
+			// Набор заменяется, а не дополняется: locate повторяется в том же
+			// соединении (авто-трекинг, ручной выбор точки), и покинутый район
+			// не должен слать в сокет до реконнекта. Так рассылка в сокет
+			// совпадает с user_channels, которые locate тоже заменяет целиком.
+			h.resubscribe(s.client, s.channels)
 
 		case env := <-h.announce:
-			// один клиент может быть подписан на несколько каналов — иначе он
-			// получил бы кадр по разу на канал
-			seen := make(map[*Client]bool)
-			for _, subs := range h.channels {
-				for c := range subs {
-					if seen[c] {
-						continue
-					}
-					seen[c] = true
-					select {
-					case c.send <- env:
-					default:
-						slog.Warn("send buffer full, dropping announce", "client", c.DisplayName())
-					}
+			// по обратному индексу, а не по каналам: в нём каждый клиент ровно
+			// один раз, сколько бы каналов у него ни было
+			for c := range h.joined {
+				select {
+				case c.send <- env:
+				default:
+					slog.Warn("send buffer full, dropping announce", "client", c.DisplayName())
 				}
 			}
 
