@@ -85,14 +85,6 @@ func (c *Client) setAuthed(userID int64, fullName string) {
 	c.authed = true
 }
 
-// typePublishGone — надгробие кадра `publish`, которым отправляли сообщения до
-// перехода на POST /messages. Тега в protocol.go больше нет: кадр не часть
-// протокола, а литерал, на который надо ответить внятным отказом. Иначе он
-// провалится в default, и сборка ≤1.3.0 (только они его и посылают) покажет
-// «Ошибка unknown_type: unknown message type: publish» — техническую строку, из
-// которой не понять ни что случилось, ни что делать.
-const typePublishGone = "publish"
-
 // newClient — соединение с обычными периодами keepalive. Тест подменяет их
 // сразу после вызова, до старта помп (см. keepalive_test.go).
 func newClient(hub *Hub, conn *websocket.Conn, geo Geocoder, store *Store) *Client {
@@ -190,10 +182,6 @@ func (c *Client) readPump() {
 				}
 			}
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
-
-		case typePublishGone:
-			c.sendError("upgrade_required",
-				"Обнови Эфир — эта версия больше не отправляет сообщения")
 
 		default:
 			c.sendError("unknown_type", "unknown message type: "+env.Type)

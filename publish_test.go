@@ -368,51 +368,6 @@ func TestMessagesGetAndPost(t *testing.T) {
 	}
 }
 
-// TestPublishFrameRefused — кадр `publish` сняли, но не молча: сборки ≤1.3.0
-// умеют только его, и вместо технического unknown_type им отвечают внятным
-// upgrade_required (см. typePublishGone в client.go). Ничего не публикуется.
-func TestPublishFrameRefused(t *testing.T) {
-	srv, store := newTestServer(t)
-	_, token := publishSession(t, store)
-
-	ws, _, err := websocket.DefaultDialer.Dial(
-		"ws"+strings.TrimPrefix(srv.URL, "http")+"/ws?token="+token, nil)
-	if err != nil {
-		t.Fatalf("dial: %v", err)
-	}
-	defer ws.Close()
-	ws.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-	if err := ws.WriteJSON(Envelope{
-		Type: "publish",
-		Data: []byte(`{"channel": "RU", "text": "по старинке"}`),
-	}); err != nil {
-		t.Fatalf("publish: %v", err)
-	}
-	var env Envelope
-	if err := ws.ReadJSON(&env); err != nil {
-		t.Fatalf("ответ: %v", err)
-	}
-	if env.Type != TypeError {
-		t.Fatalf("тип ответа = %q, want error", env.Type)
-	}
-	var e ErrorData
-	mustUnmarshal(t, env.Data, &e)
-	if e.Code != "upgrade_required" {
-		t.Errorf("code = %q, want upgrade_required", e.Code)
-	}
-	if e.Message == "" {
-		t.Error("отказ без текста — человеку нечего прочитать")
-	}
-	msgs, err := store.History("RU", 0, 10, 0)
-	if err != nil {
-		t.Fatalf("history: %v", err)
-	}
-	if len(msgs) != 0 {
-		t.Errorf("кадром опубликовалось %d сообщений, want 0", len(msgs))
-	}
-}
-
 // TestPublishRetryAfterMute — повтор с тем же client_msg_id отвечает сохранённым
 // сообщением, даже если автора успели замьютить. Повтор — не новая публикация, а
 // вопрос «дошло ли»; сообщение уже в истории и уже разослано, и отказывать в
