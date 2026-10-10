@@ -470,7 +470,7 @@ func TestPublishCountryLimit(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	for i := 0; i < countryLimit.capacity; i++ {
+	for i := 0; i < countryLimit(0).capacity; i++ {
 		if resp, body := postMessage(t, srv.URL, token, PublishRequest{
 			Channel: "RU", Text: "всей стране", ClientMsgID: fmt.Sprintf("c-%d", i),
 		}); resp.StatusCode != http.StatusOK {
@@ -527,7 +527,7 @@ func TestPublishPlanetLimit(t *testing.T) {
 		t.Errorf("code = %v, want too_fast — на другом коде старые сборки потеряют написанное", body["code"])
 	}
 	msg, _ := body["message"].(string)
-	if !strings.Contains(msg, "раз в час") {
+	if !strings.Contains(msg, "В Землю") {
 		t.Errorf("текст отказа = %q, ожидали объяснение про Землю", msg)
 	}
 	if strings.Contains(msg, " с") && !strings.Contains(msg, "мин") && !strings.Contains(msg, " ч") {

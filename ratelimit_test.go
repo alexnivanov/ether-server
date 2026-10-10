@@ -134,9 +134,9 @@ func TestRateLimiterCapsOnTierChange(t *testing.T) {
 	}
 }
 
-// Ожидание округляется ВВЕРХ и меняет единицу: «подожди 3421 с» на часовом
-// лимите не читается, а «через 45 мин» при остатке 45 мин 30 с вернуло бы
-// человека к тому же отказу.
+// Ожидание округляется ВВЕРХ до минуты и меняет единицу: «подожди 3421 с» на
+// часовом лимите не читается, «через 2 ч» при паузе 1 ч 30 мин врёт на полчаса,
+// а «через 45 мин» при остатке 45 мин 30 с вернуло бы человека к тому же отказу.
 func TestHumanWait(t *testing.T) {
 	cases := []struct {
 		d    time.Duration
@@ -146,7 +146,11 @@ func TestHumanWait(t *testing.T) {
 		{59*time.Second + 900*time.Millisecond, "60 с"},
 		{time.Minute, "1 мин"},
 		{45*time.Minute + 30*time.Second, "46 мин"},
+		{59*time.Minute + 30*time.Second, "1 ч"},
 		{time.Hour, "1 ч"},
+		{time.Hour + 30*time.Second, "1 ч 1 мин"},
+		{2*time.Hour + 29*time.Minute + 10*time.Second, "2 ч 30 мин"},
+		{24 * time.Hour, "24 ч"},
 	}
 	for _, c := range cases {
 		if got := humanWait(c.d); got != c.want {
@@ -157,13 +161,9 @@ func TestHumanWait(t *testing.T) {
 
 // Земля стоит дороже любого локального канала: одно сообщение в час на нулевой
 // репутации. Возраст аккаунта здесь не при чём (1/час строже любого локального
-// тира), а рейтинг двигает темп — но в узких пределах, см.
-// TestMessageLimitPlanetRating.
+// тира), а рейтинг только тормозит, см. TestMessageLimitPlanetRating.
 func TestMessageLimitPlanetTier(t *testing.T) {
 	planet := messageLimitFor(0, old, scopePlanet)
-	if planet != planetLimit {
-		t.Fatalf("тир Земли = %+v, want %+v", planet, planetLimit)
-	}
 	if planet.capacity != 1 || planet.refill != time.Hour {
 		t.Fatalf("Земля не 1/час: %+v", planet)
 	}
@@ -176,45 +176,49 @@ func TestMessageLimitPlanetTier(t *testing.T) {
 			t.Fatalf("Земля не строже локального тира %+v: %+v", tier, planet)
 		}
 	}
-	if messageLimitFor(0, time.Minute, scopePlanet) != planetLimit {
+	if messageLimitFor(0, time.Minute, scopePlanet) != planet {
 		t.Fatal("возраст аккаунта изменил тир Земли")
 	}
 }
 
-// Рейтинг в Земле двигает темп, но не открывает дверь: плюсы разгоняют до трёх
-// сообщений в час, минусы тормозят вдвое против базы. Потолок разгона здесь
-// несущий — при общем запасе голосов второй аккаунт может слить весь запас на
-// подельника, и невыгодной такую ферму делает именно мелкость приза.
+// Рейтинг в Земле: каждый минус добавляет полчаса к часовой паузе, не дальше
+// суток, каждый плюс делит паузу пополам, не быстрее раза в минуту.
 func TestMessageLimitPlanetRating(t *testing.T) {
-	base := messageLimitFor(0, old, scopePlanet)
-	good := messageLimitFor(goodRating, old, scopePlanet)
-	bad := messageLimitFor(-1, old, scopePlanet)
-
-	if good.refill >= base.refill {
-		t.Fatalf("плюс не разгоняет Землю: %+v против базы %+v", good, base)
+	cases := []struct {
+		rating int
+		want   time.Duration
+	}{
+		{1 << 40, time.Minute},
+		{7, time.Minute},
+		{6, time.Minute}, // 56 с — уже под полом
+		{5, 112500 * time.Millisecond},
+		{3, 7*time.Minute + 30*time.Second},
+		{1, 30 * time.Minute},
+		{0, time.Hour},
+		{-1, time.Hour + 30*time.Minute},
+		{-3, 2*time.Hour + 30*time.Minute},
+		{-46, 24 * time.Hour},
+		{-47, 24 * time.Hour},
+		{-1 << 40, 24 * time.Hour}, // без переполнения Duration
 	}
-	if bad.refill <= base.refill {
-		t.Fatalf("минус не тормозит Землю: %+v против базы %+v", bad, base)
-	}
-	// разгон ограничен: даже огромный рейтинг не выводит Землю на локальный темп
-	if top := messageLimitFor(1000, old, scopePlanet); top != good {
-		t.Fatalf("разгон Земли не упёрся в потолок: %+v", top)
-	}
-	if good.refill < 15*time.Minute {
-		t.Fatalf("Земля разогналась слишком сильно: %+v", good)
+	for _, c := range cases {
+		got := messageLimitFor(c.rating, old, scopePlanet)
+		if got.capacity != 1 || got.refill != c.want {
+			t.Errorf("рейтинг %d: %+v, want 1 / %v", c.rating, got, c.want)
+		}
 	}
 }
 
-// Область и город — своя полоса между страной и локальным: устойчивый темп как у
-// страны, всплеск меньше, а минус тормозит и здесь.
+// Область и город — своя полоса между страной и локальным: мягче страны, строже
+// района, а минус тормозит и здесь.
 func TestMessageLimitCityTier(t *testing.T) {
 	city := messageLimitFor(0, old, scopeCity)
 	if city != cityLimit {
 		t.Fatalf("тир города = %+v, want %+v", city, cityLimit)
 	}
 	country := messageLimitFor(0, old, scopeCountry)
-	if city.capacity >= country.capacity {
-		t.Fatalf("всплеск города не меньше страны: %+v против %+v", city, country)
+	if city.refill >= country.refill {
+		t.Fatalf("город не мягче страны: %+v против %+v", city, country)
 	}
 	local := messageLimitFor(0, old, scopeLocal)
 	if city.refill <= local.refill {
@@ -226,12 +230,11 @@ func TestMessageLimitCityTier(t *testing.T) {
 }
 
 // Тир страны лежит между Землёй и локальным: строже любого локального (в том
-// числе узкого тира свежих аккаунтов), но мягче часовой Земли — канал страны
-// сейчас самая населённая комната, и разговор в нём должен оставаться возможным.
+// числе узкого тира свежих аккаунтов), но мягче часовой Земли.
 func TestMessageLimitCountryTier(t *testing.T) {
 	country := messageLimitFor(0, old, scopeCountry)
-	if country != countryLimit {
-		t.Fatalf("тир страны = %+v, want %+v", country, countryLimit)
+	if country.capacity != 2 || country.refill != 5*time.Minute {
+		t.Fatalf("тир страны = %+v, want 2 / 5 мин", country)
 	}
 	planet := messageLimitFor(0, old, scopePlanet)
 	if country.refill >= planet.refill {
@@ -246,8 +249,50 @@ func TestMessageLimitCountryTier(t *testing.T) {
 			t.Fatalf("страна не строже локального тира %+v: %+v", tier, country)
 		}
 	}
-	if messageLimitFor(100, time.Hour*10000, scopeCountry) != countryLimit {
-		t.Fatal("репутация или возраст изменили тир страны")
+	if messageLimitFor(100, time.Hour*10000, scopeCountry) != country {
+		t.Fatal("плюсы или возраст изменили тир страны")
+	}
+}
+
+// Минус в стране: +2,5 мин к паузе за каждый, не дальше часа, и без всплеска.
+func TestMessageLimitCountryRating(t *testing.T) {
+	cases := []struct {
+		rating int
+		want   time.Duration
+	}{
+		{-1, 7*time.Minute + 30*time.Second},
+		{-3, 12*time.Minute + 30*time.Second},
+		{-22, time.Hour},
+		{-23, time.Hour},
+		{-1 << 40, time.Hour},
+	}
+	for _, c := range cases {
+		got := messageLimitFor(c.rating, old, scopeCountry)
+		if got.capacity != 1 || got.refill != c.want {
+			t.Errorf("рейтинг %d: %+v, want 1 / %v", c.rating, got, c.want)
+		}
+	}
+}
+
+// Разгон в Земле считается только по голосам в Земле: плюсы из района, где
+// писать можно 20 раз в минуту, его не дают. Общий минус перебивает плюсы в
+// Земле.
+func TestPlanetRating(t *testing.T) {
+	cases := []struct {
+		total, planet, want int
+	}{
+		{0, 0, 0},
+		{10, 0, 0},   // плюсы только из других каналов — разгона нет
+		{10, 3, 3},   // разгон по Земле
+		{3, 5, 5},    // в других каналах минусы, но в сумме ≥ 0
+		{10, -2, 0},  // в Земле минусы — не тормозят сверх общего, но и не разгоняют
+		{-2, 5, -2},  // общий минус перебивает плюсы в Земле
+		{-4, -4, -4}, // минусы — из общего рейтинга
+	}
+	for _, c := range cases {
+		if got := planetRating(c.total, c.planet); got != c.want {
+			t.Errorf("planetRating(%d, %d) = %d, want %d", c.total, c.planet, got, c.want)
+		}
 	}
 }
 
@@ -257,7 +302,7 @@ func TestCountryBucketSeparate(t *testing.T) {
 	r := NewRateLimiter()
 	r.now = func() time.Time { return now }
 
-	for i := 0; i < countryLimit.capacity; i++ {
+	for i := 0; i < countryLimit(0).capacity; i++ {
 		if ok, _ := r.Allow(1, 0, old, scopeCountry); !ok {
 			t.Fatalf("сообщение в страну %d отбито", i+1)
 		}

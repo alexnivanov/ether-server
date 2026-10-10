@@ -518,3 +518,35 @@ func TestVoteAnnouncesRating(t *testing.T) {
 	default:
 	}
 }
+
+// Рейтинг по каналу — только голоса под сообщениями автора в этом канале: на
+// нём держится разгон в Земле, и плюсы из района туда протекать не должны.
+func TestAuthorChannelRating(t *testing.T) {
+	s := openTestStore(t)
+	author := mkTgUser(t, s, "1", "author", "Автор")
+	fan := mkTgUser(t, s, "2", "fan", "Читатель")
+	other := mkTgUser(t, s, "3", "other", "Другой")
+
+	earth := mkMessage(t, s, PlanetChannel.ID, author, "всем")
+	for i := 0; i < 3; i++ {
+		local := mkMessage(t, s, localChannel, author, "соседям")
+		if _, err := s.Vote(fan, local, 1); err != nil {
+			t.Fatalf("голос: %v", err)
+		}
+	}
+	if r, err := s.AuthorChannelRating(author, PlanetChannel.ID); err != nil || r != 0 {
+		t.Fatalf("рейтинг в Земле = %d (err %v), want 0 — протекли плюсы из района", r, err)
+	}
+	if _, err := s.Vote(fan, earth, 1); err != nil {
+		t.Fatalf("голос: %v", err)
+	}
+	if _, err := s.Vote(other, earth, 1); err != nil {
+		t.Fatalf("голос: %v", err)
+	}
+	if r, _ := s.AuthorChannelRating(author, PlanetChannel.ID); r != 2 {
+		t.Fatalf("рейтинг в Земле = %d, want 2", r)
+	}
+	if r, _ := s.AuthorRating(author); r != 5 {
+		t.Fatalf("общий рейтинг = %d, want 5", r)
+	}
+}

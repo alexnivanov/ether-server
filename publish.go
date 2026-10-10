@@ -101,6 +101,13 @@ func (p *publisher) publish(
 			slog.Error("author rating", "err", err, "user_id", a.ID)
 		}
 		scope := p.scopeFor(channel)
+		if scope == scopePlanet && rating >= 0 {
+			planet, err := p.store.AuthorChannelRating(a.ID, channel)
+			if err != nil {
+				slog.Error("author channel rating", "err", err, "user_id", a.ID)
+			}
+			rating = planetRating(rating, planet)
+		}
 		if ok, retry := p.limiter.Allow(a.ID, rating, a.AccountAge, scope); !ok {
 			return MessageData{}, &publishError{
 				Code:    "too_fast",
@@ -251,9 +258,9 @@ func isCountryCode(s string) bool {
 func tooFastMessage(scope limitScope, retry time.Duration) string {
 	switch scope {
 	case scopePlanet:
-		return fmt.Sprintf("В Землю можно писать раз в час — следующее сообщение через %s", humanWait(retry))
+		return fmt.Sprintf("В Землю нельзя писать часто - следующее сообщение через %s", humanWait(retry))
 	case scopeCountry:
-		return fmt.Sprintf("В канале страны пишут реже — подожди %s", humanWait(retry))
+		return fmt.Sprintf("В канале страны пишут реже - подожди %s", humanWait(retry))
 	case scopeCity:
 		return fmt.Sprintf("В городском канале пишут реже — подожди %s", humanWait(retry))
 	default:
@@ -264,13 +271,17 @@ func tooFastMessage(scope limitScope, retry time.Duration) string {
 // humanWait — ожидание словами. Округляем ВВЕРХ: по подсказке «через 46 мин»
 // человек вернётся ровно к сроку, и отказ второй раз он получить не должен.
 func humanWait(d time.Duration) string {
-	switch {
-	case d < time.Minute:
+	if d < time.Minute {
 		return fmt.Sprintf("%d с", int(d.Seconds())+1)
-	case d < time.Hour:
-		return fmt.Sprintf("%d мин", int((d+time.Minute-1)/time.Minute))
+	}
+	mins := int((d + time.Minute - 1) / time.Minute)
+	switch {
+	case mins < 60:
+		return fmt.Sprintf("%d мин", mins)
+	case mins%60 == 0:
+		return fmt.Sprintf("%d ч", mins/60)
 	default:
-		return fmt.Sprintf("%d ч", int((d+time.Hour-1)/time.Hour))
+		return fmt.Sprintf("%d ч %d мин", mins/60, mins%60)
 	}
 }
 
