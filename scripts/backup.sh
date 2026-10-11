@@ -96,8 +96,19 @@ alert() {
 }
 
 # Молча ломающийся бэкап — худшее из возможного: кажется, что копия есть, а её
-# нет. Поэтому любой сбой уходит в канал.
-trap 'alert "ОШИБКА на строке $LINENO — смотри journalctl -u ether-backup"' ERR
+# нет. Поэтому любой сбой уходит в канал. Кроме остановки: `systemctl stop` или
+# перезагрузка шлют SIGTERM и sqlite3/rclone, те падают — но бэкап не сломан.
+# TERM-обработчик срабатывает раньше ERR, так что флаг к этому моменту уже стоит.
+stopping=
+trap 'stopping=1' TERM INT
+on_error() {
+	if [[ -n "$stopping" ]]; then
+		echo "остановлен (systemctl stop или перезагрузка)" >&2
+		exit 143
+	fi
+	alert "ОШИБКА на строке $1 — смотри journalctl -u ether-backup"
+}
+trap 'on_error $LINENO' ERR
 
 [[ -f "$DB" ]] || { alert "база не найдена: $DB"; exit 1; }
 mkdir -p "$(dirname "$BACKUP")"
