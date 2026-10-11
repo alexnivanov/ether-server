@@ -22,6 +22,10 @@ RestartSec=3
 # Хост общий с Айдой (JVM до ~2 ГБ): при нехватке памяти ядро убивает Айду, а не Эфир.
 # На сервере задано drop-in файлом ether-server.service.d/oom.conf.
 OOMScoreAdjust=-500
+# Алерт в служебный Telegram-канал при каждой аварийной остановке (падение, OOM-kill):
+# systemd поднимет сервер сам, и без алерта падение прошло бы молча.
+# На сервере задано drop-in файлом ether-server.service.d/failure-alert.conf.
+ExecStopPost=/opt/ether/notify-failure.sh
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
