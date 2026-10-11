@@ -19,6 +19,9 @@ WorkingDirectory=/var/lib/ether
 ExecStart=/opt/ether/ether-server -config /etc/ether/config.prod.yaml
 Restart=on-failure
 RestartSec=3
+# Хост общий с Айдой (JVM до ~2 ГБ): при нехватке памяти ядро убивает Айду, а не Эфир.
+# На сервере задано drop-in файлом ether-server.service.d/oom.conf.
+OOMScoreAdjust=-500
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

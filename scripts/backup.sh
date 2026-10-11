@@ -47,8 +47,10 @@
 # Заливается два ключа: `ether-latest.db.gz.age` (перезаписывается) и
 # `ether-YYYY-MM-DD.db.gz.age` (история). История нужна на случай, когда база
 # повредилась, а бэкап исправно её скопировал: «последняя копия» тогда уже
-# бесполезна. Срок хранения задаётся правилом жизненного цикла бакета в панели
-# Cloudflare (например, удалять объекты старше 30 дней) — скрипт старое не чистит.
+# бесполезна. Датированные копии старше RETENTION_DAYS (по умолчанию 30) скрипт
+# удаляет сам: у Яндекс.Диска нет правил жизненного цикла, и без этого история
+# копилась бессрочно. Чистка идёт только после успешной выгрузки свежей копии,
+# так что сломанный бэкап не съест архив.
 
 set -euo pipefail
 
@@ -65,6 +67,7 @@ DB="${DB:-/var/lib/ether/ether.prod.db}"
 BACKUP="${BACKUP:-/var/lib/ether/backups/ether-latest.db.gz}"
 CONFIG="${CONFIG:-/etc/ether/config.prod.yaml}"
 MIN_FREE_PCT="${MIN_FREE_PCT:-15}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
 
 # ── алерты в служебный Telegram-канал (тот же, что у модерации) ──
 # Токен и chat_id читаем из конфига сервера, чтобы не дублировать секреты.
@@ -188,6 +191,10 @@ if [[ -n "${BACKUP_REMOTE:-}" ]]; then
 		put() { rclone --retries 3 -q --ignore-times copyto "$1" "${BACKUP_REMOTE%/}/$2"; }
 		if put "$enc" "ether-latest.db.gz.age" && put "$enc" "$dated"; then
 			echo "копия выгружена: ${BACKUP_REMOTE%/}/${dated}"
+			# latest-ключи не трогаем: под маску попадают только датированные
+			if ! rclone -q delete --min-age "${RETENTION_DAYS}d" --include 'ether-20*' --include 'ether-config-20*' "${BACKUP_REMOTE%/}"; then
+				alert "не удалось удалить старые копии в ${BACKUP_REMOTE} (свежая выгружена)"
+			fi
 			if [[ -f "$cfg_tar.age" ]]; then
 				if put "$cfg_tar.age" "ether-config-latest.tar.age" &&
 					put "$cfg_tar.age" "ether-config-$(date +%F).tar.age"; then
