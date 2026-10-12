@@ -91,6 +91,18 @@ func (p *publisher) publish(
 			Code: "banned", Message: BanMessage(until, permanent, reason), Status: 403,
 		}
 	}
+	// Допуск в Землю по возрасту аккаунта (planetMinAccountAge). Код too_fast, а
+	// не свой: его понимают и выпущенные сборки (текст сервера плюс
+	// Retry-After), а «рано» для человека то же «подожди», только дольше.
+	if channel == PlanetChannel.ID && a.AccountAge < planetMinAccountAge {
+		retry := planetMinAccountAge - a.AccountAge
+		return MessageData{}, &publishError{
+			Code:    "too_fast",
+			Message: fmt.Sprintf("В Землю можно писать через сутки после регистрации - осталось %s", humanWait(retry)),
+			Status:  429,
+			Retry:   retry,
+		}
+	}
 	// Частота публикаций. Рейтинг — сумма голосов за сообщения автора за
 	// последнюю неделю (голоса уезжают вместе с сообщениями), ещё один SELECT по
 	// индексу рядом с проверкой бана. Ошибку не считаем отказом: без рейтинга

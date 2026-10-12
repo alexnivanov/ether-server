@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,16 @@ func publishSession(t *testing.T, store *Store) (int64, string) {
 		t.Fatalf("сессия: %v", err)
 	}
 	return userID, token
+}
+
+// ageAccount — состарить аккаунт за порог допуска в Землю
+// (planetMinAccountAge): тестам про лимиты Земли нужен не новичок.
+func ageAccount(t *testing.T, store *Store, userID int64) {
+	t.Helper()
+	old := time.Now().Add(-planetMinAccountAge - time.Hour).UnixMilli()
+	if _, err := store.db.Exec(`UPDATE users SET created_at = ? WHERE id = ?`, old, userID); err != nil {
+		t.Fatalf("состарить аккаунт: %v", err)
+	}
 }
 
 // postMessage — POST /messages с токеном сессии в заголовке (пустой токен —
@@ -461,7 +472,8 @@ func TestScopeForChannel(t *testing.T) {
 // отбивается, а Земля и локальный канал не задеты (у каждого свой бакет).
 func TestPublishCountryLimit(t *testing.T) {
 	_, store := newTestServer(t)
-	_, token := publishSession(t, store)
+	userID, token := publishSession(t, store)
+	ageAccount(t, store, userID)
 	hub := NewHub()
 	go hub.Run()
 	mux := http.NewServeMux()
@@ -505,7 +517,8 @@ func TestPublishCountryLimit(t *testing.T) {
 // запасы раздельные.
 func TestPublishPlanetLimit(t *testing.T) {
 	_, store := newTestServer(t)
-	_, token := publishSession(t, store)
+	userID, token := publishSession(t, store)
+	ageAccount(t, store, userID)
 	hub := NewHub()
 	go hub.Run()
 	mux := http.NewServeMux()
@@ -542,6 +555,50 @@ func TestPublishPlanetLimit(t *testing.T) {
 		Channel: "RU-MOW", Text: "а тут можно",
 	}); resp.StatusCode != http.StatusOK {
 		t.Fatalf("локальная отправка после Земли: %d (%v)", resp.StatusCode, body)
+	}
+}
+
+// TestPublishPlanetNewAccount — в Землю пускают только через сутки после
+// регистрации. Отказ — too_fast с Retry-After до конца суток (его понимают
+// выпущенные сборки), остальные каналы новичку открыты, а отказ не тратит токен
+// Земли: на рубеже суток первое сообщение проходит сразу.
+func TestPublishPlanetNewAccount(t *testing.T) {
+	_, store := newTestServer(t)
+	userID, token := publishSession(t, store)
+	hub := NewHub()
+	go hub.Run()
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /messages", handlePublish(store,
+		&publisher{store: store, hub: hub, limiter: NewRateLimiter()}))
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	earth := PublishRequest{Channel: PlanetChannel.ID, Text: "всем привет"}
+	resp, body := postMessage(t, srv.URL, token, earth)
+	if resp.StatusCode != http.StatusTooManyRequests || body["code"] != "too_fast" {
+		t.Fatalf("новичок в Землю: %d/%v, want 429/too_fast", resp.StatusCode, body["code"])
+	}
+	if msg, _ := body["message"].(string); !strings.Contains(msg, "через сутки") {
+		t.Errorf("текст отказа = %q, ожидали объяснение про сутки", msg)
+	}
+	ra, err := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if err != nil || ra <= int((planetMinAccountAge-time.Hour).Seconds()) ||
+		ra > int(planetMinAccountAge.Seconds()) {
+		t.Errorf("Retry-After = %q, want почти сутки", resp.Header.Get("Retry-After"))
+	}
+
+	for _, ch := range []string{"RU", "RU-MOW", localChannel} {
+		if resp, body := postMessage(t, srv.URL, token, PublishRequest{
+			Channel: ch, Text: "своим",
+		}); resp.StatusCode != http.StatusOK {
+			t.Errorf("новичок в %s: %d (%v)", ch, resp.StatusCode, body)
+		}
+	}
+
+	// сутки прошли — первое сообщение в Землю проходит, отказы токен не съели
+	ageAccount(t, store, userID)
+	if resp, body := postMessage(t, srv.URL, token, earth); resp.StatusCode != http.StatusOK {
+		t.Fatalf("в Землю через сутки: %d (%v)", resp.StatusCode, body)
 	}
 }
 
