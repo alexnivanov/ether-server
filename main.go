@@ -26,7 +26,7 @@ var upgrader = websocket.Upgrader{
 }
 
 // version проставляется при сборке (-ldflags "-X main.version=..."), см.
-// scripts/deploy.sh; при обычном go build/run остаётся "dev".
+// deploy.sh; при обычном go build/run остаётся "dev".
 var version = "dev"
 
 func main() {

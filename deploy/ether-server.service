@@ -1,5 +1,5 @@
 # Референс systemd-юнита для прода (etherapp.ru) — копия того, что стоит на
-# сервере в /etc/systemd/system/ether-server.service. scripts/deploy.sh только
+# сервере в /etc/systemd/system/ether-server.service. deploy.sh только
 # рестартит уже установленный сервис. После правок: sudo systemctl daemon-reload.
 #
 # Раскладка раздельная: бинарник read-only в /opt/ether, конфиг в /etc/ether,
@@ -25,7 +25,7 @@ OOMScoreAdjust=-500
 # Алерт в служебный Telegram-канал при каждой аварийной остановке (падение, OOM-kill):
 # systemd поднимет сервер сам, и без алерта падение прошло бы молча.
 # На сервере задано drop-in файлом ether-server.service.d/failure-alert.conf.
-ExecStopPost=/opt/ether/notify-failure.sh
+ExecStopPost=/opt/ether/notify-failure.sh %n
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

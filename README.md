@@ -51,7 +51,7 @@ systemd, наружу его публикует Caddy с авто-TLS. Раск�
 | `/etc/ether/config.prod.yaml` | конфиг с секретами (не в git; образец — `config.example.yaml`), передаётся флагом `-config` |
 | `/var/lib/ether/ether.prod.db` (+`-wal`/`-shm`) | база SQLite; `/var/lib/ether` — `WorkingDirectory` и единственный writable-путь сервиса |
 | `/etc/systemd/system/ether-server.service` | юнит; запускает бинарник под пользователем `ether`. Референс — [`deploy/ether-server.service`](./deploy/ether-server.service) |
-| `/opt/ether/backup.sh` | скрипт бэкапа; ставится тем же `scripts/deploy.sh` |
+| `/opt/ether/backup.sh` | скрипт бэкапа; ставится тем же `deploy.sh` |
 | `/etc/systemd/system/ether-backup.{service,timer}` | ежедневный бэкап базы (см. «Бэкапы»). Референс — [`deploy/`](./deploy) |
 | `/var/lib/ether/backups/ether-latest.db.gz` | последняя копия базы |
 | `/etc/caddy/Caddyfile` | reverse-proxy + TLS на `localhost:8080`. Референс — [`deploy/Caddyfile`](./deploy/Caddyfile) |
@@ -61,12 +61,12 @@ systemd, наружу его публикует Caddy с авто-TLS. Раск�
 поднимали руками). systemd-юнит и Caddyfile меняются на сервере; после правок
 юнита — `sudo systemctl daemon-reload`.
 
-**Выкатка новой версии** — [`scripts/deploy.sh`](./scripts/deploy.sh): собирает
+**Выкатка новой версии** — [`deploy.sh`](./deploy.sh): собирает
 статический бинарник под Linux, льёт в `/tmp`, ставит через `sudo install` и
 рестартит сервис (конфиг и базу не трогает):
 
 ```sh
-SSH_HOST=ether scripts/deploy.sh
+SSH_HOST=ether ./deploy.sh
 ```
 
 > **Сервер выкатывается раньше клиента.** Сборка 1.4.0 присылает токен сессии
@@ -177,7 +177,7 @@ scp ether:/tmp/snap.db .   # дальше — локально, чем угод�
 
 `GET /api/health` отдаёт `{ok, version, db, uptime_sec}` и **503**, если база не
 отвечает — то есть проверяет не только «процесс жив», но и «база читается». Его
-же дёргает `scripts/deploy.sh` после рестарта и печатает ответ, так что сразу
+же дёргает `deploy.sh` после рестарта и печатает ответ, так что сразу
 видно, какая версия поднялась.
 
 Внешние зависимости (Nominatim, FCM, Telegram) в health намеренно не проверяются:
@@ -340,7 +340,7 @@ sudo tail -20 /var/log/unattended-upgrades/unattended-upgrades.log
 иначе юнит запустится в пустоту.
 
 ```sh
-SSH_HOST=ether scripts/deploy.sh          # ставит /opt/ether/backup.sh
+SSH_HOST=ether ./deploy.sh          # ставит /opt/ether/backup.sh
 scp deploy/ether-backup.service deploy/ether-backup.timer ether:/tmp/
 ssh ether 'sudo install -o root -g root -m 0644 \
     /tmp/ether-backup.service /tmp/ether-backup.timer /etc/systemd/system/ &&
@@ -349,7 +349,7 @@ ssh ether 'sudo install -o root -g root -m 0644 \
   sudo systemctl start ether-backup.service'   # прогнать сразу, не дожидаясь ночи
 ```
 
-Скрипт едет на сервер вместе с бинарником (`scripts/deploy.sh` ставит его в
+Скрипт едет на сервер вместе с бинарником (`deploy.sh` ставит его в
 `/opt/ether/backup.sh`), поэтому версия на сервере не разъезжается с
 репозиторием. Юниты меняются редко — их достаточно скопировать один раз, а после
 правок повторить `scp` + `daemon-reload`.
@@ -411,7 +411,7 @@ Telegram-канал — токен и `chat_id` скрипт берёт из `co
 Установка на сервере:
 
 ```sh
-SSH_HOST=ether scripts/deploy.sh                 # свежий backup.sh на сервер
+SSH_HOST=ether ./deploy.sh                 # свежий backup.sh на сервер
 ssh ether 'sudo apt install -y age rclone'
 scp deploy/backup.env.example ether:/tmp/
 ssh ether 'sudo install -m 600 -o root -g root /tmp/backup.env.example /etc/ether/backup.env'

@@ -6,7 +6,7 @@
 # (/etc/ether/config.prod.yaml, секреты) и база (/var/lib/ether/ether.prod.db,
 # состояние) живут на сервере и не трогаются. Деплой = новый бинарник + рестарт.
 #
-# Настройка через окружение (или инлайном: SSH_HOST=... scripts/deploy.sh):
+# Настройка через окружение (или инлайном: SSH_HOST=... ./deploy.sh):
 #   SSH_HOST     обязателен, напр. ether (алиас из ~/.ssh/config) или root@host
 #   REMOTE_DIR   каталог сервиса на сервере (по умолчанию /opt/ether)
 #   OWNER        владелец бинарника на сервере (по умолчанию ether)
@@ -18,7 +18,7 @@
 #                ether-web). Пусто = сервер отдаёт домен целиком.
 #   SKIP_CHECKS  =1 пропустить gofmt/vet/test перед сборкой (не рекомендуется)
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
 SSH_HOST="${SSH_HOST:?задай SSH_HOST, напр. SSH_HOST=ether}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/ether}"
@@ -59,14 +59,15 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
 # (install заменяет файл через временный + rename, старый не «полуперезаписан»).
 remote_bin="${REMOTE_DIR}/ether-server"
 echo "==> upload → ${SSH_HOST}:/tmp/ether-server.new"
-scp -q "$out" "${SSH_HOST}:/tmp/ether-server.new"
+# Без -q: показываем прогресс scp
+scp "$out" "${SSH_HOST}:/tmp/ether-server.new"
 
 # Скрипты бэкапа и алерта о падениях едут вместе с бинарником — иначе версия на
 # сервере тихо разъедется с репозиторием. Юниты ether-backup.service и ether-server.service
 # (ExecStopPost) запускают именно эти файлы.
 echo "==> upload backup.sh, notify-failure.sh"
-scp -q "$(dirname "${BASH_SOURCE[0]}")/backup.sh" "${SSH_HOST}:/tmp/ether-backup.sh"
-scp -q "$(dirname "${BASH_SOURCE[0]}")/notify-failure.sh" "${SSH_HOST}:/tmp/ether-notify-failure.sh"
+scp -q scripts/backup.sh "${SSH_HOST}:/tmp/ether-backup.sh"
+scp -q scripts/notify-failure.sh "${SSH_HOST}:/tmp/ether-notify-failure.sh"
 
 echo "==> install + restart ${SERVICE}"
 ssh "$SSH_HOST" "set -e

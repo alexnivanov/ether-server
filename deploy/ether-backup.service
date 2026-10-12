@@ -11,6 +11,13 @@ Type=oneshot
 # лежит под root) — из него берутся токен и chat_id для алертов в Telegram.
 User=root
 ExecStart=/opt/ether/backup.sh
+# Обычный прогон — минуты (Яндекс по WebDAV долго отвечает на каждую загрузку): час — значит, завис.
+# На сервере задано drop-in файлом ether-backup.service.d/alerts.conf, как и две строки ниже.
+TimeoutStartSec=1h
+# При остановке (systemctl stop, перезагрузка) скрипт выходит с 143 — это не сбой бэкапа
+SuccessExitStatus=143
+# Сбой, kill или таймаут → алерт в служебный канал с причиной из журнала
+ExecStopPost=/opt/ether/notify-failure.sh %n
 
 # Та же изоляция, что у самого сервиса: наружу — только каталог с базой, где
 # лежит и копия. Всё остальное read-only.
