@@ -412,6 +412,15 @@ CREATE TABLE IF NOT EXISTS client_version (
 	version  TEXT NOT NULL      -- «1.2.0», уже разобранная как semver
 );
 CREATE INDEX IF NOT EXISTS client_version_ts ON client_version(ts);
+-- Объявления Эфира: новости приложения, отдельная лента внизу списка чатов.
+-- Не канал и не сообщения: автора-пользователя нет (пишет админ-бот, см.
+-- admin.go), голосов, жалоб и блоков нет, TTL нет — объявлений единицы.
+-- Правки и снятия нет: объявление уже ушло пушем и в ленты клиентов.
+CREATE TABLE IF NOT EXISTS announcements (
+	id   INTEGER PRIMARY KEY AUTOINCREMENT, -- курсор пагинации, как у messages
+	text TEXT NOT NULL,
+	ts   INTEGER NOT NULL                   -- unix-миллисекунды, время публикации
+);
 `
 
 func OpenStore(path string) (*Store, error) {
@@ -1952,6 +1961,57 @@ func (s *Store) DeviceTokensForUser(userID int64) ([]string, error) {
 		tokens = append(tokens, t)
 	}
 	return tokens, rows.Err()
+}
+
+// AllDeviceTokens — токены всех устройств с включёнными пушами. Нужны
+// объявлениям: их получает каждый, а не подписчики канала.
+func (s *Store) AllDeviceTokens() ([]string, error) {
+	rows, err := s.db.Query(`SELECT fcm_token FROM device_tokens`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// ─── объявления ───
+
+// SaveAnnouncement публикует объявление и возвращает его id.
+func (s *Store) SaveAnnouncement(text string, ts int64) (int64, error) {
+	res, err := s.db.Exec(`INSERT INTO announcements (text, ts) VALUES (?, ?)`, text, ts)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+// Announcements — лента объявлений хронологически: целиком (afterID = 0) или
+// только новее afterID. Без limit: объявлений единицы в месяц, и за годы это
+// один небольшой ответ.
+func (s *Store) Announcements(afterID int64) ([]AnnouncementData, error) {
+	rows, err := s.db.Query(
+		`SELECT id, text, ts FROM announcements WHERE id > ? ORDER BY id`, afterID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	list := []AnnouncementData{}
+	for rows.Next() {
+		var a AnnouncementData
+		if err := rows.Scan(&a.ID, &a.Text, &a.TS); err != nil {
+			return nil, err
+		}
+		list = append(list, a)
+	}
+	return list, rows.Err()
 }
 
 // ─── обращения к ссылке установки ───

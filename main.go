@@ -149,7 +149,7 @@ func main() {
 	slog.Info("weekly stats", "enabled", notify != nil)
 
 	// команды модерации из того же канала (/ban, /del, ...) — см. admin.go
-	if admin := NewAdminBot(notify, store, hub); admin != nil {
+	if admin := NewAdminBot(notify, store, hub, push); admin != nil {
 		go admin.Run()
 		slog.Info("moderation commands", "enabled", true)
 	}

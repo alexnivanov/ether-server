@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"unicode/utf8"
 )
@@ -74,8 +75,8 @@ func TestPushPayload(t *testing.T) {
 	}
 
 	t.Run("канал и его имя едут в data", func(t *testing.T) {
-		decode(t, pushPayload("dev-token", "Тверской", "Ваня: привет",
-			channelData("relation/2555133", "Тверской")))
+		decode(t, pushPayload("dev-token", pushNote{title: "Тверской", body: "Ваня: привет",
+			data: channelData("relation/2555133", "Тверской")}))
 		if got.Message.Token != "dev-token" {
 			t.Fatalf("token = %q", got.Message.Token)
 		}
@@ -94,7 +95,8 @@ func TestPushPayload(t *testing.T) {
 	// Справочник ещё не знает канал — имени нет. Пустую строку не шлём:
 	// клиенту «поля нет» и «поле пустое» означают одно и то же.
 	t.Run("без имени канала поля нет вовсе", func(t *testing.T) {
-		decode(t, pushPayload("dev-token", "Ваня", "привет", channelData("RU-MOW", "")))
+		decode(t, pushPayload("dev-token", pushNote{title: "Ваня", body: "привет",
+			data: channelData("RU-MOW", "")}))
 		if got.Message.Data["channel"] != "RU-MOW" {
 			t.Fatalf("data.channel = %q", got.Message.Data["channel"])
 		}
@@ -159,7 +161,8 @@ func TestVotePushPayload(t *testing.T) {
 		} `json:"message"`
 	}
 	if err := json.Unmarshal(
-		pushPayload("dev-token", "Тверской", "Твоё сообщение отметили: привет", data),
+		pushPayload("dev-token", pushNote{title: "Тверской",
+			body: "Твоё сообщение отметили: привет", data: data}),
 		&got); err != nil {
 		t.Fatalf("payload не разбирается: %v", err)
 	}
@@ -173,6 +176,84 @@ func TestVotePushPayload(t *testing.T) {
 	}
 	if got.Message.Notification["title"] != "Тверской" {
 		t.Fatalf("notification = %v", got.Message.Notification)
+	}
+}
+
+// Звук и канал Android — по видам уведомлений. Сообщение со звуком на обеих
+// платформах (без aps.sound iOS показывает пуш молча), отметка тихая и без
+// лишних блоков, объявление тихое и уходит в свой канал Android, который
+// клиент заводит без звука.
+func TestPushPayloadSound(t *testing.T) {
+	type payload struct {
+		Message struct {
+			APNS *struct {
+				Payload struct {
+					APS map[string]any `json:"aps"`
+				} `json:"payload"`
+			} `json:"apns"`
+			Android *struct {
+				Notification map[string]any `json:"notification"`
+			} `json:"android"`
+		} `json:"message"`
+	}
+	decode := func(t *testing.T, n pushNote) payload {
+		t.Helper()
+		var p payload
+		if err := json.Unmarshal(pushPayload("dev-token", n), &p); err != nil {
+			t.Fatalf("payload не разбирается: %v", err)
+		}
+		return p
+	}
+
+	t.Run("сообщение со звуком", func(t *testing.T) {
+		p := decode(t, pushNote{title: "Тверской", body: "Ваня: привет", sound: true})
+		if p.Message.APNS == nil || p.Message.APNS.Payload.APS["sound"] != "default" {
+			t.Fatalf("apns.payload.aps.sound не default: %+v", p.Message.APNS)
+		}
+		if p.Message.Android == nil || p.Message.Android.Notification["default_sound"] != true {
+			t.Fatalf("android.notification.default_sound не true: %+v", p.Message.Android)
+		}
+		if _, ok := p.Message.Android.Notification["channel_id"]; ok {
+			t.Errorf("у сообщения канал Android задан, а должен быть по умолчанию")
+		}
+	})
+
+	t.Run("отметка тихая", func(t *testing.T) {
+		p := decode(t, pushNote{title: "Тверской", body: "Твоё сообщение отметили: привет"})
+		if p.Message.APNS != nil || p.Message.Android != nil {
+			t.Fatalf("у тихого пуша без канала лишние блоки: apns=%+v android=%+v",
+				p.Message.APNS, p.Message.Android)
+		}
+	})
+
+	t.Run("объявление тихое и в своём канале", func(t *testing.T) {
+		p := decode(t, pushNote{title: "Эфир", body: "Вышло обновление",
+			androidChannel: announcementsChannel})
+		if p.Message.APNS != nil {
+			t.Fatalf("у объявления есть apns (звук на iOS): %+v", p.Message.APNS)
+		}
+		if p.Message.Android == nil || p.Message.Android.Notification["channel_id"] != "announcements" {
+			t.Fatalf("android.notification.channel_id = %+v, want announcements", p.Message.Android)
+		}
+		if _, ok := p.Message.Android.Notification["default_sound"]; ok {
+			t.Errorf("у объявления default_sound задан")
+		}
+	})
+}
+
+// Тело пуша об объявлении обрезается по рунам: у FCM предел 4 КБ на payload, а
+// объявление может быть длиннее, и срез по байтам развалил бы кириллицу.
+func TestAnnouncementText(t *testing.T) {
+	if got := announcementText("коротко"); got != "коротко" {
+		t.Errorf("короткий текст изменён: %q", got)
+	}
+	long := strings.Repeat("ж", maxAnnouncementText+10)
+	got := announcementText(long)
+	if r := []rune(got); len(r) != maxAnnouncementText+1 || r[len(r)-1] != '…' {
+		t.Errorf("обрезка: %d рун, хвост %q", len(r), string(r[len(r)-1]))
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("обрезка развалила UTF-8")
 	}
 }
 

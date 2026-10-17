@@ -22,6 +22,10 @@ const (
 	TypeVoted   = "voted"   // {message_id, rating} — сумма под сообщением изменилась
 	TypeEdited  = "edited"  // {message_id, text, edited_at} — автор поправил текст
 	TypeError   = "error"   // {code, message}
+
+	// всем подключённым, а не подписчикам канала (см. Hub.AnnounceNews);
+	// выпущенные сборки незнакомые кадры пропускают
+	TypeAnnouncement = "announcement" // {id, text, ts} — новое объявление Эфира
 )
 
 // Envelope — внешняя оболочка любого сообщения.
@@ -208,6 +212,19 @@ type EditedData struct {
 	MessageID int64  `json:"message_id"`
 	Text      string `json:"text"`
 	EditedAt  int64  `json:"edited_at"`
+}
+
+// AnnouncementData — объявление Эфира: элемент GET /announcements и кадр
+// `announcement`. Автора нет — пишет Эфир (см. admin.go).
+type AnnouncementData struct {
+	ID   int64  `json:"id"`
+	Text string `json:"text"`
+	TS   int64  `json:"ts"` // время публикации, unix-мс
+}
+
+// AnnouncementsData — тело ответа GET /announcements.
+type AnnouncementsData struct {
+	Announcements []AnnouncementData `json:"announcements"` // по возрастанию id
 }
 
 // HealthData — тело ответа GET /health: то, что нужно внешнему пингеру и

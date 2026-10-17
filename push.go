@@ -95,6 +95,7 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 		title:   title,
 		body:    body,
 		data:    channelData(channelID, name),
+		sound:   true,
 	}, tokens)
 }
 
@@ -137,6 +138,54 @@ func (p *Pusher) NotifyVote(voterID, messageID int64, channel string, n VoteNoti
 	}, tokens)
 }
 
+// NotifyAnnouncement — тихий пуш об объявлении Эфира на все устройства.
+// Тихий, потому что объявление не разговор: о нём достаточно узнать, когда
+// посмотришь на телефон. На iOS тишина — отсутствие sound, на Android — канал
+// announcementsChannel, который клиент заводит без звука. Сборка без этого
+// канала покажет пуш в канале по умолчанию, то есть со звуком; фильтра по
+// версии нет намеренно: объявление «обнови приложение» нужнее всего как раз
+// старым сборкам, а текст доносит сама шторка.
+//
+// В data только type, без channel: старая сборка по тапу просто откроется
+// (pushTargetFrom в клиенте без channel возвращает null).
+//
+// Как и Notify, задумана для вызова в горутине: блокируется на HTTP к FCM.
+func (p *Pusher) NotifyAnnouncement(text string) {
+	tokens, err := p.store.AllDeviceTokens()
+	if err != nil {
+		slog.Error("announcement push targets", "err", err)
+		return
+	}
+	if len(tokens) == 0 {
+		return
+	}
+	p.deliver(pushNote{
+		kind:           "announcement",
+		title:          "Эфир",
+		body:           announcementText(text),
+		data:           map[string]string{"type": "announcement"},
+		androidChannel: announcementsChannel,
+	}, tokens)
+}
+
+// announcementsChannel — id канала уведомлений Android для объявлений. Клиент
+// создаёт канал с этим id без звука; строка — контракт с клиентом.
+const announcementsChannel = "announcements"
+
+// announcementText — тело пуша об объявлении. Обрезаем сами: объявление может
+// быть до maxMessageLen байт, а у FCM предел на весь payload — 4 КБ, и длинный
+// текст целиком FCM отверг бы. Режем по рунам, иначе развалится кириллица.
+func announcementText(text string) string {
+	if r := []rune(text); len(r) > maxAnnouncementText {
+		return string(r[:maxAnnouncementText]) + "…"
+	}
+	return text
+}
+
+// maxAnnouncementText — сколько символов объявления показать в шторке. Больше
+// ОС всё равно не покажет, остальное — в самой ленте.
+const maxAnnouncementText = 300
+
 // firstVoteNotice — «об этой паре автора ещё не будили». Второй раз по той же
 // паре отвечает false, и уведомление не уходит (см. Pusher.notified).
 func (p *Pusher) firstVoteNotice(voterID, messageID int64) bool {
@@ -173,11 +222,18 @@ func (p *Pusher) channelName(channelID string) string {
 
 // pushNote — готовое уведомление: что показать и что положить в data.
 type pushNote struct {
-	kind    string // message | vote — только для строки в логе
+	kind    string // message | vote | announcement — только для строки в логе
 	channel string
 	title   string
 	body    string
 	data    map[string]string
+	// sound — со звуком. Только у сообщений: отметка и объявление — не «тебе
+	// написали», и звук на каждое быстро надоел бы.
+	sound bool
+	// androidChannel — канал уведомлений Android; пусто — канал по умолчанию.
+	// Звук на Android решает канал, а не payload, поэтому тишину объявлений
+	// держит он (см. NotifyAnnouncement).
+	androidChannel string
 }
 
 // deliver рассылает уведомление по токенам и подчищает мёртвые. Общая часть
@@ -192,7 +248,7 @@ func (p *Pusher) deliver(n pushNote, tokens []string) {
 	var sent int
 	var stale []string
 	for _, device := range tokens {
-		switch p.sendTo(tok.AccessToken, device, n.title, n.body, n.data) {
+		switch p.sendTo(tok.AccessToken, device, n) {
 		case sendOK:
 			sent++
 		case sendStale:
@@ -285,24 +341,39 @@ const (
 // Отдельная функция ради теста: собранный payload — это контракт с клиентом
 // (см. ether-meta/PROTOCOL.md), и проверять его надо на JSON, а не на живом
 // HTTP к Google.
-func pushPayload(device, title, body string, data map[string]string) []byte {
-	payload, _ := json.Marshal(map[string]any{
-		"message": map[string]any{
-			"token": device,
-			"notification": map[string]any{
-				"title": title,
-				"body":  body,
-			},
-			"data": data,
+//
+// Звук задаётся явно для обеих платформ: без aps.sound iOS показывает
+// уведомление молча, и так молча приходили все сообщения.
+func pushPayload(device string, n pushNote) []byte {
+	msg := map[string]any{
+		"token": device,
+		"notification": map[string]any{
+			"title": n.title,
+			"body":  n.body,
 		},
-	})
+		"data": n.data,
+	}
+	android := map[string]any{}
+	if n.sound {
+		msg["apns"] = map[string]any{
+			"payload": map[string]any{"aps": map[string]any{"sound": "default"}},
+		}
+		android["default_sound"] = true
+	}
+	if n.androidChannel != "" {
+		android["channel_id"] = n.androidChannel
+	}
+	if len(android) > 0 {
+		msg["android"] = map[string]any{"notification": android}
+	}
+	payload, _ := json.Marshal(map[string]any{"message": msg})
 	return payload
 }
 
-// sendTo отправляет одно уведомление на один токен устройства. title/body уже
-// готовы (см. pushText), тело — pushPayload; здесь только транспорт.
-func (p *Pusher) sendTo(accessToken, device, title, body string, data map[string]string) sendResult {
-	payload := pushPayload(device, title, body, data)
+// sendTo отправляет одно уведомление на один токен устройства. Уведомление уже
+// готово (см. pushNote), тело — pushPayload; здесь только транспорт.
+func (p *Pusher) sendTo(accessToken, device string, n pushNote) sendResult {
+	payload := pushPayload(device, n)
 	url := fmt.Sprintf("https://fcm.googleapis.com/v1/projects/%s/messages:send", p.projectID)
 	req, _ := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload))
 	req.Header.Set("Authorization", "Bearer "+accessToken)

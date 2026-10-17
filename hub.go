@@ -91,6 +91,18 @@ func (h *Hub) AnnounceEdited(channel string, d EditedData) {
 	h.announceIn <- channelFrame{channel: channel, env: envelope(TypeEdited, d)}
 }
 
+// AnnounceNews рассылает новое объявление всем подключённым: лента объявлений
+// общая, каналы тут ни при чём. Соединение, которое ещё не
+// прислало locate, кадр не получит (рассылка идёт по h.joined): объявление
+// оно увидит через GET /announcements. nil-хаб молча ничего не делает — как и
+// у AnnounceRemoved.
+func (h *Hub) AnnounceNews(a AnnouncementData) {
+	if h == nil {
+		return
+	}
+	h.announce <- envelope(TypeAnnouncement, a)
+}
+
 // resubscribe заменяет набор каналов клиента на ids: отписывает от тех, которых
 // в новом наборе нет, и подписывает на те, которых не было. Общие с прежним
 // набором каналы (планета, страна…) не трогает. Вызывается только из Run.

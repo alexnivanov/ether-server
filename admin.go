@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Команды модерации в служебном Telegram-канале. Жалобы туда уже приходят
@@ -28,6 +29,7 @@ import (
 //	/unban <id>            снять наказание
 //	/del <msg_id>          удалить одно сообщение
 //	/purge <id>            удалить все сообщения пользователя
+//	/news <текст>          опубликовать объявление Эфира (тихий пуш всем)
 //	/help                     список команд
 //
 // Автоматической эскалации нет: в посте жалобы и в ответе на команду видно, сколько
@@ -38,17 +40,19 @@ type AdminBot struct {
 	// hub нужен, чтобы удалённый контент исчезал из открытых лент сразу: в БД
 	// его уже нет, но подключённые клиенты историю не перезапрашивают и держали
 	// бы сообщение до перезапуска приложения. nil — в тестах.
-	hub    *Hub
+	hub *Hub
+	// push — тихий пуш об объявлении; nil — пуши выключены в конфиге или тест.
+	push   *Pusher
 	offset int64 // update_id + 1: подтверждает обработанные обновления
 }
 
 // NewAdminBot возвращает nil, если уведомления выключены: без токена и канала
 // команды принимать неоткуда.
-func NewAdminBot(notify *Notifier, store *Store, hub *Hub) *AdminBot {
+func NewAdminBot(notify *Notifier, store *Store, hub *Hub, push *Pusher) *AdminBot {
 	if notify == nil {
 		return nil
 	}
-	return &AdminBot{notify: notify, store: store, hub: hub}
+	return &AdminBot{notify: notify, store: store, hub: hub, push: push}
 }
 
 // announceRemoved говорит подключённым клиентам убрать контент из ленты.
@@ -166,6 +170,10 @@ func (a *AdminBot) execute(text string) string {
 	cmd := strings.ToLower(strings.SplitN(fields[0], "@", 2)[0])
 	args := fields[1:]
 
+	if cmd == "/news" {
+		return a.publishNews(text)
+	}
+
 	// Сначала убеждаемся, что команда наша: в канале могут быть и чужие слэш-
 	// команды, и на них нельзя отвечать «нужен аргумент» — иначе бот огрызается
 	// на всё подряд. Только потом разбираем id.
@@ -262,13 +270,52 @@ func (a *AdminBot) execute(text string) string {
 			"<code>/block &lt;id&gt; [причина]</code> — заблокировать навсегда + удалить аккаунт\n" +
 			"<code>/unban &lt;id&gt;</code> — снять наказание\n" +
 			"<code>/del &lt;msg_id&gt;</code> — удалить сообщение\n" +
-			"<code>/purge &lt;id&gt;</code> — удалить все сообщения пользователя\n\n" +
+			"<code>/purge &lt;id&gt;</code> — удалить все сообщения пользователя\n" +
+			"<code>/news &lt;текст&gt;</code> — объявление Эфира, тихий пуш всем; правки и снятия нет\n\n" +
 			"Причина необязательна, но её увидит пользователь. Эскалации нет: " +
 			"счётчик нарушений показывается, решение за тобой."
 
 	default:
 		return "" // незнакомые команды молча пропускаем: канал не только для нас
 	}
+}
+
+// publishNews — /news: объявление Эфира, кадр всем подключённым и тихий пуш.
+// Правки и снятия нет: объявление уходит пушем и оседает в лентах клиентов, и
+// поправить его там задним числом всё равно нельзя.
+//
+// Текст берётся из сырой строки, а не из полей: strings.Fields склеил бы
+// переносы строк, а у объявления они — часть вёрстки.
+func (a *AdminBot) publishNews(raw string) string {
+	text := afterFirstWord(strings.TrimSpace(raw))
+	if text == "" || len(text) > maxMessageLen {
+		return fmt.Sprintf("Нужен текст от 1 до %d байт", maxMessageLen)
+	}
+	ts := time.Now().UnixMilli()
+	id, err := a.store.SaveAnnouncement(text, ts)
+	if err != nil {
+		slog.Error("admin news", "err", err)
+		return "Не удалось опубликовать — смотри логи сервера"
+	}
+	slog.Info("announcement published", "id", id)
+	a.hub.AnnounceNews(AnnouncementData{ID: id, Text: text, TS: ts})
+	pushed := "пуши выключены"
+	if a.push != nil {
+		go a.push.NotifyAnnouncement(text)
+		pushed = "тихий пуш отправляется"
+	}
+	return fmt.Sprintf("📣 Объявление <code>%d</code> опубликовано, %s", id, pushed)
+}
+
+// afterFirstWord — строка без первого слова и пробелов вокруг; переносы строк
+// внутри остатка сохраняются.
+func afterFirstWord(s string) string {
+	s = strings.TrimSpace(s)
+	i := strings.IndexFunc(s, unicode.IsSpace)
+	if i < 0 {
+		return ""
+	}
+	return strings.TrimSpace(s[i:])
 }
 
 // reasonSuffix добавляет причину к ответу, если она указана.

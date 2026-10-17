@@ -58,6 +58,7 @@ import (
 // раньше, просто молча.
 func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifier, notify *Notifier, gate *versionGate, pub *publisher, hub *Hub, geo Geocoder, push *Pusher) {
 	mux.HandleFunc("POST /account/delete", handleDeleteAccount(store))
+	mux.HandleFunc("GET /announcements", handleAnnouncements(store))
 	// GET покрывает и HEAD — им ходят сборщики превью ссылок (см. handleAppLink)
 	mux.HandleFunc("GET /app", handleAppLink(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
@@ -639,6 +640,24 @@ func handleHistory(store *Store) http.HandlerFunc {
 			return
 		}
 		writeJSON(w, http.StatusOK, HistoryData{Channel: channel, Messages: msgs})
+	}
+}
+
+// handleAnnouncements — лента объявлений Эфира: GET /announcements?after_id= →
+// 200 {announcements}; без авторизации, объявления публичные. after_id
+// (необязательный) — только новее него: проверка «есть ли новое» при старте.
+// Объявления не правятся и не снимаются, так что клиенту хватает дозагрузки.
+// Мусорный after_id равносилен отсутствию.
+func handleAnnouncements(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		afterID, _ := strconv.ParseInt(r.URL.Query().Get("after_id"), 10, 64)
+		list, err := store.Announcements(max(afterID, 0))
+		if err != nil {
+			slog.Error("announcements", "err", err)
+			writeRESTError(w, http.StatusInternalServerError, "internal", "announcements lookup failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, AnnouncementsData{Announcements: list})
 	}
 }
 
