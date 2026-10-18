@@ -1889,24 +1889,61 @@ func (s *Store) DeleteDeviceTokens(fcmTokens []string) error {
 // SetUserChannels заменяет набор каналов пользователя (вызывается на locate).
 // Полная замена, а не добавление: при переезде старые каналы должны исчезнуть,
 // иначе пуши продолжат приходить из района, откуда пользователь уехал.
-func (s *Store) SetUserChannels(userID int64, channels []string) error {
+//
+// Возвращает каналы, где участие человека в счётчике (ChannelSubscribers)
+// изменилось: вошёл (строки не было), вернулся (строка старше
+// subscriberWindow, в счётчике его не было) или ушёл (свежая строка, а канала
+// в новом наборе нет). По ним locate рассылает новое число участников. Тот же
+// locate на том же месте не меняет ничего — список пуст.
+func (s *Store) SetUserChannels(userID int64, channels []string) ([]string, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
-	if _, err := tx.Exec(`DELETE FROM user_channels WHERE user_id = ?`, userID); err != nil {
-		return err
+	now := time.Now()
+	cutoff := now.Add(-subscriberWindow).UnixMilli()
+	// прежний набор: канал → считался ли человек в нём (строка свежая)
+	counted := map[string]bool{}
+	rows, err := tx.Query(`SELECT channel, updated_at FROM user_channels WHERE user_id = ?`, userID)
+	if err != nil {
+		return nil, err
 	}
-	now := time.Now().UnixMilli()
+	for rows.Next() {
+		var ch string
+		var at int64
+		if err := rows.Scan(&ch, &at); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		counted[ch] = at > cutoff
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM user_channels WHERE user_id = ?`, userID); err != nil {
+		return nil, err
+	}
+	var changed []string
+	next := make(map[string]bool, len(channels))
 	for _, ch := range channels {
 		if _, err := tx.Exec(`
 			INSERT OR REPLACE INTO user_channels (user_id, channel, updated_at) VALUES (?, ?, ?)`,
-			userID, ch, now); err != nil {
-			return err
+			userID, ch, now.UnixMilli()); err != nil {
+			return nil, err
+		}
+		if !counted[ch] && !next[ch] {
+			changed = append(changed, ch)
+		}
+		next[ch] = true
+	}
+	for ch, was := range counted {
+		if was && !next[ch] {
+			changed = append(changed, ch)
 		}
 	}
-	return tx.Commit()
+	return changed, tx.Commit()
 }
 
 // SaveChannels запоминает имена и уровни каналов (вызывается на locate, рядом с

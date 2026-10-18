@@ -429,13 +429,13 @@ func TestStorePushTargets(t *testing.T) {
 	neighbour := mkTgUser(t, s, "2", "", "Neighbour")
 	far := mkTgUser(t, s, "3", "", "Far")
 	_ = author
-	if err := s.SetUserChannels(author, []string{"RU", "RU-MOW", "relation/1"}); err != nil {
+	if _, err := s.SetUserChannels(author, []string{"RU", "RU-MOW", "relation/1"}); err != nil {
 		t.Fatalf("channels 1: %v", err)
 	}
-	if err := s.SetUserChannels(neighbour, []string{"RU", "RU-MOW", "relation/1"}); err != nil {
+	if _, err := s.SetUserChannels(neighbour, []string{"RU", "RU-MOW", "relation/1"}); err != nil {
 		t.Fatalf("channels 2: %v", err)
 	}
-	if err := s.SetUserChannels(far, []string{"RU", "relation/999"}); err != nil {
+	if _, err := s.SetUserChannels(far, []string{"RU", "relation/999"}); err != nil {
 		t.Fatalf("channels 3: %v", err)
 	}
 	for _, d := range []struct {
@@ -466,7 +466,7 @@ func TestStorePushTargets(t *testing.T) {
 
 	// переезд: набор каналов заменяется целиком, из старого района пуши больше
 	// не приходят
-	if err := s.SetUserChannels(neighbour, []string{"RU", "relation/777"}); err != nil {
+	if _, err := s.SetUserChannels(neighbour, []string{"RU", "relation/777"}); err != nil {
 		t.Fatalf("move: %v", err)
 	}
 	if got, err := s.PushTargets("relation/1", author); err != nil || len(got) != 0 {
@@ -732,13 +732,13 @@ func TestStoreChannelSubscribers(t *testing.T) {
 	b := mkTgUser(t, s, "2", "", "b")
 	c := mkTgUser(t, s, "3", "", "c")
 	// трое в стране, двое в одном районе, третий в своём
-	if err := s.SetUserChannels(a, []string{"RU", "relation/1"}); err != nil {
+	if _, err := s.SetUserChannels(a, []string{"RU", "relation/1"}); err != nil {
 		t.Fatalf("channels 1: %v", err)
 	}
-	if err := s.SetUserChannels(b, []string{"RU", "relation/1"}); err != nil {
+	if _, err := s.SetUserChannels(b, []string{"RU", "relation/1"}); err != nil {
 		t.Fatalf("channels 2: %v", err)
 	}
-	if err := s.SetUserChannels(c, []string{"RU", "relation/2"}); err != nil {
+	if _, err := s.SetUserChannels(c, []string{"RU", "relation/2"}); err != nil {
 		t.Fatalf("channels 3: %v", err)
 	}
 
@@ -777,7 +777,7 @@ func TestStoreChannelSubscribersWindow(t *testing.T) {
 	live := mkTgUser(t, s, "10", "", "live")
 	gone := mkTgUser(t, s, "11", "", "gone")
 	for _, u := range []int64{live, gone} {
-		if err := s.SetUserChannels(u, []string{"RU", "relation/1"}); err != nil {
+		if _, err := s.SetUserChannels(u, []string{"RU", "relation/1"}); err != nil {
 			t.Fatalf("channels %d: %v", u, err)
 		}
 	}
@@ -811,7 +811,7 @@ func TestStoreChannelSubscribersWindow(t *testing.T) {
 	}
 
 	// вернулся и открыл приложение — снова в счётчике
-	if err := s.SetUserChannels(gone, []string{"RU", "relation/1"}); err != nil {
+	if _, err := s.SetUserChannels(gone, []string{"RU", "relation/1"}); err != nil {
 		t.Fatalf("возврат: %v", err)
 	}
 	if m, err := s.ChannelSubscribers([]string{"RU"}); err != nil || m["RU"] != 2 {
@@ -882,11 +882,11 @@ func TestStoreBlocks(t *testing.T) {
 		if err := s.SaveDeviceToken(p.user, p.dev, "android"); err != nil {
 			t.Fatalf("token %s: %v", p.dev, err)
 		}
-		if err := s.SetUserChannels(p.user, []string{"RU"}); err != nil {
+		if _, err := s.SetUserChannels(p.user, []string{"RU"}); err != nil {
 			t.Fatalf("channels %d: %v", p.user, err)
 		}
 	}
-	if err := s.SetUserChannels(troll, []string{"RU"}); err != nil {
+	if _, err := s.SetUserChannels(troll, []string{"RU"}); err != nil {
 		t.Fatalf("channels troll: %v", err)
 	}
 	got, err := s.PushTargets("RU", troll)

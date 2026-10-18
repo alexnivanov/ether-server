@@ -24,6 +24,9 @@ const (
 	TypeReply   = "reply"   // Message с parent_id — ответ в тред
 	TypeError   = "error"   // {code, message}
 
+	// {channel, subscribers} — в канале стало больше или меньше людей
+	TypeSubscribers = "subscribers"
+
 	// всем подключённым, а не подписчикам канала (см. Hub.AnnounceNews);
 	// выпущенные сборки незнакомые кадры пропускают
 	TypeAnnouncement = "announcement" // {id, text, ts} — новое объявление Эфира
@@ -279,6 +282,15 @@ type PublishRequest struct {
 // отсеет дубль по серверному id.
 type PublishedData struct {
 	Message MessageData `json:"message"`
+}
+
+// SubscribersData — кадр `subscribers`: новое число участников канала (то же,
+// что Channel.Subscribers в `located`). Уходит подписчикам канала, когда
+// кто-то в нём появился или из него ушёл (см. Store.SetUserChannels), иначе
+// число застывало до следующего locate смотрящего.
+type SubscribersData struct {
+	Channel     string `json:"channel"`
+	Subscribers int    `json:"subscribers"`
 }
 
 // RepliesData — тело ответа GET /messages/{id}/replies: корень и все ответы

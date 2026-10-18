@@ -40,6 +40,7 @@ type Hub struct {
 type channelFrame struct {
 	channel string
 	env     Envelope
+	except  *Client // кому не слать: у него и так свежее; nil — всем
 }
 
 type subscription struct {
@@ -80,6 +81,20 @@ func (h *Hub) AnnounceVoted(channel string, d VotedData) {
 		return
 	}
 	h.announceIn <- channelFrame{channel: channel, env: envelope(TypeVoted, d)}
+}
+
+// AnnounceSubscribers говорит подписчикам канала, сколько в нём теперь людей.
+// except — тот, чей locate это число сдвинул: свежие числа он уже получил в
+// своём `located`. nil-хаб молча ничего не делает — как и у AnnounceRemoved.
+func (h *Hub) AnnounceSubscribers(channel string, n int, except *Client) {
+	if h == nil {
+		return
+	}
+	h.announceIn <- channelFrame{
+		channel: channel,
+		env:     envelope(TypeSubscribers, SubscribersData{Channel: channel, Subscribers: n}),
+		except:  except,
+	}
 }
 
 // AnnounceEdited говорит подписчикам канала, что автор поправил текст
@@ -172,6 +187,9 @@ func (h *Hub) Run() {
 
 		case f := <-h.announceIn:
 			for c := range h.channels[f.channel] {
+				if c == f.except {
+					continue
+				}
 				select {
 				case c.send <- f.env:
 				default:

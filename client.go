@@ -158,8 +158,10 @@ func (c *Client) readPump() {
 			//
 			// Порядок важен: сначала записываем свои каналы, потом считаем
 			// подписчиков — иначе человек не увидел бы в счётчике себя.
+			var moved []string // каналы, где число участников сдвинулось
 			if userID, authed := c.author(); authed {
-				if err := c.store.SetUserChannels(userID, ids); err != nil {
+				var err error
+				if moved, err = c.store.SetUserChannels(userID, ids); err != nil {
 					slog.Error("set user channels", "err", err, "user_id", userID)
 				}
 			}
@@ -182,6 +184,18 @@ func (c *Client) readPump() {
 				}
 			}
 			c.out(envelope(TypeLocated, LocatedData{Channels: chans}))
+			// Остальным в этих каналах — новое число: иначе оно у них застыло бы
+			// до их собственного locate. Повторный locate на том же месте не
+			// сдвигает ничего, и кадров нет.
+			if len(moved) > 0 {
+				if counts, err := c.store.ChannelSubscribers(moved); err != nil {
+					slog.Error("channel subscribers", "err", err)
+				} else {
+					for _, ch := range moved {
+						c.hub.AnnounceSubscribers(ch, counts[ch], c)
+					}
+				}
+			}
 
 		default:
 			c.sendError("unknown_type", "unknown message type: "+env.Type)
