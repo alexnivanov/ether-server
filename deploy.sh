@@ -59,8 +59,25 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
 # (install заменяет файл через временный + rename, старый не «полуперезаписан»).
 remote_bin="${REMOTE_DIR}/ether-server"
 echo "==> upload → ${SSH_HOST}:/tmp/ether-server.new"
-# Без -q: показываем прогресс scp
-scp "$out" "${SSH_HOST}:/tmp/ether-server.new"
+# rsync, а не scp: на плохом канале (потери, сотни мс задержки) scp полз и
+# зависал так, что не выходил по Ctrl+C. --partial оставляет на сервере
+# недокачанное, и следующая попытка продолжает с места обрыва. Зависание ловит
+# ssh-keepalive: сервер молчит ~минуту — соединение рвётся, цикл пробует снова.
+# Общего таймаута на загрузку нет: медленная, но идущая загрузка не прерывается.
+upload_tries=5
+for try in $(seq 1 "$upload_tries"); do
+	if rsync --partial --progress \
+		-e "ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=4" \
+		"$out" "${SSH_HOST}:/tmp/ether-server.new"; then
+		break
+	fi
+	if [ "$try" -eq "$upload_tries" ]; then
+		echo "загрузка не удалась за ${upload_tries} попыток" >&2
+		exit 1
+	fi
+	echo "==> обрыв, попытка $((try + 1))/${upload_tries}…"
+	sleep 5
+done
 
 # Скрипты бэкапа и алерта о падениях едут вместе с бинарником — иначе версия на
 # сервере тихо разъедется с репозиторием. Юниты ether-backup.service и ether-server.service
