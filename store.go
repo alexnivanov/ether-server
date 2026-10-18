@@ -1116,8 +1116,8 @@ func scanMessages(rows *sql.Rows, capHint int) ([]MessageData, error) {
 }
 
 // pageQuery дописывает к выборке фильтр блокировок, курсор и порядок и
-// возвращает страницу хронологически. Общая часть ленты и треда: страница
-// берётся с новых (ORDER BY id DESC LIMIT), а отдаётся по возрастанию id.
+// возвращает страницу хронологически: берётся с новых (ORDER BY id DESC
+// LIMIT), а отдаётся по возрастанию id.
 func (s *Store) pageQuery(q string, args []any, beforeID int64, limit int, viewerID int64) ([]MessageData, error) {
 	if viewerID > 0 {
 		q += ` AND m.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?)`
@@ -1157,12 +1157,14 @@ func (s *Store) History(channel string, beforeID int64, limit int, viewerID int6
 	return s.pageQuery(q, []any{viewerID, viewerID, viewerID, channel}, beforeID, limit, viewerID)
 }
 
-// Replies — тред: корень и страница его ответов (хронологически, beforeID —
-// страница вверх). Корень отдаётся всегда: тред открывают и из пуша, когда
+// Replies — тред: корень и ВСЕ его ответы, хронологически. Без пагинации: тред
+// — один разговор, ответы в нём идут не чаще раза в минуту на человека, и
+// страница тут только усложнила бы клиент. Понадобится — добавится курсором,
+// как у History. Корень отдаётся всегда: тред открывают и из пуша, когда
 // корня в загруженной странице ленты может не быть. Корня нет (удалён, уехал
 // по TTL) — ErrMessageGone. rootID должен быть корнем; ответ на ответ сюда
 // приводит вызывающий (см. ThreadRoot).
-func (s *Store) Replies(rootID, beforeID int64, limit int, viewerID int64) (MessageData, []MessageData, error) {
+func (s *Store) Replies(rootID, viewerID int64) (MessageData, []MessageData, error) {
 	rows, err := s.db.Query(`SELECT `+messageColumns+` WHERE m.id = ? AND m.parent_id IS NULL`,
 		viewerID, viewerID, viewerID, rootID)
 	if err != nil {
@@ -1176,7 +1178,16 @@ func (s *Store) Replies(rootID, beforeID int64, limit int, viewerID int64) (Mess
 		return MessageData{}, nil, ErrMessageGone
 	}
 	q := `SELECT ` + messageColumns + ` WHERE m.parent_id = ?`
-	replies, err := s.pageQuery(q, []any{viewerID, viewerID, viewerID, rootID}, beforeID, limit, viewerID)
+	args := []any{viewerID, viewerID, viewerID, rootID}
+	if viewerID > 0 {
+		q += ` AND m.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?)`
+		args = append(args, viewerID)
+	}
+	rows, err = s.db.Query(q+` ORDER BY m.id`, args...)
+	if err != nil {
+		return MessageData{}, nil, err
+	}
+	replies, err := scanMessages(rows, roots[0].ReplyCount)
 	if err != nil {
 		return MessageData{}, nil, err
 	}

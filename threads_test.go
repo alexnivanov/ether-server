@@ -57,7 +57,7 @@ func TestStoreThreads(t *testing.T) {
 		t.Errorf("у корня без ответов счётчик: %+v", feed[1])
 	}
 
-	gotRoot, replies, err := s.Replies(root, 0, 50, 0)
+	gotRoot, replies, err := s.Replies(root, 0)
 	if err != nil {
 		t.Fatalf("replies: %v", err)
 	}
@@ -70,9 +70,6 @@ func TestStoreThreads(t *testing.T) {
 	if replies[0].ParentID != root || replies[0].Sender != "Боря" {
 		t.Errorf("ответ = %+v, want parent_id корня и имя автора", replies[0])
 	}
-	if _, older, _ := s.Replies(root, r2, 50, 0); !slices.Equal(idsOf(older), []int64{r1}) {
-		t.Errorf("страница вверх = %v, want [%d]", idsOf(older), r1)
-	}
 
 	if err := s.BlockUser(viewer, b); err != nil {
 		t.Fatalf("block: %v", err)
@@ -81,7 +78,7 @@ func TestStoreThreads(t *testing.T) {
 	if feed[0].ReplyCount != 1 || feed[0].LastReplyTS != 6000 {
 		t.Errorf("с блоком: reply_count=%d last_reply_ts=%d, want 1/6000", feed[0].ReplyCount, feed[0].LastReplyTS)
 	}
-	if _, replies, _ := s.Replies(root, 0, 50, viewer); !slices.Equal(idsOf(replies), []int64{r2}) {
+	if _, replies, _ := s.Replies(root, viewer); !slices.Equal(idsOf(replies), []int64{r2}) {
 		t.Errorf("тред с блоком = %v, want только [%d]", idsOf(replies), r2)
 	}
 
@@ -95,7 +92,7 @@ func TestStoreThreads(t *testing.T) {
 	if _, _, err := s.ThreadRoot(999999); err != ErrMessageGone {
 		t.Errorf("ThreadRoot(нет) err = %v, want ErrMessageGone", err)
 	}
-	if _, _, err := s.Replies(r1, 0, 50, 0); err != ErrMessageGone {
+	if _, _, err := s.Replies(r1, 0); err != ErrMessageGone {
 		t.Errorf("Replies по id ответа err = %v, want ErrMessageGone (приводит вызывающий)", err)
 	}
 }
@@ -427,7 +424,7 @@ func TestPublishReplyIdempotent(t *testing.T) {
 	if got := int64(body["message"].(map[string]any)["parent_id"].(float64)); got != root {
 		t.Fatalf("повтор: parent_id = %d, want %d", got, root)
 	}
-	_, replies, _ := store.Replies(root, 0, 50, 0)
+	_, replies, _ := store.Replies(root, 0)
 	if len(replies) != 1 {
 		t.Fatalf("повтор создал дубль: %d ответов", len(replies))
 	}

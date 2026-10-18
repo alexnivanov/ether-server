@@ -281,8 +281,8 @@ type PublishedData struct {
 	Message MessageData `json:"message"`
 }
 
-// RepliesData — тело ответа GET /messages/{id}/replies: корень и страница
-// ответов (хронологически).
+// RepliesData — тело ответа GET /messages/{id}/replies: корень и все ответы
+// (хронологически).
 type RepliesData struct {
 	Root    MessageData   `json:"root"`
 	Replies []MessageData `json:"replies"`

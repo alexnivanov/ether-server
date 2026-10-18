@@ -662,9 +662,10 @@ func handleAnnouncements(store *Store) http.HandlerFunc {
 	}
 }
 
-// handleReplies — тред: GET /messages/{id}/replies?before_id=&limit= →
-// 200 {root, replies} | 404 not_found | 400 bad_data. Как и история, без
-// авторизации; токен (опц.) убирает авторов, которых читатель заблокировал.
+// handleReplies — тред: GET /messages/{id}/replies → 200 {root, replies} |
+// 404 not_found | 400 bad_data. Все ответы разом, без пагинации (см.
+// Store.Replies). Как и история, без авторизации; токен (опц.) убирает
+// авторов, которых читатель заблокировал.
 // id ответа тоже годится: тред находится по его корню (см. Store.ThreadRoot),
 // так что клиенту неважно, какой id у него на руках.
 func handleReplies(store *Store) http.HandlerFunc {
@@ -674,12 +675,6 @@ func handleReplies(store *Store) http.HandlerFunc {
 			writeRESTError(w, http.StatusBadRequest, "bad_data", "bad message id")
 			return
 		}
-		q := r.URL.Query()
-		limit := 50
-		if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
-			limit = min(n, maxHistoryLimit)
-		}
-		beforeID, _ := strconv.ParseInt(q.Get("before_id"), 10, 64)
 		var viewerID int64
 		if token := bearerToken(r); token != "" {
 			if u, err := store.UserBySession(token); err != nil {
@@ -691,7 +686,7 @@ func handleReplies(store *Store) http.HandlerFunc {
 		rootID, _, err := store.ThreadRoot(id)
 		if err == nil {
 			var data RepliesData
-			data.Root, data.Replies, err = store.Replies(rootID, beforeID, limit, viewerID)
+			data.Root, data.Replies, err = store.Replies(rootID, viewerID)
 			if err == nil {
 				writeJSON(w, http.StatusOK, data)
 				return
