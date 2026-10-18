@@ -181,7 +181,13 @@ func (h *Hub) Run() {
 			}
 
 		case m := <-h.broadcast:
-			env := envelope(TypeMessage, m)
+			// Ответ — своим кадром: сборки без тредов его пропускают, и в их
+			// ленте не появляются реплики без контекста.
+			typ := TypeMessage
+			if m.ParentID != 0 {
+				typ = TypeReply
+			}
+			env := envelope(typ, m)
 			for c := range h.channels[m.Channel] {
 				select {
 				case c.send <- env:

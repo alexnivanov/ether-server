@@ -99,6 +99,36 @@ func (p *Pusher) Notify(channelID string, senderID int64, sender, text string) {
 	}, tokens)
 }
 
+// NotifyReply — пуш об ответе в треде: автору корня и тем, кто в треде уже
+// отвечал (Store.ThreadPushTargets), со звуком, как сообщение. Вид тот же, что
+// у пуша о сообщении — канал в заголовке, «имя: текст» в теле, — а в data
+// type=reply и message_id корня: тап ведёт в тред, ответа в ленте канала нет.
+// Сборки без тредов по channel откроют комнату: тред они не покажут, но и
+// никуда не денутся.
+func (p *Pusher) NotifyReply(channelID string, rootID, senderID int64, sender, text string) {
+	tokens, err := p.store.ThreadPushTargets(rootID, senderID)
+	if err != nil {
+		slog.Error("reply push targets", "err", err, "root_id", rootID)
+		return
+	}
+	if len(tokens) == 0 {
+		return
+	}
+	name := p.channelName(channelID)
+	title, body := pushText(name, sender, text)
+	data := channelData(channelID, name)
+	data["type"] = "reply"
+	data["message_id"] = strconv.FormatInt(rootID, 10)
+	p.deliver(pushNote{
+		kind:    "reply",
+		channel: channelID,
+		title:   title,
+		body:    body,
+		data:    data,
+		sound:   true,
+	}, tokens)
+}
+
 // NotifyVote уведомляет автора о том, что под его сообщением появилась отметка.
 // Получатель ровно один — сам автор, поэтому устройства берём напрямую
 // (Store.DeviceTokensForUser), а не через подписчиков канала.
@@ -129,6 +159,10 @@ func (p *Pusher) NotifyVote(voterID, messageID int64, channel string, n VoteNoti
 	// message_id ведёт тап к самому сообщению, а не просто в комнату.
 	data["type"] = "vote"
 	data["message_id"] = strconv.FormatInt(messageID, 10)
+	// отметили ответ: тап ведёт в тред его корня, в ленте канала ответа нет
+	if n.RootID > 0 {
+		data["root_id"] = strconv.FormatInt(n.RootID, 10)
+	}
 	p.deliver(pushNote{
 		kind:    "vote",
 		channel: channel,
@@ -222,7 +256,7 @@ func (p *Pusher) channelName(channelID string) string {
 
 // pushNote — готовое уведомление: что показать и что положить в data.
 type pushNote struct {
-	kind    string // message | vote | announcement — только для строки в логе
+	kind    string // message | reply | vote | announcement — только для строки в логе
 	channel string
 	title   string
 	body    string

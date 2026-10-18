@@ -121,9 +121,16 @@ CREATE TABLE IF NOT EXISTS messages (
 	-- когда автор последний раз правил текст (unix-миллисекунды); 0 — не правил.
 	-- Время, а не флаг: клиент показывает только «изм.», но момент правки
 	-- пригодится модерации, если отредактированное сообщение станет спорным.
-	edited_at INTEGER NOT NULL DEFAULT 0
+	edited_at INTEGER NOT NULL DEFAULT 0,
+	-- корень треда, если это ответ; NULL — само сообщение корень. Тред в один
+	-- уровень: ответ на ответ сервер приводит к корню (см. Store.ThreadRoot).
+	-- ON DELETE CASCADE: удаление корня (автором, модератором, по TTL) уносит
+	-- тред целиком — ответы «непонятно на что» не остаются.
+	parent_id INTEGER REFERENCES messages(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS messages_channel_id ON messages(channel, id);
+-- ответы треда по порядку и «есть ли у корня свежие ответы» для TTL
+CREATE INDEX IF NOT EXISTS messages_parent ON messages(parent_id, id);
 -- под уборку старых сообщений по TTL (DeleteMessagesOlderThan)
 CREATE INDEX IF NOT EXISTS messages_ts ON messages(ts);
 -- Идемпотентность повтора отправки. Индекс ЧАСТИЧНЫЙ: у старых строк и у всего,
@@ -481,7 +488,7 @@ func OpenStore(path string) (*Store, error) {
 
 // schemaVersion — на какую версию схемы рассчитан этот бинарник. Поднимать
 // ВМЕСТЕ с добавлением шага в migrations, иначе шаг не выполнится.
-const schemaVersion = 2
+const schemaVersion = 3
 
 // migrations — шаги по версиям: индекс это версия, НА которую шаг переводит
 // базу. Ноль не используется: версия 0 — база, не знавшая миграций вовсе.
@@ -509,6 +516,11 @@ var migrations = [][]string{
 	// сообщения и пометка «изм.» у клиента.
 	2: {
 		`ALTER TABLE messages ADD COLUMN edited_at INTEGER NOT NULL DEFAULT 0`,
+	},
+	// parent_id — треды (см. Store.SaveReply). Индекс по колонке — в
+	// storeSchema, он применяется после шагов.
+	3: {
+		`ALTER TABLE messages ADD COLUMN parent_id INTEGER REFERENCES messages(id) ON DELETE CASCADE`,
 	},
 }
 
@@ -954,6 +966,7 @@ type savedMessage struct {
 	channel  string
 	text     string
 	editedAt int64
+	parentID int64 // 0 — корень
 }
 
 // SaveMessage пишет сообщение в историю. clientMsgID делает повтор
@@ -968,10 +981,28 @@ type savedMessage struct {
 func (s *Store) SaveMessage(
 	channel string, userID int64, text string, ts int64, clientMsgID string,
 ) (int64, savedMessage, error) {
+	return s.saveMessage(channel, userID, text, ts, clientMsgID, 0)
+}
+
+// SaveReply — то же, что SaveMessage, но ответ в тред корня rootID. Канал
+// ответа — канал корня, его вызывающий берёт из Store.ThreadRoot.
+func (s *Store) SaveReply(
+	rootID int64, channel string, userID int64, text string, ts int64, clientMsgID string,
+) (int64, savedMessage, error) {
+	return s.saveMessage(channel, userID, text, ts, clientMsgID, rootID)
+}
+
+func (s *Store) saveMessage(
+	channel string, userID int64, text string, ts int64, clientMsgID string, parentID int64,
+) (int64, savedMessage, error) {
+	var parent any // NULL у корня: 0 не бывает валидным messages.id
+	if parentID > 0 {
+		parent = parentID
+	}
 	res, err := s.db.Exec(`
-		INSERT INTO messages (channel, user_id, text, ts, client_msg_id)
-		VALUES (?, ?, ?, ?, ?)`,
-		channel, userID, text, ts, clientMsgID)
+		INSERT INTO messages (channel, user_id, text, ts, client_msg_id, parent_id)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		channel, userID, text, ts, clientMsgID, parent)
 	if err == nil {
 		id, err := res.LastInsertId()
 		return id, savedMessage{}, err
@@ -997,9 +1028,9 @@ func (s *Store) MessageByClientMsgID(userID int64, clientMsgID string) (savedMes
 	}
 	var m savedMessage
 	err := s.db.QueryRow(`
-		SELECT id, ts, channel, text, edited_at FROM messages
+		SELECT id, ts, channel, text, edited_at, COALESCE(parent_id, 0) FROM messages
 		WHERE user_id = ? AND client_msg_id = ?`,
-		userID, clientMsgID).Scan(&m.id, &m.ts, &m.channel, &m.text, &m.editedAt)
+		userID, clientMsgID).Scan(&m.id, &m.ts, &m.channel, &m.text, &m.editedAt, &m.parentID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return savedMessage{}, nil
 	}
@@ -1018,41 +1049,76 @@ func isUniqueViolation(err error) bool {
 	return strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-// DeleteMessagesOlderThan удаляет сообщения старше ttl и возвращает их число.
-// Зовётся по таймеру (см. cleanup.go): чат географический и живой, старая
-// история никому не нужна, а база не должна расти бесконечно.
+// DeleteMessagesOlderThan удаляет сообщения старше ttl и возвращает число
+// удалённых корней. Зовётся по таймеру (см. cleanup.go): чат географический и
+// живой, старая история никому не нужна, а база не должна расти бесконечно.
+//
+// Тред живёт по последней активности: корень уходит, только когда и он сам, и
+// все его ответы старше ttl, а ответы уезжают с ним каскадом. По одному они не
+// удаляются: иначе старый корень уезжал бы раньше свежих ответов, и они висели
+// бы «непонятно на что». Обратная сторона — тред, где отвечают хотя бы раз за
+// ttl, живёт сколько угодно; это и есть живой разговор.
 func (s *Store) DeleteMessagesOlderThan(ttl time.Duration) (int64, error) {
 	cutoff := time.Now().Add(-ttl).UnixMilli()
-	res, err := s.db.Exec(`DELETE FROM messages WHERE ts < ?`, cutoff)
+	res, err := s.db.Exec(`
+		DELETE FROM messages
+		WHERE parent_id IS NULL AND ts < ?
+		  AND NOT EXISTS (SELECT 1 FROM messages r WHERE r.parent_id = messages.id AND r.ts >= ?)`,
+		cutoff, cutoff)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// History возвращает до limit последних сообщений канала в хронологическом
-// порядке (по возрастанию id). beforeID > 0 — страница вверх: только сообщения
-// старше него.
-// viewerID > 0 — читатель известен (клиент прислал токен), и из выборки
-// исключаются авторы, которых он заблокировал: иначе после блокировки чужие
-// сообщения возвращались бы при каждой подгрузке истории. 0 — анонимное чтение,
-// фильтровать нечего.
-func (s *Store) History(channel string, beforeID int64, limit int, viewerID int64) ([]MessageData, error) {
-	// имя, @username и аватар автора — JOIN из users по user_id (в messages их
-	// нет). LEFT JOIN — защитно: при удалении аккаунта сообщения удаляются
-	// каскадом вместе с автором (см. DeleteUser), поэтому «висячих» строк без
-	// users быть не должно, но JOIN не должен ронять выборку, если что.
-	//
-	// Голоса — двумя скалярными подзапросами по votes_message: сумма под
-	// сообщением и свой голос смотрящего (0 у не вошедшего — viewerID тогда 0 и
-	// не совпадёт ни с кем). Подзапросы, а не GROUP BY по всей таблице: строк тут
-	// не больше maxHistoryLimit, и каждая идёт по индексу.
-	q := `SELECT m.id, m.channel, m.user_id, COALESCE(u.full_name, ''), COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts, m.edited_at,
-			(SELECT COALESCE(SUM(value), 0) FROM votes WHERE message_id = m.id),
-			COALESCE((SELECT value FROM votes WHERE message_id = m.id AND voter_user_id = ?), 0)
-		FROM messages m LEFT JOIN users u ON u.id = m.user_id
-		WHERE m.channel = ?`
-	args := []any{viewerID, channel}
+// messageColumns — строка сообщения для истории и треда, общая, чтобы лента и
+// тред отдавали одну и ту же форму. Имя, @username и аватар автора — JOIN из
+// users по user_id (в messages их нет); LEFT JOIN защитно: при удалении
+// аккаунта сообщения уходят каскадом (см. DeleteUser), «висячих» строк быть
+// не должно, но и ронять выборку из-за них незачем.
+//
+// Голоса — скалярными подзапросами по votes_message: сумма под сообщением и
+// свой голос смотрящего (0 у не вошедшего — viewerID тогда 0 и не совпадёт ни
+// с кем). Подзапросы, а не GROUP BY по всей таблице: строк тут не больше
+// maxHistoryLimit, и каждая идёт по индексу.
+//
+// Счётчик и время последнего ответа — по messages_parent, без авторов,
+// которых смотрящий заблокировал: иначе у корня стояло бы «3 ответа», а в
+// треде их было бы два. У ответа оба нуля.
+//
+// Плейсхолдеры по порядку: viewerID трижды (свой голос, две выборки ответов).
+const messageColumns = `m.id, m.channel, m.user_id, COALESCE(u.full_name, ''),
+		COALESCE(u.tg_username, ''), COALESCE(u.avatar_url, ''), m.text, m.ts, m.edited_at,
+		COALESCE(m.parent_id, 0),
+		(SELECT COALESCE(SUM(value), 0) FROM votes WHERE message_id = m.id),
+		COALESCE((SELECT value FROM votes WHERE message_id = m.id AND voter_user_id = ?), 0),
+		(SELECT COUNT(*) FROM messages r WHERE r.parent_id = m.id
+			AND r.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?)),
+		(SELECT COALESCE(MAX(r.ts), 0) FROM messages r WHERE r.parent_id = m.id
+			AND r.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?))
+	FROM messages m LEFT JOIN users u ON u.id = m.user_id`
+
+func scanMessages(rows *sql.Rows, capHint int) ([]MessageData, error) {
+	defer rows.Close()
+	msgs := make([]MessageData, 0, capHint)
+	for rows.Next() {
+		var m MessageData
+		if err := rows.Scan(
+			&m.ID, &m.Channel, &m.SenderID, &m.Sender, &m.Username,
+			&m.AvatarURL, &m.Text, &m.TS, &m.EditedAt, &m.ParentID,
+			&m.Rating, &m.MyVote, &m.ReplyCount, &m.LastReplyTS,
+		); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, rows.Err()
+}
+
+// pageQuery дописывает к выборке фильтр блокировок, курсор и порядок и
+// возвращает страницу хронологически. Общая часть ленты и треда: страница
+// берётся с новых (ORDER BY id DESC LIMIT), а отдаётся по возрастанию id.
+func (s *Store) pageQuery(q string, args []any, beforeID int64, limit int, viewerID int64) ([]MessageData, error) {
 	if viewerID > 0 {
 		q += ` AND m.user_id NOT IN (SELECT blocked_user_id FROM blocks WHERE blocker_user_id = ?)`
 		args = append(args, viewerID)
@@ -1063,32 +1129,71 @@ func (s *Store) History(channel string, beforeID int64, limit int, viewerID int6
 	}
 	q += ` ORDER BY m.id DESC LIMIT ?`
 	args = append(args, limit)
-
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	msgs := make([]MessageData, 0, limit)
-	for rows.Next() {
-		var m MessageData
-		if err := rows.Scan(
-			&m.ID, &m.Channel, &m.SenderID, &m.Sender, &m.Username,
-			&m.AvatarURL, &m.Text, &m.TS, &m.EditedAt, &m.Rating, &m.MyVote,
-		); err != nil {
-			return nil, err
-		}
-		msgs = append(msgs, m)
-	}
-	if err := rows.Err(); err != nil {
+	msgs, err := scanMessages(rows, limit)
+	if err != nil {
 		return nil, err
 	}
-	// выборка шла новые→старые, отдаём хронологически
 	for i, j := 0, len(msgs)-1; i < j; i, j = i+1, j-1 {
 		msgs[i], msgs[j] = msgs[j], msgs[i]
 	}
 	return msgs, nil
+}
+
+// History возвращает до limit последних КОРНЕЙ канала в хронологическом
+// порядке (по возрастанию id), у каждого счётчик ответов. Ответы в ленту не
+// попадают: они живут в треде (Store.Replies), и сборки без тредов получают
+// ленту без них, а не перемешанную с репликами без контекста.
+// beforeID > 0 — страница вверх: только корни старше него.
+// viewerID > 0 — читатель известен (клиент прислал токен), и из выборки
+// исключаются авторы, которых он заблокировал: иначе после блокировки чужие
+// сообщения возвращались бы при каждой подгрузке истории. 0 — анонимное чтение,
+// фильтровать нечего.
+func (s *Store) History(channel string, beforeID int64, limit int, viewerID int64) ([]MessageData, error) {
+	q := `SELECT ` + messageColumns + ` WHERE m.channel = ? AND m.parent_id IS NULL`
+	return s.pageQuery(q, []any{viewerID, viewerID, viewerID, channel}, beforeID, limit, viewerID)
+}
+
+// Replies — тред: корень и страница его ответов (хронологически, beforeID —
+// страница вверх). Корень отдаётся всегда: тред открывают и из пуша, когда
+// корня в загруженной странице ленты может не быть. Корня нет (удалён, уехал
+// по TTL) — ErrMessageGone. rootID должен быть корнем; ответ на ответ сюда
+// приводит вызывающий (см. ThreadRoot).
+func (s *Store) Replies(rootID, beforeID int64, limit int, viewerID int64) (MessageData, []MessageData, error) {
+	rows, err := s.db.Query(`SELECT `+messageColumns+` WHERE m.id = ? AND m.parent_id IS NULL`,
+		viewerID, viewerID, viewerID, rootID)
+	if err != nil {
+		return MessageData{}, nil, err
+	}
+	roots, err := scanMessages(rows, 1)
+	if err != nil {
+		return MessageData{}, nil, err
+	}
+	if len(roots) == 0 {
+		return MessageData{}, nil, ErrMessageGone
+	}
+	q := `SELECT ` + messageColumns + ` WHERE m.parent_id = ?`
+	replies, err := s.pageQuery(q, []any{viewerID, viewerID, viewerID, rootID}, beforeID, limit, viewerID)
+	if err != nil {
+		return MessageData{}, nil, err
+	}
+	return roots[0], replies, nil
+}
+
+// ThreadRoot — корень треда для сообщения id и его канал: у корня это он сам,
+// у ответа — его parent_id. Так ответ на ответ встаёт в тот же тред, а клиенту
+// не нужно помнить, кому именно отвечали: тред в один уровень. Сообщения нет —
+// ErrMessageGone.
+func (s *Store) ThreadRoot(id int64) (rootID int64, channel string, err error) {
+	err = s.db.QueryRow(`SELECT COALESCE(parent_id, id), channel FROM messages WHERE id = ?`, id).
+		Scan(&rootID, &channel)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, "", ErrMessageGone
+	}
+	return rootID, channel, err
 }
 
 // DeleteMessage удаляет одно сообщение (реакция на жалобу). Возвращает false,
@@ -1277,6 +1382,9 @@ type VoteState struct {
 type VoteNotice struct {
 	AuthorID int64
 	Text     string
+	// RootID — корень треда, если отметили ответ; 0 — отметили корень. Тап по
+	// уведомлению должен вести в тред: в ленте канала ответа нет.
+	RootID int64
 }
 
 // VoteOutcome — всё, что случилось от одного голоса: что показать
@@ -1316,10 +1424,10 @@ func (s *Store) Vote(voterID, messageID int64, value int) (VoteOutcome, error) {
 
 	// Канал и текст берём тем же запросом, что и автора: они нужны уведомлению,
 	// а отдельное обращение к messages ради них — лишний проход по той же строке.
-	var authorID int64
+	var authorID, rootID int64
 	var channel, text string
-	err = tx.QueryRow(`SELECT user_id, channel, text FROM messages WHERE id = ?`, messageID).
-		Scan(&authorID, &channel, &text)
+	err = tx.QueryRow(`SELECT user_id, channel, text, COALESCE(parent_id, 0) FROM messages WHERE id = ?`, messageID).
+		Scan(&authorID, &channel, &text, &rootID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return VoteOutcome{}, ErrMessageGone
 	}
@@ -1370,7 +1478,7 @@ func (s *Store) Vote(voterID, messageID int64, value int) (VoteOutcome, error) {
 			voterID, messageID, authorID, value, now); err != nil {
 			return VoteOutcome{}, err
 		}
-		notice = &VoteNotice{AuthorID: authorID, Text: text}
+		notice = &VoteNotice{AuthorID: authorID, Text: text, RootID: rootID}
 	}
 
 	st, err := voteState(tx, voterID, messageID)
@@ -1923,6 +2031,34 @@ func (s *Store) PushTargets(channel string, exceptUserID int64) ([]string, error
 		WHERE uc.channel = ? AND uc.user_id != ?
 		  AND uc.user_id NOT IN (SELECT blocker_user_id FROM blocks WHERE blocked_user_id = ?)`,
 		channel, exceptUserID, exceptUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var tokens []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			return nil, err
+		}
+		tokens = append(tokens, t)
+	}
+	return tokens, rows.Err()
+}
+
+// ThreadPushTargets — устройства участников треда: автора корня и всех, кто в
+// нём уже отвечал. Кроме самого отвечающего и тех, кто его заблокировал (то же
+// обещание «я его больше не вижу», что в PushTargets). Подписчиков канала тут
+// нет намеренно: ответ — продолжение чужого разговора, и будить им весь канал
+// значило бы поток пушей на каждую реплику каждого треда. Подписан ли участник
+// на канал сейчас, не важно: тред его, он туда писал.
+func (s *Store) ThreadPushTargets(rootID, exceptUserID int64) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT DISTINCT d.fcm_token FROM device_tokens d
+		WHERE d.user_id IN (SELECT user_id FROM messages WHERE id = ? OR parent_id = ?)
+		  AND d.user_id != ?
+		  AND d.user_id NOT IN (SELECT blocker_user_id FROM blocks WHERE blocked_user_id = ?)`,
+		rootID, rootID, exceptUserID, exceptUserID)
 	if err != nil {
 		return nil, err
 	}

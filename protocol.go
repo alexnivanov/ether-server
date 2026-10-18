@@ -21,6 +21,7 @@ const (
 	TypeRemoved = "removed" // {message_id} | {user_id} — модератор убрал контент
 	TypeVoted   = "voted"   // {message_id, rating} — сумма под сообщением изменилась
 	TypeEdited  = "edited"  // {message_id, text, edited_at} — автор поправил текст
+	TypeReply   = "reply"   // Message с parent_id — ответ в тред
 	TypeError   = "error"   // {code, message}
 
 	// всем подключённым, а не подписчикам канала (см. Hub.AnnounceNews);
@@ -136,6 +137,14 @@ type MessageData struct {
 	// вообще за то, что можно перечитать, а реплика проскроллила за десять секунд.
 	// Единственное, на что влияет рейтинг, — темп автора (ratelimit.go).
 	Rating int `json:"rating,omitempty"`
+	// ParentID — корень треда, если это ответ; у корня поля нет. Ответы в ленту
+	// канала не попадают: приходят кадром `reply` и из GET /messages/{id}/replies.
+	ParentID int64 `json:"parent_id,omitempty"`
+	// ReplyCount и LastReplyTS — у корня: сколько в треде ответов и когда был
+	// последний (unix-мс). Без ответов полей нет. Ответы заблокированных
+	// смотрящим авторов не считаются, как и не показываются.
+	ReplyCount  int   `json:"reply_count,omitempty"`
+	LastReplyTS int64 `json:"last_reply_ts,omitempty"`
 	// MyVote — как проголосовал тот, кто запросил историю: +1 | -1 | 0. Нужен
 	// отдельно от Rating: свой плюс мог быть погашен чужим минусом, но кнопка у
 	// человека всё равно должна выглядеть нажатой. В live-рассылке всегда 0 —
@@ -260,6 +269,9 @@ type PublishRequest struct {
 	Channel     string `json:"channel"`
 	Text        string `json:"text"`
 	ClientMsgID string `json:"client_msg_id,omitempty"`
+	// ParentID — ответ в тред этого сообщения. Канал тогда берётся из корня, а
+	// не из Channel: ответ не может уехать в чужой канал.
+	ParentID int64 `json:"parent_id,omitempty"`
 }
 
 // PublishedData — тело ответа POST /messages: опубликованное сообщение тем же
@@ -267,6 +279,13 @@ type PublishRequest struct {
 // отсеет дубль по серверному id.
 type PublishedData struct {
 	Message MessageData `json:"message"`
+}
+
+// RepliesData — тело ответа GET /messages/{id}/replies: корень и страница
+// ответов (хронологически).
+type RepliesData struct {
+	Root    MessageData   `json:"root"`
+	Replies []MessageData `json:"replies"`
 }
 
 // HistoryData — тело ответа GET /messages (см. rest.go).

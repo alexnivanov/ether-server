@@ -52,6 +52,7 @@ const (
 	scopePlanet                    // канал Земля
 	scopeCountry                   // канал страны
 	scopeCity                      // область и город
+	scopeThread                    // ответы в тредах любого канала
 )
 
 // Земля: одно сообщение в час при нулевом рейтинге, всплеска нет. Каждый минус
@@ -174,7 +175,11 @@ func messageLimitFor(rating int, accountAge time.Duration, scope limitScope) mes
 		return planetLimit(rating)
 	case scopeCountry:
 		return countryLimit(rating)
-	case scopeCity:
+	case scopeCity, scopeThread:
+		// Тред — по городскому тиру в любом канале, своим бакетом. Ответ не
+		// попадает в ленту канала, охват у него меньше, и в Земле с её «раз в
+		// час» разговор в треде иначе был бы невозможен. Но и не локальный
+		// темп: тред Земли видят все, кто его открыл.
 		if rating < 0 {
 			return wideBadLimit
 		}

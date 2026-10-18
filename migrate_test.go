@@ -78,8 +78,8 @@ func TestMigrateFreshDB(t *testing.T) {
 	if got := userVersion(t, s.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
 	}
-	if cols := columns(t, s.db, "messages"); !cols["client_msg_id"] || !cols["edited_at"] {
-		t.Errorf("в свежей базе нет колонок версий 1 и 2: %v", cols)
+	if cols := columns(t, s.db, "messages"); !cols["client_msg_id"] || !cols["edited_at"] || !cols["parent_id"] {
+		t.Errorf("в свежей базе нет колонок версий 1–3: %v", cols)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestMigrateLegacyDB(t *testing.T) {
 	if got := userVersion(t, store.db); got != schemaVersion {
 		t.Errorf("user_version = %d, want %d", got, schemaVersion)
 	}
-	if cols := columns(t, store.db, "messages"); !cols["client_msg_id"] || !cols["edited_at"] {
+	if cols := columns(t, store.db, "messages"); !cols["client_msg_id"] || !cols["edited_at"] || !cols["parent_id"] {
 		t.Errorf("миграция не добавила колонки: %v", cols)
 	}
 	var text, clientMsgID string
@@ -120,6 +120,21 @@ func TestMigrateLegacyDB(t *testing.T) {
 	// DDL и зря двигает schemaVersion. unmapped_unit проверяем именно поэтому.
 	if _, err := store.db.Exec(`SELECT COUNT(*) FROM unmapped_unit`); err != nil {
 		t.Errorf("новая таблица не появилась в дожившей базе: %v", err)
+	}
+
+	// Каскад треда должен работать и на колонке, добавленной ALTER-ом, а не
+	// только в свежей схеме: на проде база именно такая.
+	reply, _, err := store.SaveReply(1, "RU", 1, "ответ", 2000, "")
+	if err != nil {
+		t.Fatalf("ответ на старое сообщение: %v", err)
+	}
+	if ok, err := store.DeleteMessage(1); err != nil || !ok {
+		t.Fatalf("удалить корень: ok=%v err=%v", ok, err)
+	}
+	var left int
+	store.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE id = ?`, reply).Scan(&left)
+	if left != 0 {
+		t.Errorf("ответ пережил удаление корня в мигрированной базе")
 	}
 }
 

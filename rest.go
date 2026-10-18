@@ -74,6 +74,7 @@ func registerREST(mux *http.ServeMux, store *Store, verifiers map[string]*Verifi
 	mux.HandleFunc("DELETE /messages/{id}", handleDeleteMessage(store, hub))
 	mux.HandleFunc("PATCH /messages/{id}", handleEditMessage(store, hub))
 	mux.HandleFunc("GET /messages", handleHistory(store))
+	mux.HandleFunc("GET /messages/{id}/replies", handleReplies(store))
 	mux.HandleFunc("POST /messages", handlePublish(store, pub))
 	mux.HandleFunc("POST /profile/name", handleSetName(store))
 	for _, provider := range []string{ProviderApple, ProviderGoogle, ProviderTelegram} {
@@ -661,9 +662,54 @@ func handleAnnouncements(store *Store) http.HandlerFunc {
 	}
 }
 
-// handlePublish — POST /messages {channel, text, client_msg_id?} (токен — заголовком) →
-// 200 {message} | 401 bad_session | 403 banned | 429 too_fast (+Retry-After) |
-// 400 bad_data — отправить сообщение в канал.
+// handleReplies — тред: GET /messages/{id}/replies?before_id=&limit= →
+// 200 {root, replies} | 404 not_found | 400 bad_data. Как и история, без
+// авторизации; токен (опц.) убирает авторов, которых читатель заблокировал.
+// id ответа тоже годится: тред находится по его корню (см. Store.ThreadRoot),
+// так что клиенту неважно, какой id у него на руках.
+func handleReplies(store *Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+		if err != nil || id <= 0 {
+			writeRESTError(w, http.StatusBadRequest, "bad_data", "bad message id")
+			return
+		}
+		q := r.URL.Query()
+		limit := 50
+		if n, err := strconv.Atoi(q.Get("limit")); err == nil && n > 0 {
+			limit = min(n, maxHistoryLimit)
+		}
+		beforeID, _ := strconv.ParseInt(q.Get("before_id"), 10, 64)
+		var viewerID int64
+		if token := bearerToken(r); token != "" {
+			if u, err := store.UserBySession(token); err != nil {
+				slog.Error("replies session lookup", "err", err)
+			} else if u != nil {
+				viewerID = u.ID
+			}
+		}
+		rootID, _, err := store.ThreadRoot(id)
+		if err == nil {
+			var data RepliesData
+			data.Root, data.Replies, err = store.Replies(rootID, beforeID, limit, viewerID)
+			if err == nil {
+				writeJSON(w, http.StatusOK, data)
+				return
+			}
+		}
+		if errors.Is(err, ErrMessageGone) {
+			writeRESTError(w, http.StatusNotFound, "not_found", "Сообщение уже удалено")
+			return
+		}
+		slog.Error("replies", "err", err, "message_id", id)
+		writeRESTError(w, http.StatusInternalServerError, "internal", "replies lookup failed")
+	}
+}
+
+// handlePublish — POST /messages {channel, text, client_msg_id?, parent_id?} (токен — заголовком) →
+// 200 {message} | 401 bad_session | 403 banned | 404 not_found (корня треда нет) |
+// 429 too_fast (+Retry-After) | 400 bad_data — отправить сообщение в канал или
+// ответ в тред.
 //
 // Зачем запросом, а не кадром на WS (так было до 1.4.0): у запроса есть ответ.
 // Кадр уходил в буфер сокета, и если соединение умирало между отправкой и
@@ -702,7 +748,7 @@ func handlePublish(store *Store, pub *publisher) http.HandlerFunc {
 			AvatarURL:  u.AvatarURL,
 			AccountAge: time.Since(u.CreatedAt),
 		}
-		m, perr := pub.publish(author, d.Channel, d.Text, d.ClientMsgID)
+		m, perr := pub.publish(author, d.Channel, d.Text, d.ClientMsgID, d.ParentID)
 		if perr != nil {
 			// Retry-After — стандартный способ сказать «повтори через N»: клиент
 			// показывает это человеком читаемым текстом из message, а заголовок

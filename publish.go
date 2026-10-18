@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -55,10 +56,13 @@ type publisher struct {
 // (автор, id) уже сохранено, второй раз оно не публикуется и не рассылается, а
 // в ответ уходит уже сохранённое. Пустой id идемпотентности не даёт — поле
 // необязательное.
+//
+// parentID > 0 — ответ в тред этого сообщения: канал берётся из корня, а не из
+// channel, и бакет лимита свой (scopeThread).
 func (p *publisher) publish(
-	a publishAuthor, channel, text, clientMsgID string,
+	a publishAuthor, channel, text, clientMsgID string, parentID int64,
 ) (MessageData, *publishError) {
-	if channel == "" {
+	if parentID < 0 || (parentID == 0 && channel == "") {
 		return MessageData{}, &publishError{
 			Code: "bad_data", Message: "нужен канал", Status: 400,
 		}
@@ -79,6 +83,25 @@ func (p *publisher) publish(
 		slog.Error("lookup client_msg_id", "err", err, "user_id", a.ID)
 	} else if dup.exists {
 		return storedMessage(a, dup), nil
+	}
+	// Ответ: канал и корень — из базы. Ответ на ответ встаёт в тред его корня
+	// (тред в один уровень). Корня нет — ответить некуда: 404, а не публикация
+	// в никуда.
+	var rootID int64
+	if parentID > 0 {
+		root, ch, err := p.store.ThreadRoot(parentID)
+		switch {
+		case errors.Is(err, ErrMessageGone):
+			return MessageData{}, &publishError{
+				Code: "not_found", Message: "Сообщение, на которое ты отвечаешь, уже удалено", Status: 404,
+			}
+		case err != nil:
+			slog.Error("thread root", "err", err, "parent_id", parentID)
+			return MessageData{}, &publishError{
+				Code: "internal", Message: "Не удалось отправить, попробуй ещё раз", Status: 500,
+			}
+		}
+		rootID, channel = root, ch
 	}
 	// Бан мог прилететь при уже открытом сокете (BanEscalate отзывает сессии, но
 	// живое соединение остаётся authed в памяти) или между двумя REST-запросами.
@@ -113,6 +136,9 @@ func (p *publisher) publish(
 			slog.Error("author rating", "err", err, "user_id", a.ID)
 		}
 		scope := p.scopeFor(channel)
+		if rootID > 0 {
+			scope = scopeThread
+		}
 		if scope == scopePlanet && rating >= 0 {
 			planet, err := p.store.AuthorChannelRating(a.ID, channel)
 			if err != nil {
@@ -138,8 +164,16 @@ func (p *publisher) publish(
 		AvatarURL: a.AvatarURL,
 		Text:      text,
 		TS:        time.Now().UnixMilli(),
+		ParentID:  rootID,
 	}
-	id, dup, err := p.store.SaveMessage(m.Channel, a.ID, m.Text, m.TS, clientMsgID)
+	var id int64
+	var dup savedMessage
+	var err error
+	if rootID > 0 {
+		id, dup, err = p.store.SaveReply(rootID, m.Channel, a.ID, m.Text, m.TS, clientMsgID)
+	} else {
+		id, dup, err = p.store.SaveMessage(m.Channel, a.ID, m.Text, m.TS, clientMsgID)
+	}
 	switch {
 	case err != nil:
 		// живая рассылка важнее истории: сообщение уйдёт подписчикам без id
@@ -154,11 +188,16 @@ func (p *publisher) publish(
 	}
 
 	p.hub.broadcast <- m
-	// пуш устройствам подписчиков канала, КРОМЕ автора (иначе человек получает
-	// уведомление о своём же сообщении). Асинхронно: HTTP к FCM не должен
-	// тормозить ни сокет, ни ответ REST.
+	// Пуш: о сообщении — устройствам подписчиков канала, об ответе — участникам
+	// треда; в обоих случаях КРОМЕ автора (иначе человек получает уведомление о
+	// своём же сообщении). Асинхронно: HTTP к FCM не должен тормозить ни сокет,
+	// ни ответ REST.
 	if p.push != nil {
-		go p.push.Notify(m.Channel, a.ID, a.Name, m.Text)
+		if rootID > 0 {
+			go p.push.NotifyReply(m.Channel, rootID, a.ID, a.Name, m.Text)
+		} else {
+			go p.push.Notify(m.Channel, a.ID, a.Name, m.Text)
+		}
 	}
 	return m, nil
 }
@@ -275,6 +314,8 @@ func tooFastMessage(scope limitScope, retry time.Duration) string {
 		return fmt.Sprintf("В канале страны пишут реже - подожди %s", humanWait(retry))
 	case scopeCity:
 		return fmt.Sprintf("В городском канале пишут реже — подожди %s", humanWait(retry))
+	case scopeThread:
+		return fmt.Sprintf("В тредах пишут реже — подожди %s", humanWait(retry))
 	default:
 		return fmt.Sprintf("Слишком часто — подожди %d с", int(retry.Seconds())+1)
 	}
@@ -311,5 +352,6 @@ func storedMessage(a publishAuthor, dup savedMessage) MessageData {
 		Text:      dup.text,
 		TS:        dup.ts,
 		EditedAt:  dup.editedAt,
+		ParentID:  dup.parentID,
 	}
 }
