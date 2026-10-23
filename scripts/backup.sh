@@ -112,6 +112,16 @@ on_error() {
 }
 trap 'on_error $LINENO' ERR
 
+# Выгрузка за пределы сервера не удалась: пишем причину и продолжаем (локальная копия
+# всё равно нужна), а в конце скрипт выходит с ошибкой и НЕ шлёт сигнал в healthchecks —
+# алерт с причиной пришлёт ExecStopPost юнита. Раньше такой сбой давал алерт, но прогон
+# считался успешным, и сторож «бэкап не прошёл» его не видел.
+upload_failed=
+upload_fail() {
+	echo "$1" >&2
+	upload_failed=1
+}
+
 [[ -f "$DB" ]] || { echo "база не найдена: $DB" >&2; exit 1; }
 mkdir -p "$(dirname "$BACKUP")"
 
@@ -149,7 +159,7 @@ if [[ "${SEND_TO_TELEGRAM:-0}" == "1" && -n "$tg_token" && -n "$tg_chat" ]]; the
 		"https://api.telegram.org/bot${tg_token}/sendDocument"; then
 		echo "копия выгружена в Telegram"
 	else
-		alert "не удалось выгрузить копию в Telegram (на сервере копия сохранена)"
+		upload_fail "не удалось выгрузить копию в Telegram (на сервере копия сохранена)"
 	fi
 fi
 
@@ -158,9 +168,9 @@ fi
 # работает», а невыгруженный бэкап, о котором никто не узнает.
 if [[ -n "${BACKUP_REMOTE:-}" ]]; then
 	if [[ -z "${AGE_RECIPIENT:-}" ]]; then
-		alert "хранилище настроено, но нет AGE_RECIPIENT — выгрузка отменена, копию без шифрования не отправляем"
+		upload_fail "хранилище настроено, но нет AGE_RECIPIENT — выгрузка отменена, копию без шифрования не отправляем"
 	elif ! command -v age >/dev/null || ! command -v rclone >/dev/null; then
-		alert "нет age или rclone — выгрузка невозможна (apt install age rclone)"
+		upload_fail "нет age или rclone — выгрузка невозможна (apt install age rclone)"
 	else
 		enc="$tmp_dir/ether-latest.db.gz.age"
 		age -r "$AGE_RECIPIENT" -o "$enc" "$BACKUP"
@@ -213,16 +223,21 @@ if [[ -n "${BACKUP_REMOTE:-}" ]]; then
 					put "$cfg_tar.age" "ether-config-$(date +%F).tar.age"; then
 					echo "конфиг выгружен"
 				else
-					alert "база выгружена, а конфиг — нет (смотри journalctl -u ether-backup)"
+					upload_fail "база выгружена, а конфиг — нет"
 				fi
 			fi
 		else
-			alert "не удалось выгрузить копию в ${BACKUP_REMOTE} (на сервере копия сохранена)"
+			upload_fail "не удалось выгрузить копию в ${BACKUP_REMOTE} (на сервере копия сохранена)"
 		fi
 	fi
 fi
 
 echo "бэкап готов: $BACKUP ($size); свободно на диске: ${free_pct}%"
+
+if [[ -n "$upload_failed" ]]; then
+	echo "копия сохранена только на сервере, за его пределы не выгружена" >&2
+	exit 1
+fi
 
 # «Сторож мёртвой руки»: healthchecks.io шлёт алерт, если этого сигнала не было сутки.
 # Так ловится и то, о чём сервер сам сообщить не может: выключенный таймер, незапуск

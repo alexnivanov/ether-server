@@ -7,7 +7,8 @@
 # состояние) живут на сервере и не трогаются. Деплой = новый бинарник + рестарт.
 #
 # Настройка через окружение (или инлайном: SSH_HOST=... ./deploy.sh):
-#   SSH_HOST     обязателен, напр. ether (алиас из ~/.ssh/config) или root@host
+#   SSH_HOST     алиас из ~/.ssh/config или user@host (по умолчанию nous — как в
+#                ether-web/deploy.sh)
 #   REMOTE_DIR   каталог сервиса на сервере (по умолчанию /opt/ether)
 #   OWNER        владелец бинарника на сервере (по умолчанию ether)
 #   SERVICE      имя systemd-юнита (по умолчанию ether-server)
@@ -20,7 +21,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-SSH_HOST="${SSH_HOST:?задай SSH_HOST, напр. SSH_HOST=ether}"
+SSH_HOST="${SSH_HOST:-nous}"
 REMOTE_DIR="${REMOTE_DIR:-/opt/ether}"
 OWNER="${OWNER:-ether}"
 SERVICE="${SERVICE:-ether-server}"
@@ -53,8 +54,8 @@ CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
 	go build -trimpath -ldflags="-s -w -X main.version=${version}" -o "$out" .
 
 # ── доставка и атомарная подмена ──
-# scp льём в /tmp (мир-доступный на запись), а не сразу в /opt — тот принадлежит
-# root, и scp туда падает с "No such file or directory". Затем `sudo install`
+# Льём в /tmp (мир-доступный на запись), а не сразу в /opt — тот принадлежит
+# root, и записать туда от ops нельзя. Затем `sudo install`
 # ставит бинарник на место атомарно и сразу с нужным владельцем/правами
 # (install заменяет файл через временный + rename, старый не «полуперезаписан»).
 remote_bin="${REMOTE_DIR}/ether-server"
@@ -102,12 +103,20 @@ ssh "$SSH_HOST" "set -e
 # /health пингует базу и отдаёт версию — то есть проверяет не только «процесс
 # отвечает», но и «база читается». Идём через API_PREFIX: на домене живёт ещё и
 # статика ether-web, поэтому без префикса ответит она (404), а не сервер.
+#
+# Версию сверяем с собранной: «сервис отвечает» ещё не значит «отвечает новый
+# бинарник» — без сверки скрипт рапортовал бы успех и тогда, когда рестарт
+# поднял старый.
 health_url="https://${DOMAIN}${API_PREFIX}/health"
 echo "==> health-check ${health_url}"
-if body=$(curl -fsS --max-time 10 "$health_url"); then
-	echo "✓ задеплоено: ${version}"
-	echo "  health: ${body}"
-else
+if ! body=$(curl -fsS --max-time 10 "$health_url"); then
 	echo "✗ сервис перезапущен, но health-check не прошёл — проверь Caddy/логи" >&2
 	exit 1
 fi
+if [[ "$body" != *"\"version\":\"${version}\""* ]]; then
+	echo "✗ сервис отвечает, но не той версией: ждали ${version}" >&2
+	echo "  health: ${body}" >&2
+	exit 1
+fi
+echo "✓ задеплоено: ${version}"
+echo "  health: ${body}"

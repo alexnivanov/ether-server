@@ -40,7 +40,7 @@ go run . -config /etc/ether/custom.yaml  # явный путь вместо -env
 
 ## Деплой (прод)
 
-Прод — один хост (`etherapp.ru`, SSH-алиас `ether`): статический Go-бинарник под
+Прод — один хост (`etherapp.ru`, SSH-алиас `nous`): статический Go-бинарник под
 systemd, наружу его публикует Caddy с авто-TLS. Раскладка раздельная — бинарник
 и конфиг read-only, запись только в каталог с базой (`ProtectSystem=strict` +
 `ReadWritePaths=/var/lib/ether`):
@@ -66,7 +66,7 @@ systemd, наружу его публикует Caddy с авто-TLS. Раск�
 рестартит сервис (конфиг и базу не трогает):
 
 ```sh
-SSH_HOST=ether ./deploy.sh
+./deploy.sh
 ```
 
 > **Сервер выкатывается раньше клиента.** Сборка 1.4.0 присылает токен сессии
@@ -161,9 +161,9 @@ root-владельца — и сервис, который ходит под п
 `VACUUM INTO`, что и в бэкапе (`cp` на WAL-базе даёт битый файл):
 
 ```sh
-ssh ether "sudo -u ether sqlite3 /var/lib/ether/ether.prod.db \
+ssh nous "sudo -u ether sqlite3 /var/lib/ether/ether.prod.db \
   \"VACUUM INTO '/tmp/snap.db';\""
-scp ether:/tmp/snap.db .   # дальше — локально, чем угодно
+scp nous:/tmp/snap.db .   # дальше — локально, чем угодно
 ```
 
 Копия суточной свежести уже лежит в бэкапах
@@ -244,7 +244,7 @@ Go-сервер логирует свои события, а не чужие п�
 Смотреть удобно через `jq`:
 
 ```sh
-ssh ether "sudo tail -200 /var/log/caddy/access.log" |
+ssh nous "sudo tail -200 /var/log/caddy/access.log" |
   jq -r '[.request.remote_ip, .request.method, .request.uri, (.status|tostring)] | @tsv'
 ```
 
@@ -322,7 +322,7 @@ sudo tail -20 /var/log/unattended-upgrades/unattended-upgrades.log
 
 [`scripts/backup.sh`](./scripts/backup.sh) снимает копию базы и кладёт её в
 `/var/lib/ether/backups/ether-latest.db.gz`. Локально хранится **только
-последняя** копия (база маленькая), а история версий живёт в R2 — см. ниже.
+последняя** копия (база маленькая), а история версий живёт на Google Drive — см. ниже.
 
 Копия делается через `VACUUM INTO`, а не `cp`: база в WAL-режиме, и простое
 копирование файла при активной записи даёт битый снимок. Пишем во временный
@@ -340,9 +340,9 @@ sudo tail -20 /var/log/unattended-upgrades/unattended-upgrades.log
 иначе юнит запустится в пустоту.
 
 ```sh
-SSH_HOST=ether ./deploy.sh          # ставит /opt/ether/backup.sh
-scp deploy/ether-backup.service deploy/ether-backup.timer ether:/tmp/
-ssh ether 'sudo install -o root -g root -m 0644 \
+./deploy.sh          # ставит /opt/ether/backup.sh
+scp deploy/ether-backup.service deploy/ether-backup.timer nous:/tmp/
+ssh nous 'sudo install -o root -g root -m 0644 \
     /tmp/ether-backup.service /tmp/ether-backup.timer /etc/systemd/system/ &&
   sudo systemctl daemon-reload &&
   sudo systemctl enable --now ether-backup.timer &&
@@ -372,18 +372,24 @@ Telegram-канал — токен и `chat_id` скрипт берёт из `co
 таблицу», но не от потери сервера. Поэтому копия дополнительно уезжает в удалённое
 хранилище.
 
-Куда именно — скрипт не знает: адрес в `BACKUP_REMOTE`, сам remote описан
-переменными `RCLONE_CONFIG_*` в `/etc/ether/backup.env` (root, `0600`; образец —
-[`deploy/backup.env.example`](./deploy/backup.env.example)). Смена провайдера =
-правка этого файла. Отдельным файлом, а не в `config.prod.yaml`: Go-серверу
-доступы к хранилищу ни к чему.
+Куда именно — скрипт не знает: адрес в `BACKUP_REMOTE` в `/etc/ether/backup.env`
+(root, `0600`; образец — [`deploy/backup.env.example`](./deploy/backup.env.example)).
+Смена провайдера = правка этого файла. Отдельным файлом, а не в `config.prod.yaml`:
+Go-серверу доступы к хранилищу ни к чему.
 
-Что выбрать. **Яндекс.Диск** — 5 ГБ, карта не нужна, WebDAV из коробки, российская
-юрисдикция (в privacy у нас заявлен 152-ФЗ, и бэкап за рубеж — та же плоскость);
-пароль берётся не основной, а «пароль приложения». **Cloudflare R2** технически
-приятнее (10 ГБ, S3), но требует привязки карты даже на бесплатном тарифе — на
-этом мы и споткнулись. Любое S3-совместимое (B2, Yandex Object Storage, MinIO)
-подключается тем же блоком, меняется endpoint.
+Сейчас это **Google Drive**, папка `nous-backups/ether`, та же, что у Айды
+(`nous-backups/ida`): `BACKUP_REMOTE=GD:nous-backups/ether`. Remote `GD` (scope
+`drive.file` — rclone видит только свои файлы) описан не переменными, а в
+`/var/lib/ether/backups/rclone.conf` (`RCLONE_CONFIG` в `backup.env`): OAuth-токен
+Google обновляется каждый час, и rclone должен записать его обратно, а юниту
+бэкапа писать можно только в `/var/lib/ether`. Токен — копия айдиного.
+
+Почему не другие. **Яндекс.Диск** (стоял до 2026-10): WebDAV стал обрывать
+загрузки (`499`), а REST API отвергает `rclone` 1.60 из Debian (`410 Gone`) —
+сначала отвалилась Айда с файлами в мегабайты, потом и Эфир с 60 КБ.
+**Cloudflare R2** требует карту даже на бесплатном тарифе, **Backblaze B2** не
+регистрирует из РФ/КЗ. Любое S3-совместимое (Yandex Object Storage, Selectel)
+подключается тем же блоком переменных `RCLONE_CONFIG_*`.
 
 **Копия шифруется до отправки — `age` на публичный ключ.** На сервере лежит
 только публичный, закрытый — в менеджере паролей. Это важнее, чем кажется:
@@ -411,12 +417,12 @@ Telegram-канал — токен и `chat_id` скрипт берёт из `co
 Установка на сервере:
 
 ```sh
-SSH_HOST=ether ./deploy.sh                 # свежий backup.sh на сервер
-ssh ether 'sudo apt install -y age rclone'
-scp deploy/backup.env.example ether:/tmp/
-ssh ether 'sudo install -m 600 -o root -g root /tmp/backup.env.example /etc/ether/backup.env'
-ssh ether 'sudo nano /etc/ether/backup.env'      # хранилище + AGE_RECIPIENT
-ssh ether 'sudo systemctl start ether-backup.service && journalctl -u ether-backup -n 25 --no-pager'
+./deploy.sh                 # свежий backup.sh на сервер
+ssh nous 'sudo apt install -y age rclone'
+scp deploy/backup.env.example nous:/tmp/
+ssh nous 'sudo install -m 600 -o root -g root /tmp/backup.env.example /etc/ether/backup.env'
+ssh nous 'sudo nano /etc/ether/backup.env'      # хранилище + AGE_RECIPIENT
+ssh nous 'sudo systemctl start ether-backup.service && journalctl -u ether-backup -n 25 --no-pager'
 ```
 
 Ключи `age` генерируются **на своей машине**, не на сервере:
@@ -433,14 +439,14 @@ grep 'public key' ether-backup.key    # публичный (age1...) → в back
 **Восстановление из хранилища:**
 
 ```sh
-# те же RCLONE_CONFIG_* и BACKUP_REMOTE, что на сервере (из менеджера паролей)
-rclone ls YD:ether-backups
-rclone copyto YD:ether-backups/ether-latest.db.gz.age ./backup.db.gz.age
+# remote GD — тот же Google-аккаунт: rclone config create gd drive scope=drive.file
+rclone ls gd:nous-backups/ether
+rclone copyto gd:nous-backups/ether/ether-latest.db.gz.age ./backup.db.gz.age
 age -d -i ether-backup.key backup.db.gz.age | gunzip > restore.db
 sqlite3 restore.db 'pragma integrity_check;'    # ждём ok
 
 # конфиг, если поднимаем сервер с нуля
-rclone copyto YD:ether-backups/ether-config-latest.tar.age ./config.tar.age
+rclone copyto gd:nous-backups/ether/ether-config-latest.tar.age ./config.tar.age
 age -d -i ether-backup.key config.tar.age > config.tar && tar -tf config.tar
 ```
 
