@@ -95,10 +95,13 @@ func TestAdminCommands(t *testing.T) {
 		t.Fatalf("/unban = %q", reply)
 	}
 
-	// постоянный бан — только явной командой
-	reply = a.execute("/block " + itoa(userID) + " спам")
-	if !strings.Contains(reply, "навсегда") {
-		t.Fatalf("/block = %q", reply)
+	// постоянный бан — только явной командой и только подтверждённой
+	if reply := a.execute("/block " + itoa(userID) + " спам"); !strings.Contains(reply, "Подтверди") {
+		t.Fatalf("/block без подтверждения = %q, want сводку", reply)
+	}
+	reply = a.execute("/block " + itoa(userID) + " !")
+	if !strings.Contains(reply, "навсегда") || !strings.Contains(reply, "спам") {
+		t.Fatalf("/block ! = %q, want блок с причиной из сводки", reply)
 	}
 	var users int
 	if err := store.db.QueryRow(`SELECT COUNT(*) FROM users WHERE id = ?`, userID).Scan(&users); err != nil {
@@ -194,7 +197,56 @@ func TestAdminAnnouncesRemoval(t *testing.T) {
 	// постоянный бан удаляет аккаунт, а с ним каскадом сообщения — про это
 	// клиентам тоже надо сказать
 	a.execute("/block " + itoa(userID))
+	a.execute("/block " + itoa(userID) + " !")
 	if d := next("/block"); d.UserID != userID {
 		t.Fatalf("/block: removed = %+v, want user_id %d", d, userID)
+	}
+}
+
+// /block необратим и от /ban отличается одной буквой, поэтому в два шага:
+// сводка с ценой шага, потом «/block <id> !» в течение окна. Подтверждение
+// без сводки или после окна снова показывает сводку, а не блокирует.
+func TestAdminBlockNeedsConfirm(t *testing.T) {
+	a, store := newAdminForTest(t)
+	now := time.Now()
+	a.now = func() time.Time { return now }
+	userID := mkTgUser(t, store, "9000077", "", "Вася <script>")
+	other := mkTgUser(t, store, "9000078", "", "Соседка")
+	root := mkMessage(t, store, "RU", userID, "корень")
+	mkMessage(t, store, "RU", userID, "ещё")
+	mkReply(t, store, root, "RU", other, "чужой ответ", now.UnixMilli())
+	alive := func() bool {
+		u, err := store.UserByID(userID)
+		if err != nil {
+			t.Fatalf("user: %v", err)
+		}
+		return u != nil
+	}
+
+	// подтверждение без сводки — сводка, аккаунт на месте
+	reply := a.execute("/block " + itoa(userID) + " !")
+	if !strings.Contains(reply, "Подтверди") || !alive() {
+		t.Fatalf("подтверждение без сводки: %q, alive=%v", reply, alive())
+	}
+	// сводка называет человека (экранированно) и цену шага
+	for _, want := range []string{"Вася &lt;script&gt;", "сообщений: 2", "чужих ответов в его тредах: 1", "/block " + itoa(userID) + " !"} {
+		if !strings.Contains(reply, want) {
+			t.Errorf("сводка %q: нет %q", reply, want)
+		}
+	}
+
+	// окно прошло — снова сводка
+	now = now.Add(blockConfirmWindow + time.Second)
+	if reply := a.execute("/block " + itoa(userID) + " !"); !strings.Contains(reply, "Подтверди") || !alive() {
+		t.Fatalf("подтверждение после окна: %q, alive=%v", reply, alive())
+	}
+	// в окне — блок
+	now = now.Add(time.Minute)
+	if reply := a.execute("/block " + itoa(userID) + " ! реклама"); !strings.Contains(reply, "навсегда") || alive() {
+		t.Fatalf("подтверждение в окне: %q, alive=%v", reply, alive())
+	}
+	// подтверждение одноразовое: повтор отвечает «уже удалён», а не блокирует снова
+	if reply := a.execute("/block " + itoa(userID) + " !"); !strings.Contains(reply, "уже удалён") {
+		t.Fatalf("повтор подтверждения: %q", reply)
 	}
 }

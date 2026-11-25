@@ -1339,6 +1339,19 @@ func (s *Store) EditOwnMessage(authorID, messageID int64, text string, now time.
 	return out, tx.Commit()
 }
 
+// UserContent — сколько сообщений пользователя и сколько чужих ответов в его
+// тредах: всё это уйдёт каскадом при удалении аккаунта. Нужно сводке /block,
+// чтобы модератор видел цену необратимого шага до него.
+func (s *Store) UserContent(userID int64) (own, foreignReplies int, err error) {
+	err = s.db.QueryRow(`
+		SELECT
+			(SELECT COUNT(*) FROM messages WHERE user_id = ?),
+			(SELECT COUNT(*) FROM messages
+				WHERE user_id != ? AND parent_id IN (SELECT id FROM messages WHERE user_id = ?))`,
+		userID, userID, userID).Scan(&own, &foreignReplies)
+	return own, foreignReplies, err
+}
+
 // DeleteUserMessages удаляет все сообщения пользователя и возвращает их число —
 // когда одного сообщения мало (спамер засыпал канал).
 func (s *Store) DeleteUserMessages(userID int64) (int64, error) {

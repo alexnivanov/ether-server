@@ -25,7 +25,8 @@ import (
 // Команды (причина необязательна, её увидит пользователь):
 //
 //	/ban <id> [причина]    закрыть отправку на сутки; читать и заходить можно
-//	/block <id> [причина]  заблокировать навсегда + удалить аккаунт
+//	/block <id> [причина]  заблокировать навсегда + удалить аккаунт; в два шага:
+//	                       сводка, затем /block <id> ! в течение 5 минут
 //	/unban <id>            снять наказание
 //	/del <msg_id>          удалить одно сообщение
 //	/purge <id>            удалить все сообщения пользователя
@@ -44,6 +45,31 @@ type AdminBot struct {
 	// push — тихий пуш об объявлении; nil — пуши выключены в конфиге или тест.
 	push   *Pusher
 	offset int64 // update_id + 1: подтверждает обработанные обновления
+
+	// pendingBlocks — /block, ждущие подтверждения (см. blockPreview). В памяти:
+	// рестарт между шагами просто начинает блок заново. Без мьютекса — execute
+	// зовётся только из цикла опроса, по одной команде.
+	pendingBlocks map[int64]pendingBlock
+	// now — часы для окна подтверждения; nil — time.Now (подменяется в тестах).
+	now func() time.Time
+}
+
+// pendingBlock — показанная сводка /block: когда и с какой причиной.
+type pendingBlock struct {
+	at     time.Time
+	reason string
+}
+
+// blockConfirmWindow — сколько после сводки ждём подтверждения. Коротко
+// намеренно: старая команда с «!», найденная в истории канала и отправленная
+// по ошибке, не должна снести аккаунт.
+const blockConfirmWindow = 5 * time.Minute
+
+func (a *AdminBot) clock() time.Time {
+	if a.now != nil {
+		return a.now()
+	}
+	return time.Now()
 }
 
 // NewAdminBot возвращает nil, если уведомления выключены: без токена и канала
@@ -212,6 +238,18 @@ func (a *AdminBot) execute(text string) string {
 			id, until.Format("02.01 15:04"), reasonSuffix(reason), count, id)
 
 	case "/block":
+		// Необратимо (аккаунт и сообщения удаляются), а от /ban отличается
+		// одной буквой — поэтому в два шага: сводка, потом «/block <id> !».
+		confirm := len(args) > 1 && args[1] == "!"
+		pending, ok := a.pendingBlocks[id]
+		if !confirm || !ok || a.clock().Sub(pending.at) > blockConfirmWindow {
+			return a.blockPreview(id, reason)
+		}
+		delete(a.pendingBlocks, id)
+		// причина из сводки, если в подтверждении её не повторили
+		if reason = strings.Join(args[2:], " "); reason == "" {
+			reason = pending.reason
+		}
 		count, err := a.store.BanPermanent(id, reason)
 		if errors.Is(err, ErrNoIdentities) {
 			return fmt.Sprintf("Пользователя <code>%d</code> нет — аккаунт уже удалён", id)
@@ -267,7 +305,7 @@ func (a *AdminBot) execute(text string) string {
 	case "/help":
 		return "<b>Команды модерации</b>\n" +
 			"<code>/ban &lt;id&gt; [причина]</code> — закрыть отправку на сутки (читать можно)\n" +
-			"<code>/block &lt;id&gt; [причина]</code> — заблокировать навсегда + удалить аккаунт\n" +
+			"<code>/block &lt;id&gt; [причина]</code> — заблокировать навсегда + удалить аккаунт (покажет сводку, подтвердить: <code>/block &lt;id&gt; !</code>)\n" +
 			"<code>/unban &lt;id&gt;</code> — снять наказание\n" +
 			"<code>/del &lt;msg_id&gt;</code> — удалить сообщение\n" +
 			"<code>/purge &lt;id&gt;</code> — удалить все сообщения пользователя\n" +
@@ -316,6 +354,46 @@ func afterFirstWord(s string) string {
 		return ""
 	}
 	return strings.TrimSpace(s[i:])
+}
+
+// blockPreview — первый шаг /block: что именно удалится, и запомнить, что
+// сводку показали. Блок выполнит только «/block <id> !» в течение
+// blockConfirmWindow.
+func (a *AdminBot) blockPreview(id int64, reason string) string {
+	u, err := a.store.UserByID(id)
+	if err != nil {
+		slog.Error("admin block preview", "err", err, "user_id", id)
+		return "Не удалось найти пользователя — смотри логи сервера"
+	}
+	if u == nil {
+		return fmt.Sprintf("Пользователя <code>%d</code> нет — аккаунт уже удалён", id)
+	}
+	own, foreign, err := a.store.UserContent(id)
+	if err != nil {
+		slog.Error("admin block preview", "err", err, "user_id", id)
+		return "Не удалось посчитать сообщения — смотри логи сервера"
+	}
+	count, err := a.store.BanCount(id)
+	if err != nil {
+		slog.Error("admin block preview", "err", err, "user_id", id)
+	}
+	if a.pendingBlocks == nil {
+		a.pendingBlocks = map[int64]pendingBlock{}
+	}
+	a.pendingBlocks[id] = pendingBlock{at: a.clock(), reason: reason}
+
+	name := u.FullName
+	if name == "" {
+		name = "без имени"
+	}
+	what := fmt.Sprintf("аккаунт и сообщений: %d", own)
+	if foreign > 0 {
+		what += fmt.Sprintf(", плюс чужих ответов в его тредах: %d", foreign)
+	}
+	return fmt.Sprintf(
+		"⚠️ Заблокировать навсегда <b>%s</b> (<code>%d</code>)?\nУдалятся %s%s. Нарушений всего: <b>%d</b>.\nПодтверди в течение %d минут: <code>/block %d !</code>",
+		html.EscapeString(name), id, what, reasonSuffix(reason), count,
+		int(blockConfirmWindow.Minutes()), id)
 }
 
 // reasonSuffix добавляет причину к ответу, если она указана.
